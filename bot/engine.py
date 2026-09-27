@@ -224,10 +224,10 @@ class TradingEngine:
                     self.logger.exception("Erreur lors du traitement de %s", symbol)
                     self.notifier.send(f"⚠️ Erreur sur {symbol}, voir les logs")
 
+            self._manage_treasury()
+
             if self.mode == "paper" and self.portfolio is not None:
                 self.portfolio.snapshot(self._open_positions_value())
-
-            self._manage_treasury()
 
             elapsed = time.time() - cycle_start
             sleep_time = max(1.0, self.poll_interval - elapsed)

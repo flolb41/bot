@@ -47,7 +47,7 @@ rewards:
   collect_interval_hours: 6 # fréquence de la collecte périodique
   profit_skim_pct: 30 # % des profits de trading envoyés au coffre
   min_idle_to_subscribe: 50 # place le solde libre excédentaire dans Earn au-delà de ce montant
-  keep_free: 100 # solde toujours gardé disponible pour le trading
+  keep_free: 500 # solde toujours gardé disponible pour le trading
   min_trading_balance: 50 # sous ce seuil, rachat automatique depuis le coffre
   dust_enabled: true # conversion des poussières en BNB (mode live)
   paper_apr_pct: 5.0 # APR simulé du coffre en mode paper
