@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Trading Bot — Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="logo">🤖</span>
+      <h1>Trading Bot</h1>
+      <span id="mode-badge" class="badge">—</span>
+      <span id="alive-badge" class="badge">—</span>
+    </div>
+    <div class="meta">
+      <span id="meta-exchange"></span> · <span id="meta-symbols"></span> · <span id="meta-timeframe"></span> · <span id="meta-strategy"></span>
+      <span class="refresh">MAJ <span id="last-refresh">—</span></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="cards">
+      <div class="card">
+        <div class="label">Solde disponible</div>
+        <div class="value" id="kpi-balance">—</div>
+      </div>
+      <div class="card">
+        <div class="label">Equity totale</div>
+        <div class="value" id="kpi-equity">—</div>
+        <div class="sub" id="kpi-equity-change">—</div>
+      </div>
+      <div class="card">
+        <div class="label">PnL 24h</div>
+        <div class="value" id="kpi-daily">—</div>
+      </div>
+      <div class="card">
+        <div class="label">PnL total réalisé</div>
+        <div class="value" id="kpi-total-pnl">—</div>
+        <div class="sub" id="kpi-trades">—</div>
+      </div>
+      <div class="card">
+        <div class="label">Taux de réussite</div>
+        <div class="value" id="kpi-winrate">—</div>
+        <div class="sub" id="kpi-fees">—</div>
+      </div>
+      <div class="card vault">
+        <div class="label">Coffre (Earn)</div>
+        <div class="value" id="kpi-vault">—</div>
+        <div class="sub" id="kpi-rewards">—</div>
+      </div>
+      <div class="card">
+        <div class="label">Positions ouvertes</div>
+        <div class="value" id="kpi-positions">—</div>
+      </div>
+      <div class="card wallet">
+        <div class="label">Wallet on-chain</div>
+        <div class="value small" id="kpi-wallet">—</div>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="panel">
+        <h2>Courbe d'equity</h2>
+        <canvas id="equity-chart"></canvas>
+      </div>
+      <div class="panel">
+        <h2>PnL par symbole</h2>
+        <canvas id="pnl-chart"></canvas>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Positions ouvertes</h2>
+      <div class="table-wrap">
+        <table id="positions-table">
+          <thead>
+            <tr><th>Symbole</th><th>Entrée</th><th>Quantité</th><th>Stop-loss</th><th>Take-profit</th><th>Trailing</th><th>Ouverte</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Derniers trades</h2>
+      <div class="table-wrap">
+        <table id="trades-table">
+          <thead>
+            <tr><th>Date</th><th>Symbole</th><th>Côté</th><th>Prix</th><th>Quantité</th><th>PnL</th><th>Raison</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Logs <button id="toggle-logs" class="btn">Afficher</button></h2>
+      <pre id="logs" class="logs hidden"></pre>
+    </section>
+  </main>
+
+  <footer>Actualisation automatique toutes les 30 s · lecture seule</footer>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

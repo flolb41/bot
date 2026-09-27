@@ -1,0 +1,75 @@
+# Configuration du bot de trading
+# Les valeurs ${VAR} sont substituées depuis les variables d'environnement (.env)
+
+exchange:
+  name: binance # nom ccxt de l'exchange (binance, kraken, bybit, ...)
+  api_key: ${EXCHANGE_API_KEY}
+  api_secret: ${EXCHANGE_API_SECRET}
+  sandbox: true # true = testnet/sandbox de l'exchange (si supporté)
+
+trading:
+  mode: paper # "paper" (simulation) ou "live" (ordres réels)
+  symbols:
+    - "BTC/USDT"
+    - "ETH/USDT"
+  timeframe: "15m" # bougies utilisées pour l'analyse
+  poll_interval_seconds: 60 # fréquence de vérification du marché
+  starting_balance: 1000.0 # solde virtuel de départ en mode paper
+  quote_currency: "USDT"
+  allocation_pct: 10 # % du solde disponible investi par trade
+  fee_pct: 0.1 # frais simulés par trade en mode paper (%)
+
+strategy:
+  name: ema_rsi
+  params:
+    ema_fast: 9
+    ema_slow: 21
+    rsi_period: 14
+    rsi_overbought: 70
+    rsi_oversold: 30
+
+risk:
+  max_open_positions: 3
+  stop_loss_pct: 2.0
+  take_profit_pct: 4.0
+  trailing_stop_pct: 1.5 # 0 pour désactiver le trailing stop
+  max_daily_loss_pct: 5.0 # arrête l'ouverture de nouveaux trades passé ce seuil
+
+telegram:
+  enabled: false
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  chat_id: ${TELEGRAM_CHAT_ID}
+
+# Coffre de récompenses : Simple Earn (intérêts), conversion des poussières,
+# auto-compounding des profits. En mode paper, le coffre est simulé avec paper_apr_pct.
+rewards:
+  enabled: true
+  collect_interval_hours: 6 # fréquence de la collecte périodique
+  profit_skim_pct: 30 # % des profits de trading envoyés au coffre
+  min_idle_to_subscribe: 50 # place le solde libre excédentaire dans Earn au-delà de ce montant
+  keep_free: 100 # solde toujours gardé disponible pour le trading
+  min_trading_balance: 50 # sous ce seuil, rachat automatique depuis le coffre
+  dust_enabled: true # conversion des poussières en BNB (mode live)
+  paper_apr_pct: 5.0 # APR simulé du coffre en mode paper
+
+# Wallet on-chain local (BSC) : clé privée chiffrée (keystore V3), mot de passe via WALLET_PASSWORD.
+# Sert de stockage sécurisé hors exchange (commandes: wallet create/address/balance/sweep/send).
+wallet:
+  keystore_path: "data/keystore.json"
+  network: "BSC" # code réseau côté exchange pour les retraits
+  rpc_url: "https://bsc-dataseed.binance.org"
+  chain_id: 56
+  usdt_contract: "0x55d398326f99059fF775485246999027B3197955" # USDT BEP-20
+  usdt_decimals: 18
+
+database:
+  path: "data/trading_bot.db"
+
+# Dashboard web (lecture seule). Protégé par mot de passe si WEB_PASSWORD est défini dans .env.
+web:
+  host: "0.0.0.0" # 0.0.0.0 = accessible depuis le réseau local, 127.0.0.1 = Pi uniquement
+  port: 8080
+
+logging:
+  level: INFO
+  file: "logs/bot.log"
