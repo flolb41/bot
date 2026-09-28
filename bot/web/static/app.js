@@ -63,6 +63,7 @@ async function loadOverview() {
   setText("kpi-rewards", `récompenses : +${fmt(o.vault.total_rewards, 4)} ${quote}`);
   setText("kpi-positions", `${o.open_positions} / ${o.max_open_positions}`);
   setText("kpi-wallet", o.wallet_address || "non créé");
+  setText("kpi-vault-wallet", o.vault_wallet_address || "non créé");
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +183,21 @@ async function loadTrades() {
   );
 }
 
+async function loadSpreads() {
+  const rows = await getJSON("/api/spreads");
+  fillTable(
+    "spreads-table",
+    rows,
+    (s) => `
+      <td>${esc(s.symbol)}</td>
+      <td class="num">${fmt(s.cex_price, 4)}</td>
+      <td class="num">${fmt(s.dex_price, 4)}</td>
+      <td class="num ${Math.abs(s.spread_pct) >= 1 ? "neg" : ""}">${signed(s.spread_pct, 3)} %</td>
+      <td>${fmtDate(s.updated_at)}</td>`,
+    "Cotation DEX désactivée ou pas encore disponible"
+  );
+}
+
 async function loadLogs() {
   if ($("logs").classList.contains("hidden")) return;
   const lines = await getJSON("/api/logs?lines=150");
@@ -192,7 +208,7 @@ async function loadLogs() {
 
 // ---------------------------------------------------------------------------
 async function refreshAll() {
-  const tasks = [loadOverview, loadEquity, loadPnlBySymbol, loadPositions, loadTrades, loadLogs];
+  const tasks = [loadOverview, loadEquity, loadPnlBySymbol, loadSpreads, loadPositions, loadTrades, loadLogs];
   for (const task of tasks) {
     try {
       await task();

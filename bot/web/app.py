@@ -54,8 +54,19 @@ def create_app(config: Config) -> Flask:
     log_file = Path(config["logging"]["file"])
     wallet_cfg = config.get("wallet", {}) or {}
     keystore_path = Path(wallet_cfg.get("keystore_path", "data/keystore.json"))
+    vault_keystore_path = Path(wallet_cfg.get("vault_keystore_path", "data/keystore_vault.json"))
     password = os.environ.get("WEB_PASSWORD", "")
     protected = _require_auth(password)
+
+    def _address_of(path: Path) -> str | None:
+        if not path.exists():
+            return None
+        try:
+            import json
+
+            return "0x" + json.loads(path.read_text(encoding="utf-8"))["address"]
+        except Exception:
+            return None
 
     @app.route("/")
     @protected
@@ -69,15 +80,6 @@ def create_app(config: Config) -> Flask:
         latest = db.get_latest_equity()
         stats = db.get_trade_stats()
         vault_amount, vault_rewards, _ = db.get_vault(quote)
-
-        wallet_address = None
-        if keystore_path.exists():
-            try:
-                import json
-
-                wallet_address = "0x" + json.loads(keystore_path.read_text(encoding="utf-8"))["address"]
-            except Exception:
-                wallet_address = None
 
         # Le bot est considéré actif si un snapshot equity date de moins de 3 cycles
         bot_alive = False
@@ -99,7 +101,8 @@ def create_app(config: Config) -> Flask:
                 "daily_pnl": db.get_daily_pnl(),
                 "stats": stats,
                 "vault": {"amount": vault_amount, "total_rewards": vault_rewards},
-                "wallet_address": wallet_address,
+                "wallet_address": _address_of(keystore_path),
+                "vault_wallet_address": _address_of(vault_keystore_path),
                 "open_positions": len(db.get_all_positions()),
                 "max_open_positions": int(config["risk"]["max_open_positions"]),
                 "server_time": time.time(),
@@ -110,6 +113,11 @@ def create_app(config: Config) -> Flask:
     @protected
     def api_positions():
         return jsonify([dict(p) for p in db.get_all_positions()])
+
+    @app.route("/api/spreads")
+    @protected
+    def api_spreads():
+        return jsonify([dict(s) for s in db.get_spreads()])
 
     @app.route("/api/trades")
     @protected

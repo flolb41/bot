@@ -21,10 +21,11 @@ Bot de trading crypto complet, léger et fonctionnel, conçu pour tourner en con
 - **Backtester** sur données historiques réelles téléchargées depuis l'exchange
 - **Coffre de récompenses** : Binance Simple Earn (intérêts sur le solde inactif), conversion des poussières,
   auto-compounding des profits — le coffre recharge automatiquement le capital de trading quand il baisse
-- **Wallet on-chain local sécurisé** (BSC) : clé privée chiffrée keystore V3, jamais en clair
-- **Dashboard web** léger (Flask + Chart.js) : equity, PnL, positions, trades, coffre, logs — accessible depuis le LAN
+- **Wallets on-chain locaux sécurisés** (BSC) : BOT opérationnel + VAULT coffre-fort, clés chiffrées keystore V3
+- **Cotation PancakeSwap** en lecture seule : écart de prix CEX/DEX par symbole, alerte au-delà d'un seuil
+- **Dashboard web** léger (Flask + Chart.js) : equity, PnL, positions, trades, coffre, écarts CEX/DEX, logs
 - Notifications Telegram (achats, ventes, erreurs, démarrage/arrêt)
-- CLI simple : `run`, `backtest`, `status`, `wallet`, `rewards`, `web`
+- CLI simple : `run`, `backtest`, `status`, `wallet`, `rewards`, `dex`, `web`
 - Logs avec rotation automatique (pas de saturation de la carte SD)
 
 ## Structure du projet
@@ -40,7 +41,9 @@ bot/
   notifier.py       # alertes Telegram
   portfolio.py      # solde virtuel (mode paper)
   rewards.py        # coffre : Simple Earn, dust, compounding des profits
-  wallet.py         # wallet on-chain local (keystore V3 chiffré, BSC)
+  wallet.py         # wallet on-chain (keystore V3 chiffré, BSC)
+  treasury.py       # trésorerie 2 wallets : transfert BOT -> VAULT
+  dex.py            # cotation PancakeSwap V2 (getAmountsOut via RPC, sans web3.py)
   engine.py         # boucle principale de trading
   backtester.py     # backtest sur historique réel
   strategies/       # stratégies (interface + implémentations)
@@ -108,25 +111,52 @@ solde inactif ──────┘          │
 > ⚠️ Le farming automatisé de faucets/airdrops n'est volontairement pas implémenté :
 > il repose sur le contournement de captchas et viole les CGU des services (risque de ban).
 
-## Wallet on-chain sécurisé
+## Wallets on-chain sécurisés (BOT / VAULT)
 
-Wallet EVM local sur le Pi (réseau BSC, frais faibles). La clé privée est chiffrée au format
-keystore V3 (scrypt) — jamais stockée en clair. Mot de passe via `WALLET_PASSWORD` dans `.env`
-ou saisie interactive.
+Deux wallets EVM locaux sur le Pi (réseau BSC, frais faibles), clés privées chiffrées au format
+keystore V3 (scrypt) — jamais stockées en clair.
+
+| Wallet | Rôle | Mot de passe | Qui le connaît |
+|---|---|---|---|
+| **BOT** | opérationnel, petite somme de travail | `WALLET_PASSWORD` | le bot (dans `.env`) |
+| **VAULT** | coffre-fort, reçoit l'excédent | `VAULT_PASSWORD` | toi uniquement, **pas dans le `.env` du Pi** |
+
+Le bot peut **déposer** sur le VAULT (simple transfert vers son adresse) mais jamais en **retirer** :
+si le bot ou une autorisation DeFi est compromis, le VAULT reste isolé.
 
 ```bash
-.venv/bin/python main.py wallet create                     # génère le wallet chiffré
-.venv/bin/python main.py wallet address                    # adresse publique (pour recevoir)
-.venv/bin/python main.py wallet balance                    # soldes BNB + USDT on-chain
-.venv/bin/python main.py wallet sweep --amount 100         # retire 100 USDT de Binance vers le wallet
-.venv/bin/python main.py wallet send --to 0x... --amount 50 # renvoie 50 USDT (ex: dépôt Binance)
+.venv/bin/python main.py wallet create                       # crée le wallet BOT
+.venv/bin/python main.py --role vault wallet create          # crée le wallet VAULT (mot de passe différent !)
+.venv/bin/python main.py wallet balance                      # soldes BNB/USDT des deux wallets
+.venv/bin/python main.py wallet sweep --amount 100           # retire 100 USDT de Binance vers le BOT
+.venv/bin/python main.py wallet to-vault                     # déplace l'excédent BOT -> VAULT
+.venv/bin/python main.py wallet to-vault --amount 50         # ou un montant précis
+.venv/bin/python main.py --role vault wallet send --to 0x... --amount 50   # retrait du VAULT (VAULT_PASSWORD demandé)
 ```
 
+`wallet.auto_sweep.enabled: true` dans la config = le bot déplace seul l'excédent BOT → VAULT toutes les heures
+dès que le BOT dépasse `threshold` USDT (en gardant `keep_on_bot`).
+
 **Sécurité :**
-- Sauvegarde le fichier `data/keystore.json` **et** le mot de passe hors du Pi (sans les deux, fonds perdus)
-- `wallet sweep` nécessite le droit *withdraw* sur la clé API — ne l'active que si tu utilises cette commande,
-  et restreins les retraits à l'adresse du wallet (whitelist d'adresses sur Binance)
-- Prévois un peu de BNB sur le wallet pour payer le gas des envois sortants
+- Sauvegarde les deux fichiers keystore **et** leurs mots de passe hors du Pi (sans les deux, fonds perdus)
+- Importe le keystore dans MetaMask si tu veux juste *regarder* le wallet
+- `wallet sweep` nécessite le droit *withdraw* sur la clé API — restreins les retraits à l'adresse du BOT (whitelist Binance)
+- Prévois un peu de BNB sur le BOT pour payer le gas des transferts
+
+## Cotation PancakeSwap (CEX vs DEX)
+
+À chaque cycle, le bot cote le prix effectif d'un achat de `dex.notional` USDT sur PancakeSwap V2
+(`getAmountsOut` via le RPC public BSC, aucune clé, aucun gas) et enregistre l'écart avec le prix Binance.
+Affiché dans le dashboard ; alerte log/Telegram si |écart| > `dex.alert_spread_pct`.
+
+```bash
+.venv/bin/python main.py dex                                 # symboles de la config
+.venv/bin/python main.py dex --symbols BNB/USDT --notional 500
+```
+
+En pratique le DEX est ~0,1–0,5 % plus cher (frais LP 0,25 % + slippage) : trader sur PancakeSwap
+avec un petit capital n'est pas rentable face à Binance (0,1 %, sans gas). Cette brique sert à le mesurer,
+pas à trader.
 
 ## Tourner en continu (systemd)
 
@@ -138,6 +168,16 @@ sudo systemctl enable --now trading-bot trading-bot-web
 sudo systemctl status trading-bot
 journalctl -u trading-bot -f      # logs en direct
 ```
+
+## Redéployer depuis le PC
+
+```bash
+./scripts/deploy.sh                    # florian@192.168.1.158 par défaut
+./scripts/deploy.sh pi@192.168.1.50    # autre cible
+```
+
+Envoie uniquement les fichiers nécessaires (pas de tests, `.git`, venv, données ni secrets), met à jour
+les dépendances et redémarre les services. Nécessite une clé SSH installée sur le Pi (`ssh-copy-id`).
 
 ## Dashboard web
 

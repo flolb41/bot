@@ -52,15 +52,31 @@ rewards:
   dust_enabled: true # conversion des poussières en BNB (mode live)
   paper_apr_pct: 5.0 # APR simulé du coffre en mode paper
 
-# Wallet on-chain local (BSC) : clé privée chiffrée (keystore V3), mot de passe via WALLET_PASSWORD.
-# Sert de stockage sécurisé hors exchange (commandes: wallet create/address/balance/sweep/send).
+# Wallets on-chain locaux (BSC), clés privées chiffrées (keystore V3).
+# - BOT   : wallet opérationnel, mot de passe WALLET_PASSWORD (le seul connu du bot)
+# - VAULT : coffre-fort, mot de passe VAULT_PASSWORD (jamais chargé par le bot en marche)
+# Le bot peut déposer sur le VAULT mais jamais en retirer.
 wallet:
-  keystore_path: "data/keystore.json"
+  keystore_path: "data/keystore.json" # wallet BOT
+  vault_keystore_path: "data/keystore_vault.json" # wallet VAULT
   network: "BSC" # code réseau côté exchange pour les retraits
   rpc_url: "https://bsc-dataseed.binance.org"
   chain_id: 56
   usdt_contract: "0x55d398326f99059fF775485246999027B3197955" # USDT BEP-20
   usdt_decimals: 18
+  auto_sweep:
+    enabled: false # true = le bot déplace seul l'excédent USDT du BOT vers le VAULT
+    threshold: 200 # déclenche quand le wallet BOT dépasse ce montant USDT
+    keep_on_bot: 50 # USDT conservés sur le wallet BOT après transfert
+
+# Cotation PancakeSwap V2 en lecture seule (RPC public, aucune clé, aucun gas).
+# Sert à mesurer l'écart de prix CEX/DEX, pas à trader.
+dex:
+  enabled: true
+  router: "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+  notional: 100 # montant USDT simulé pour la cotation (intègre le slippage réel)
+  alert_spread_pct: 1.0 # log + Telegram si |écart| dépasse ce %
+  tokens: {} # surcharges/ajouts : SYMBOLE: "0xadresse" (BTC, ETH, BNB, USDT, BUSD prédéfinis)
 
 database:
   path: "data/trading_bot.db"

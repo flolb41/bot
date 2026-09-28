@@ -56,8 +56,12 @@
         <div class="value" id="kpi-positions">—</div>
       </div>
       <div class="card wallet">
-        <div class="label">Wallet on-chain</div>
+        <div class="label">Wallet BOT (on-chain)</div>
         <div class="value small" id="kpi-wallet">—</div>
+      </div>
+      <div class="card wallet">
+        <div class="label">Wallet VAULT (coffre-fort)</div>
+        <div class="value small" id="kpi-vault-wallet">—</div>
       </div>
     </section>
 
@@ -69,6 +73,18 @@
       <div class="panel">
         <h2>PnL par symbole</h2>
         <canvas id="pnl-chart"></canvas>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Écart de prix CEX / PancakeSwap <span class="hint">positif = DEX plus cher</span></h2>
+      <div class="table-wrap">
+        <table id="spreads-table">
+          <thead>
+            <tr><th>Symbole</th><th>Prix CEX</th><th>Prix DEX</th><th>Écart</th><th>MAJ</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
     </section>
 

@@ -176,6 +176,12 @@ main {
     align-items: center;
 }
 
+.panel h2 .hint {
+    font-size: 11px;
+    font-weight: 400;
+    text-transform: none;
+}
+
 .panel canvas {
     max-height: 280px;
 }

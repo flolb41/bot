@@ -104,53 +104,79 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(f"Coffre: {vault_amount:.2f} {quote} | Récompenses cumulées: {vault_rewards:.4f} {quote}")
 
 
-def _get_wallet(config):
+def _get_wallet(config, role: str = "bot"):
     from bot.wallet import Wallet
 
     wallet_cfg = config.get("wallet", {}) or {}
+    key = "vault_keystore_path" if role == "vault" else "keystore_path"
+    default = "data/keystore_vault.json" if role == "vault" else "data/keystore.json"
     return Wallet(
-        keystore_path=wallet_cfg.get("keystore_path", "data/keystore.json"),
+        keystore_path=wallet_cfg.get(key, default),
         rpc_url=wallet_cfg.get("rpc_url", "https://bsc-dataseed.binance.org"),
         chain_id=int(wallet_cfg.get("chain_id", 56)),
     ), wallet_cfg
 
 
-def _wallet_password() -> str:
+def _wallet_password(role: str = "bot") -> str:
     import getpass
     import os
 
-    password = os.environ.get("WALLET_PASSWORD", "")
+    env_var = "VAULT_PASSWORD" if role == "vault" else "WALLET_PASSWORD"
+    password = os.environ.get(env_var, "")
     if not password:
-        password = getpass.getpass("Mot de passe du wallet: ")
+        password = getpass.getpass(f"Mot de passe du wallet {role.upper()}: ")
     return password
+
+
+def _build_treasury(config):
+    from bot.treasury import Treasury
+
+    bot_wallet, wallet_cfg = _get_wallet(config, "bot")
+    vault_wallet, _ = _get_wallet(config, "vault")
+    sweep_cfg = wallet_cfg.get("auto_sweep", {}) or {}
+    return Treasury(
+        bot_wallet=bot_wallet,
+        vault_wallet=vault_wallet,
+        usdt_contract=wallet_cfg.get("usdt_contract", "0x55d398326f99059fF775485246999027B3197955"),
+        usdt_decimals=int(wallet_cfg.get("usdt_decimals", 18)),
+        sweep_threshold=float(sweep_cfg.get("threshold", 200.0)),
+        keep_on_bot=float(sweep_cfg.get("keep_on_bot", 50.0)),
+    )
 
 
 def cmd_wallet(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     setup_logger(level=config["logging"]["level"], log_file=config["logging"]["file"])
-    wallet, wallet_cfg = _get_wallet(config)
+    role = getattr(args, "role", "bot")
+    wallet, wallet_cfg = _get_wallet(config, role)
 
     if args.wallet_command == "create":
-        password = _wallet_password()
+        password = _wallet_password(role)
         if not password:
             raise SystemExit("Mot de passe vide refusé.")
         address = wallet.create(wallet.keystore_path, password)
-        print(f"Wallet créé. Adresse: {address}")
+        print(f"Wallet {role.upper()} créé. Adresse: {address}")
         print(f"Keystore chiffré: {wallet.keystore_path}")
         print("⚠️  Sauvegarde ce fichier keystore ET le mot de passe hors du Pi (sans les deux, fonds perdus).")
+        if role == "vault":
+            print("⚠️  Ne mets PAS VAULT_PASSWORD dans le .env du Pi : le bot ne doit jamais pouvoir vider le vault.")
 
     elif args.wallet_command == "address":
         print(wallet.address)
 
     elif args.wallet_command == "balance":
-        print(f"Adresse : {wallet.address}")
-        print(f"BNB     : {wallet.native_balance():.6f}")
-        token = wallet_cfg.get("usdt_contract", "0x55d398326f99059fF775485246999027B3197955")
-        decimals = int(wallet_cfg.get("usdt_decimals", 18))
-        print(f"USDT    : {wallet.token_balance(token, decimals):.4f}")
+        treasury = _build_treasury(config)
+        for name, info in treasury.balances().items():
+            print(f"=== {name.upper()} ===")
+            if info is None:
+                print("  non créé")
+                continue
+            print(f"  Adresse : {info['address']}")
+            print(f"  BNB     : {info['bnb']:.6f}")
+            print(f"  USDT    : {info['usdt']:.4f}")
 
     elif args.wallet_command == "sweep":
-        # Retire du USDT de l'exchange vers le wallet local (nécessite le droit 'withdraw' sur la clé API)
+        # Retire du USDT de l'exchange vers le wallet BOT (nécessite le droit 'withdraw' sur la clé API)
         exch_cfg = config["exchange"]
         exchange = ExchangeClient(
             name=exch_cfg["name"],
@@ -164,12 +190,50 @@ def cmd_wallet(args: argparse.Namespace) -> None:
         print(f"Retrait soumis: {result.get('id', result)}")
 
     elif args.wallet_command == "send":
-        # Renvoie du USDT du wallet vers une adresse (ex: adresse de dépôt de l'exchange)
-        password = _wallet_password()
+        # Envoie du USDT depuis le wallet choisi vers une adresse (ex: dépôt exchange)
+        password = _wallet_password(role)
         token = wallet_cfg.get("usdt_contract", "0x55d398326f99059fF775485246999027B3197955")
         decimals = int(wallet_cfg.get("usdt_decimals", 18))
         tx_hash = wallet.send_token(password, token, args.to, args.amount, decimals)
-        print(f"Transaction envoyée: {tx_hash}")
+        print(f"Transaction envoyée depuis {role.upper()}: {tx_hash}")
+
+    elif args.wallet_command == "to-vault":
+        treasury = _build_treasury(config)
+        amount = args.amount if args.amount else treasury.sweep_amount()
+        if amount <= 0:
+            print("Rien à transférer (sous le seuil ou wallet BOT vide).")
+            return
+        print(f"Transfert de {amount:.4f} USDT du wallet BOT vers le VAULT {treasury.vault.address}...")
+        tx_hash = treasury.sweep_to_vault(_wallet_password("bot"), amount)
+        print(f"Transaction: {tx_hash}")
+
+
+def cmd_dex(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    from bot.dex import PancakeQuoter
+
+    dex_cfg = config.get("dex", {}) or {}
+    wallet_cfg = config.get("wallet", {}) or {}
+    quoter = PancakeQuoter(
+        rpc_url=wallet_cfg.get("rpc_url", "https://bsc-dataseed.binance.org"),
+        router=dex_cfg.get("router", "0x10ED43C718714eb63d5aA57B78B54704E256024E"),
+        tokens=dex_cfg.get("tokens") or {},
+    )
+    exch_cfg = config["exchange"]
+    exchange = ExchangeClient(name=exch_cfg["name"], sandbox=False)
+    notional = args.notional or float(dex_cfg.get("notional", 100.0))
+    symbols = args.symbols.split(",") if args.symbols else config["trading"]["symbols"]
+
+    rows = []
+    for symbol in symbols:
+        cex = exchange.fetch_ticker_price(symbol)
+        try:
+            dex = quoter.quote_price(symbol, notional)
+            rows.append([symbol, f"{cex:.4f}", f"{dex:.4f}", f"{quoter.spread_pct(cex, dex):+.3f} %"])
+        except Exception as exc:
+            rows.append([symbol, f"{cex:.4f}", "n/a", str(exc)[:40]])
+    print(f"\nCotation pour {notional:g} USDT (PancakeSwap V2 vs {exch_cfg['name']})")
+    print(tabulate(rows, headers=["Symbole", "CEX", "DEX", "Écart DEX/CEX"]))
 
 
 def cmd_rewards(args: argparse.Namespace) -> None:
@@ -243,17 +307,25 @@ def main() -> None:
     p_status = sub.add_parser("status", help="Affiche l'état actuel du bot")
     p_status.set_defaults(func=cmd_status)
 
-    p_wallet = sub.add_parser("wallet", help="Gère le wallet on-chain local sécurisé")
+    p_wallet = sub.add_parser("wallet", help="Gère les wallets on-chain (BOT opérationnel / VAULT coffre-fort)")
+    p_wallet.add_argument("--role", choices=["bot", "vault"], default="bot", help="Wallet ciblé (défaut: bot)")
     wallet_sub = p_wallet.add_subparsers(dest="wallet_command", required=True)
-    wallet_sub.add_parser("create", help="Crée un nouveau wallet (keystore chiffré)")
+    wallet_sub.add_parser("create", help="Crée un wallet (keystore chiffré)")
     wallet_sub.add_parser("address", help="Affiche l'adresse publique")
-    wallet_sub.add_parser("balance", help="Affiche les soldes BNB et USDT on-chain")
-    p_sweep = wallet_sub.add_parser("sweep", help="Retire du USDT de l'exchange vers le wallet")
+    wallet_sub.add_parser("balance", help="Affiche les soldes BNB/USDT des deux wallets")
+    p_sweep = wallet_sub.add_parser("sweep", help="Retire du USDT de l'exchange vers le wallet BOT")
     p_sweep.add_argument("--amount", type=float, required=True, help="Montant USDT à retirer")
     p_send = wallet_sub.add_parser("send", help="Envoie du USDT du wallet vers une adresse")
     p_send.add_argument("--to", required=True, help="Adresse destinataire (ex: dépôt exchange)")
     p_send.add_argument("--amount", type=float, required=True, help="Montant USDT à envoyer")
+    p_to_vault = wallet_sub.add_parser("to-vault", help="Déplace l'excédent USDT du BOT vers le VAULT")
+    p_to_vault.add_argument("--amount", type=float, default=None, help="Montant (défaut: excédent selon config)")
     p_wallet.set_defaults(func=cmd_wallet)
+
+    p_dex = sub.add_parser("dex", help="Compare les prix CEX et PancakeSwap (lecture seule)")
+    p_dex.add_argument("--symbols", default="", help="Symboles séparés par des virgules")
+    p_dex.add_argument("--notional", type=float, default=None, help="Montant USDT simulé")
+    p_dex.set_defaults(func=cmd_dex)
 
     p_rewards = sub.add_parser("rewards", help="Coffre et collecte de récompenses")
     rewards_sub = p_rewards.add_subparsers(dest="rewards_command", required=True)

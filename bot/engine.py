@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import time
 
 from bot.config import Config
 from bot.db import Database
+from bot.dex import PancakeQuoter
 from bot.exchange import ExchangeClient
 from bot.notifier import TelegramNotifier
 from bot.portfolio import PaperPortfolio
 from bot.rewards import RewardsCollector
 from bot.risk import RiskManager, RiskParams
 from bot.strategies import Signal, get_strategy
+from bot.treasury import Treasury
+from bot.wallet import Wallet
 
 
 class TradingEngine:
@@ -83,6 +87,34 @@ class TradingEngine:
                 keep_free=float(rewards_cfg.get("keep_free", 100.0)),
                 min_trading_balance=float(rewards_cfg.get("min_trading_balance", 50.0)),
                 dust_enabled=bool(rewards_cfg.get("dust_enabled", True)),
+            )
+
+        dex_cfg = config.get("dex", {}) or {}
+        wallet_cfg = config.get("wallet", {}) or {}
+        self.quoter: PancakeQuoter | None = None
+        self.dex_notional = float(dex_cfg.get("notional", 100.0))
+        self.dex_alert_pct = float(dex_cfg.get("alert_spread_pct", 1.0))
+        if dex_cfg.get("enabled", False):
+            self.quoter = PancakeQuoter(
+                rpc_url=wallet_cfg.get("rpc_url", "https://bsc-dataseed.binance.org"),
+                router=dex_cfg.get("router", "0x10ED43C718714eb63d5aA57B78B54704E256024E"),
+                tokens=dex_cfg.get("tokens") or {},
+                quote_currency=self.quote_currency,
+            )
+
+        sweep_cfg = wallet_cfg.get("auto_sweep", {}) or {}
+        self.treasury: Treasury | None = None
+        self._last_sweep_check = 0.0
+        if sweep_cfg.get("enabled", False):
+            rpc = wallet_cfg.get("rpc_url", "https://bsc-dataseed.binance.org")
+            chain_id = int(wallet_cfg.get("chain_id", 56))
+            self.treasury = Treasury(
+                bot_wallet=Wallet(wallet_cfg.get("keystore_path", "data/keystore.json"), rpc, chain_id),
+                vault_wallet=Wallet(wallet_cfg.get("vault_keystore_path", "data/keystore_vault.json"), rpc, chain_id),
+                usdt_contract=wallet_cfg.get("usdt_contract", "0x55d398326f99059fF775485246999027B3197955"),
+                usdt_decimals=int(wallet_cfg.get("usdt_decimals", 18)),
+                sweep_threshold=float(sweep_cfg.get("threshold", 200.0)),
+                keep_on_bot=float(sweep_cfg.get("keep_on_bot", 50.0)),
             )
 
         signal.signal(signal.SIGINT, self._handle_stop)
@@ -168,9 +200,40 @@ class TradingEngine:
         except Exception:
             self.logger.exception("Erreur dans la gestion du coffre")
 
+    def _record_spread(self, symbol: str, cex_price: float) -> None:
+        """Cote le prix DEX et enregistre l'écart CEX/DEX (lecture seule, aucun gas)."""
+        if self.quoter is None:
+            return
+        try:
+            dex_price = self.quoter.quote_price(symbol, self.dex_notional)
+            spread = self.quoter.spread_pct(cex_price, dex_price)
+            self.db.set_spread(symbol, cex_price, dex_price, spread)
+            if abs(spread) >= self.dex_alert_pct:
+                msg = f"📊 Écart CEX/DEX {symbol}: {spread:+.2f}% (CEX {cex_price:.2f} / DEX {dex_price:.2f})"
+                self.logger.info(msg)
+                self.notifier.send(msg)
+        except Exception as exc:
+            self.logger.debug("Cotation DEX indisponible pour %s: %s", symbol, exc)
+
+    def _manage_onchain_treasury(self) -> None:
+        """Toutes les heures : déplace l'excédent USDT du wallet BOT vers le VAULT."""
+        if self.treasury is None or time.time() - self._last_sweep_check < 3600:
+            return
+        self._last_sweep_check = time.time()
+        password = os.environ.get("WALLET_PASSWORD", "")
+        if not password or not self.treasury.ready():
+            return
+        try:
+            tx = self.treasury.sweep_to_vault(password)
+            if tx:
+                self.notifier.send(f"🔐 Excédent USDT sécurisé dans le VAULT — tx {tx}")
+        except Exception:
+            self.logger.exception("Erreur lors du transfert vers le vault")
+
     def process_symbol(self, symbol: str) -> None:
         df = self.exchange.fetch_ohlcv_df(symbol, self.timeframe, limit=max(200, self.strategy.min_candles + 10))
         current_price = float(df["close"].iloc[-1])
+        self._record_spread(symbol, current_price)
         position = self.db.get_position(symbol)
 
         if position is not None:
@@ -225,6 +288,7 @@ class TradingEngine:
                     self.notifier.send(f"⚠️ Erreur sur {symbol}, voir les logs")
 
             self._manage_treasury()
+            self._manage_onchain_treasury()
 
             if self.mode == "paper" and self.portfolio is not None:
                 self.portfolio.snapshot(self._open_positions_value())

@@ -69,6 +69,14 @@ class Database:
                     total_rewards REAL NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS spreads (
+                    symbol TEXT PRIMARY KEY,
+                    cex_price REAL NOT NULL,
+                    dex_price REAL NOT NULL,
+                    spread_pct REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
                 """
             )
 
@@ -201,3 +209,16 @@ class Database:
                    ON CONFLICT(asset) DO UPDATE SET amount = ?, total_rewards = ?, updated_at = ?""",
                 (asset, amount, total_rewards, time.time(), amount, total_rewards, time.time()),
             )
+
+    # --- Spreads CEX/DEX ---------------------------------------------------
+    def set_spread(self, symbol: str, cex_price: float, dex_price: float, spread_pct: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO spreads (symbol, cex_price, dex_price, spread_pct, updated_at) VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(symbol) DO UPDATE SET cex_price = ?, dex_price = ?, spread_pct = ?, updated_at = ?""",
+                (symbol, cex_price, dex_price, spread_pct, time.time(), cex_price, dex_price, spread_pct, time.time()),
+            )
+
+    def get_spreads(self) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM spreads ORDER BY symbol").fetchall()
