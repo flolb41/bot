@@ -277,6 +277,32 @@ def cmd_rewards(args: argparse.Namespace) -> None:
     print(f"Récompenses cumulées : {collector.total_rewards():.4f}")
 
 
+def cmd_check(args: argparse.Namespace) -> None:
+    """Vérifie la connexion à l'exchange avec les clés du .env, sans jamais les afficher."""
+    config = load_config(args.config)
+    exch_cfg = config["exchange"]
+    trading_cfg = config["trading"]
+    key, secret = exch_cfg.get("api_key", ""), exch_cfg.get("api_secret", "")
+
+    print(f"Exchange : {exch_cfg['name']} | sandbox/testnet : {exch_cfg.get('sandbox', True)} | mode : {trading_cfg['mode']}")
+    print(f"Clé API  : {'présente (' + str(len(key)) + ' car.)' if key else 'ABSENTE'} | secret : {'présent' if secret else 'ABSENT'}")
+    if not key or not secret:
+        raise SystemExit("Renseigne EXCHANGE_API_KEY et EXCHANGE_API_SECRET dans .env")
+
+    exchange = ExchangeClient(name=exch_cfg["name"], api_key=key, api_secret=secret, sandbox=bool(exch_cfg.get("sandbox", True)))
+    print(f"Prix {trading_cfg['symbols'][0]} : {exchange.fetch_ticker_price(trading_cfg['symbols'][0]):.4f}  (données publiques OK)")
+    try:
+        balance = exchange.exchange.fetch_balance()
+    except Exception as exc:
+        raise SystemExit(f"❌ Authentification refusée : {type(exc).__name__}: {str(exc)[:200]}")
+    nonzero = {k: v for k, v in balance.get("total", {}).items() if v}
+    print("✅ Authentification OK. Soldes non nuls :")
+    for asset, amount in sorted(nonzero.items()):
+        print(f"   {asset:<8} {amount}")
+    if not nonzero:
+        print("   (aucun)")
+
+
 def cmd_web(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     setup_logger(level=config["logging"]["level"], log_file=config["logging"]["file"])
@@ -306,6 +332,9 @@ def main() -> None:
 
     p_status = sub.add_parser("status", help="Affiche l'état actuel du bot")
     p_status.set_defaults(func=cmd_status)
+
+    p_check = sub.add_parser("check", help="Teste la connexion API à l'exchange (sans afficher les clés)")
+    p_check.set_defaults(func=cmd_check)
 
     p_wallet = sub.add_parser("wallet", help="Gère les wallets on-chain (BOT opérationnel / VAULT coffre-fort)")
     p_wallet.add_argument("--role", choices=["bot", "vault"], default="bot", help="Wallet ciblé (défaut: bot)")
