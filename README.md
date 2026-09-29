@@ -216,3 +216,17 @@ pytest -q
 
 Créer un fichier dans `bot/strategies/`, hériter de `Strategy` (dans `base.py`), implémenter `generate_signal(df)`,
 puis l'enregistrer dans `bot/strategies/__init__.py` (dict `STRATEGIES`).
+
+Stratégies fournies (backtest 90 j, BTC + ETH, 1h, 10 % du capital par trade) :
+
+| Stratégie | Type | Rdt | Trades | Win | DD max | Profil |
+|---|---|---|---|---|---|---|
+| `ema_rsi` | suivi de tendance | +0,87 % | 99 | 30 % | 1,08 % | pertes petites fréquentes, gains larges ; perd en range |
+| `bollinger_rsi` | retour à la moyenne | +0,46 % | 31 | 81 % | 0,14 % | gagne en range, peu de trades ; préférer `trailing_stop_pct: 0` |
+
+Le 15m est perdant pour `ema_rsi` (frais) et neutre pour `bollinger_rsi`. Comparer avec :
+
+```bash
+python scripts/compare_backtests.py --days 90 --strategy ema_rsi,bollinger_rsi --timeframes 1h,4h
+python main.py backtest --set strategy.name=bollinger_rsi --set risk.trailing_stop_pct=0
+```

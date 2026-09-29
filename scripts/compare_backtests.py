@@ -35,6 +35,7 @@ def main() -> None:
     parser.add_argument("--stop", default="2", help="valeurs de stop_loss_pct")
     parser.add_argument("--tp", default="4", help="valeurs de take_profit_pct")
     parser.add_argument("--ema", default="", help="paires ema_fast/ema_slow, ex: 9/21,12/26,20/50 (défaut: config)")
+    parser.add_argument("--strategy", default="", help="stratégies à comparer, ex: ema_rsi,bollinger_rsi (défaut: config)")
     args = parser.parse_args()
 
     config = load_config()
@@ -49,9 +50,8 @@ def main() -> None:
     stops = [float(x) for x in args.stop.split(",")]
     tps = [float(x) for x in args.tp.split(",")]
     base_params = dict(strat_cfg.get("params", {}))
-    emas = [tuple(int(v) for v in pair.split("/")) for pair in args.ema.split(",")] if args.ema else [
-        (base_params.get("ema_fast", 9), base_params.get("ema_slow", 21))
-    ]
+    strategies = args.strategy.split(",") if args.strategy else [strat_cfg["name"]]
+    emas = [tuple(int(v) for v in pair.split("/")) for pair in args.ema.split(",")] if args.ema else [None]
 
     data: dict[tuple[str, str], object] = {}
     for symbol, tf in itertools.product(symbols, timeframes):
@@ -59,9 +59,14 @@ def main() -> None:
         data[(symbol, tf)] = fetch_historical(exchange, symbol, tf, args.days)
 
     rows = []
-    for tf, trailing, stop, tp, (ema_fast, ema_slow) in itertools.product(timeframes, trailings, stops, tps, emas):
+    for strat_name, tf, trailing, stop, tp, ema in itertools.product(strategies, timeframes, trailings, stops, tps, emas):
         risk = RiskManager(RiskParams(stop_loss_pct=stop, take_profit_pct=tp, trailing_stop_pct=trailing), db)
-        strategy = get_strategy(strat_cfg["name"], {**base_params, "ema_fast": ema_fast, "ema_slow": ema_slow})
+        # Les params de la config ne s'appliquent qu'à la stratégie configurée ; les autres prennent leurs défauts
+        params = dict(base_params) if strat_name == strat_cfg["name"] else {}
+        if ema:
+            params.update(ema_fast=ema[0], ema_slow=ema[1])
+        strategy = get_strategy(strat_name, params)
+        ema_label = f"{ema[0]}/{ema[1]}" if ema else "-"
         total_ret, total_trades, wins, closed, max_dd = 0.0, 0, 0, 0, 0.0
         per_symbol = []
         for symbol in symbols:
@@ -79,7 +84,7 @@ def main() -> None:
             max_dd = max(max_dd, r.max_drawdown_pct)
             per_symbol.append(f"{r.total_return_pct:+.2f}")
         rows.append([
-            tf, f"{ema_fast}/{ema_slow}", trailing or "off", stop, tp,
+            strat_name, tf, ema_label, trailing or "off", stop, tp,
             f"{total_ret / len(symbols):+.2f} %",
             " / ".join(per_symbol),
             total_trades,
@@ -87,9 +92,9 @@ def main() -> None:
             f"{max_dd:.2f} %",
         ])
 
-    rows.sort(key=lambda r: float(r[5].split()[0]), reverse=True)
-    print(f"\nGrille sur {args.days} jours — {', '.join(symbols)} — stratégie {strat_cfg['name']}\n")
-    print(tabulate(rows, headers=["TF", "EMA", "Trailing %", "SL %", "TP %", "Rdt moyen", "Rdt par symbole", "Trades", "Win", "DD max"]))
+    rows.sort(key=lambda r: float(r[6].split()[0]), reverse=True)
+    print(f"\nGrille sur {args.days} jours — {', '.join(symbols)}\n")
+    print(tabulate(rows, headers=["Stratégie", "TF", "EMA", "Trailing %", "SL %", "TP %", "Rdt moyen", "Rdt par symbole", "Trades", "Win", "DD max"]))
 
 
 if __name__ == "__main__":

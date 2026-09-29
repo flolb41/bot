@@ -1,10 +1,12 @@
 """Package des stratégies de trading."""
 
 from .base import Signal, Strategy
+from .bollinger_rsi import BollingerRsiStrategy
 from .ema_rsi import EmaRsiStrategy
 
 STRATEGIES = {
     "ema_rsi": EmaRsiStrategy,
+    "bollinger_rsi": BollingerRsiStrategy,
 }
 
 

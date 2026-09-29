@@ -21,13 +21,17 @@ trading:
   fee_pct: 0.1 # frais simulés par trade en mode paper (%)
 
 strategy:
-  name: ema_rsi
+  name: ema_rsi # suivi de tendance (backtest 90j 1h : +0,87 %, 99 trades, win 30 %)
   params:
     ema_fast: 9
     ema_slow: 21
     rsi_period: 14
     rsi_overbought: 70
     rsi_oversold: 30
+  # Alternative : retour à la moyenne, peu de trades mais 80 % gagnants, drawdown minime
+  # (backtest 90j 1h : +0,46 % avec trailing_stop_pct: 0 et stop_loss_pct: 3)
+  # name: bollinger_rsi
+  # params: { bb_period: 20, bb_std: 2.0, rsi_period: 14, rsi_oversold_max: 35, rsi_overbought: 70, exit_at: middle }
 
 risk:
   max_open_positions: 3
