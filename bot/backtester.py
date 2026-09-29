@@ -93,8 +93,11 @@ def run_backtest(
     highest_since_entry = 0.0
 
     min_candles = strategy.min_candles
+    # Fenêtre bornée : les EMA (adjust=False) convergent bien avant 10x la période max,
+    # inutile de recalculer sur tout l'historique à chaque bougie.
+    lookback = max(300, min_candles * 10)
     for i in range(min_candles, len(df)):
-        window = df.iloc[: i + 1]
+        window = df.iloc[max(0, i + 1 - lookback) : i + 1]
         price = float(window["close"].iloc[-1])
 
         if position is not None:

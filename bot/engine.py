@@ -33,6 +33,8 @@ class TradingEngine:
         self.quote_currency: str = trading_cfg["quote_currency"]
         self.allocation_pct: float = float(trading_cfg["allocation_pct"])
         self.fee_pct: float = float(trading_cfg.get("fee_pct", 0.1))
+        # En live, plafonne le capital considéré par le bot (0 = pas de plafond)
+        self.max_capital: float = float(trading_cfg.get("max_capital", 0) or 0)
 
         exch_cfg = config["exchange"]
         self.exchange = ExchangeClient(
@@ -128,7 +130,11 @@ class TradingEngine:
     def _get_balance(self) -> float:
         if self.mode == "paper":
             return self.portfolio.balance
-        return self.exchange.fetch_balance(self.quote_currency)
+        balance = self.exchange.fetch_balance(self.quote_currency)
+        if self.max_capital > 0:
+            invested = sum(p["entry_price"] * p["amount"] for p in self.db.get_all_positions())
+            balance = min(balance, max(0.0, self.max_capital - invested))
+        return balance
 
     def _open_positions_value(self) -> float:
         total = 0.0
@@ -141,10 +147,19 @@ class TradingEngine:
         return total
 
     def _execute_buy(self, symbol: str, price: float, amount: float) -> None:
+        if self.mode == "live":
+            amount = self.exchange.amount_to_precision(symbol, amount)
+            if amount <= 0:
+                self.logger.warning("Quantité trop faible pour %s après arrondi, achat ignoré", symbol)
+                return
         cost = price * amount
         fee = cost * (self.fee_pct / 100.0)
         if self.mode == "live":
-            self.exchange.create_market_order(symbol, "buy", amount)
+            order = self.exchange.create_market_order(symbol, "buy", amount)
+            filled = float(order.get("filled") or amount)
+            avg = float(order.get("average") or price)
+            fee = float((order.get("fee") or {}).get("cost") or fee)
+            amount, price, cost = filled, avg, avg * filled
         else:
             self.portfolio.apply_buy(cost + fee)
 
@@ -157,14 +172,20 @@ class TradingEngine:
 
     def _execute_sell(self, symbol: str, price: float, position, reason: str) -> None:
         amount = position["amount"]
+        if self.mode == "live":
+            amount = self.exchange.amount_to_precision(symbol, amount)
         cost = price * amount
         fee = cost * (self.fee_pct / 100.0)
-        pnl = (price - position["entry_price"]) * amount - fee
 
         if self.mode == "live":
-            self.exchange.create_market_order(symbol, "sell", amount)
+            order = self.exchange.create_market_order(symbol, "sell", amount)
+            filled = float(order.get("filled") or amount)
+            avg = float(order.get("average") or price)
+            fee = float((order.get("fee") or {}).get("cost") or fee)
+            amount, price, cost = filled, avg, avg * filled
         else:
             self.portfolio.apply_sell(cost - fee)
+        pnl = (price - position["entry_price"]) * amount - fee
 
         self.db.close_position(symbol)
         self.db.record_trade(symbol, "sell", price, amount, cost, self.mode, fee=fee, pnl=pnl, reason=reason)
@@ -292,6 +313,12 @@ class TradingEngine:
 
             if self.mode == "paper" and self.portfolio is not None:
                 self.portfolio.snapshot(self._open_positions_value())
+            elif self.mode == "live":
+                try:
+                    balance = self._get_balance()
+                    self.db.record_equity(balance, balance + self._open_positions_value())
+                except Exception:
+                    self.logger.exception("Snapshot equity impossible")
 
             elapsed = time.time() - cycle_start
             sleep_time = max(1.0, self.poll_interval - elapsed)

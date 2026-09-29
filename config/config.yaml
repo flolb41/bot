@@ -12,9 +12,10 @@ trading:
   symbols:
     - "BTC/USDT"
     - "ETH/USDT"
-  timeframe: "15m" # bougies utilisées pour l'analyse
+  timeframe: "1h" # bougies utilisées pour l'analyse (1h validé par backtest 90j ; 15m perdant à cause des frais)
   poll_interval_seconds: 60 # fréquence de vérification du marché
   starting_balance: 1000.0 # solde virtuel de départ en mode paper
+  max_capital: 0 # mode live : plafonne le capital utilisé par le bot (0 = tout le solde disponible)
   quote_currency: "USDT"
   allocation_pct: 10 # % du solde disponible investi par trade
   fee_pct: 0.1 # frais simulés par trade en mode paper (%)

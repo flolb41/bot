@@ -30,8 +30,22 @@ def cmd_run(args: argparse.Namespace) -> None:
     engine.run()
 
 
+def _apply_overrides(config, overrides: list[str]) -> None:
+    """Applique des surcharges `section.cle=valeur` à la config chargée (valeurs parsées en YAML)."""
+    import yaml
+
+    for item in overrides or []:
+        path, _, raw = item.partition("=")
+        keys = path.split(".")
+        node = config.raw
+        for key in keys[:-1]:
+            node = node.setdefault(key, {})
+        node[keys[-1]] = yaml.safe_load(raw)
+
+
 def cmd_backtest(args: argparse.Namespace) -> None:
     config = load_config(args.config)
+    _apply_overrides(config, args.set)
     setup_logger(level=config["logging"]["level"], log_file=config["logging"]["file"])
     logger = logging.getLogger("bot.backtest")
 
@@ -328,6 +342,8 @@ def main() -> None:
     p_backtest = sub.add_parser("backtest", help="Lance un backtest sur données historiques")
     p_backtest.add_argument("--days", type=int, default=30, help="Nombre de jours d'historique")
     p_backtest.add_argument("--symbols", default="", help="Liste de symboles séparés par des virgules")
+    p_backtest.add_argument("--set", action="append", default=[], metavar="SECTION.CLE=VALEUR",
+                            help="Surcharge un paramètre (ex: --set trading.timeframe=1h --set risk.trailing_stop_pct=3)")
     p_backtest.set_defaults(func=cmd_backtest)
 
     p_status = sub.add_parser("status", help="Affiche l'état actuel du bot")
