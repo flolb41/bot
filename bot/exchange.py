@@ -45,6 +45,23 @@ class ExchangeClient:
         """Passe un ordre marché réel. Utilisé uniquement en mode 'live'."""
         return self.exchange.create_order(symbol, "market", side, amount)
 
+    def create_guarded_order(self, symbol: str, side: str, amount: float, ref_price: float, max_slippage_pct: float) -> dict[str, Any]:
+        """Ordre limite IOC borné à ±max_slippage_pct du prix de référence.
+
+        Exécute immédiatement ce qui est disponible dans la limite de prix, annule le reste :
+        protège contre un carnet d'ordres vide (testnet) ou un pic de volatilité.
+        """
+        factor = 1 + max_slippage_pct / 100.0 if side == "buy" else 1 - max_slippage_pct / 100.0
+        limit_price = float(self.exchange.price_to_precision(symbol, ref_price * factor))
+        order = self.exchange.create_order(symbol, "limit", side, amount, limit_price, {"timeInForce": "IOC"})
+        # Certains exchanges renvoient un ordre incomplet : on recharge pour avoir filled/average/fee
+        if order.get("filled") is None or order.get("average") is None:
+            try:
+                order = self.exchange.fetch_order(order["id"], symbol)
+            except Exception as exc:
+                self.logger.debug("fetch_order impossible: %s", exc)
+        return order
+
     def withdraw(self, currency: str, amount: float, address: str, network: str) -> dict[str, Any]:
         """Retire des fonds vers une adresse on-chain (nécessite le droit 'withdraw' sur la clé API)."""
         return self.exchange.withdraw(currency, amount, address, params={"network": network})

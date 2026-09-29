@@ -5,6 +5,9 @@ import logging
 import os
 import signal
 import time
+from dataclasses import dataclass
+
+import pandas as pd
 
 from bot.config import Config
 from bot.db import Database
@@ -14,9 +17,62 @@ from bot.notifier import TelegramNotifier
 from bot.portfolio import PaperPortfolio
 from bot.rewards import RewardsCollector
 from bot.risk import RiskManager, RiskParams
-from bot.strategies import Signal, get_strategy
+from bot.strategies import Signal, Strategy, get_strategy
 from bot.treasury import Treasury
 from bot.wallet import Wallet
+
+
+@dataclass
+class StrategySlot:
+    """Une stratégie active avec son propre risque, timeframe, symboles et allocation."""
+
+    name: str
+    strategy: Strategy
+    risk: RiskManager
+    timeframe: str
+    symbols: list[str]
+    allocation_pct: float
+
+
+def build_strategy_slots(config: Config, db: Database) -> list[StrategySlot]:
+    """Construit les slots depuis `strategies:` (liste) ou, à défaut, `strategy:` (unique)."""
+    trading_cfg = config["trading"]
+    base_risk = config["risk"]
+    entries = config.get("strategies")
+    if not entries:
+        entries = [config["strategy"]]
+
+    slots: list[StrategySlot] = []
+    for entry in entries:
+        if not entry.get("enabled", True):
+            continue
+        risk_over = entry.get("risk", {}) or {}
+        risk = RiskManager(
+            RiskParams(
+                max_open_positions=int(risk_over.get("max_open_positions", base_risk["max_open_positions"])),
+                stop_loss_pct=float(risk_over.get("stop_loss_pct", base_risk["stop_loss_pct"])),
+                take_profit_pct=float(risk_over.get("take_profit_pct", base_risk["take_profit_pct"])),
+                trailing_stop_pct=float(risk_over.get("trailing_stop_pct", base_risk.get("trailing_stop_pct", 0))),
+                max_daily_loss_pct=float(risk_over.get("max_daily_loss_pct", base_risk["max_daily_loss_pct"])),
+            ),
+            db,
+        )
+        slots.append(
+            StrategySlot(
+                name=entry["name"],
+                strategy=get_strategy(entry["name"], entry.get("params", {}) or {}),
+                risk=risk,
+                timeframe=entry.get("timeframe", trading_cfg["timeframe"]),
+                symbols=list(entry.get("symbols") or trading_cfg["symbols"]),
+                allocation_pct=float(entry.get("allocation_pct", trading_cfg["allocation_pct"])),
+            )
+        )
+    if not slots:
+        raise ValueError("Aucune stratégie active dans la configuration.")
+    names = [s.name for s in slots]
+    if len(names) != len(set(names)):
+        raise ValueError(f"Noms de stratégies dupliqués: {names} (les positions sont indexées par nom).")
+    return slots
 
 
 class TradingEngine:
@@ -33,6 +89,8 @@ class TradingEngine:
         self.quote_currency: str = trading_cfg["quote_currency"]
         self.allocation_pct: float = float(trading_cfg["allocation_pct"])
         self.fee_pct: float = float(trading_cfg.get("fee_pct", 0.1))
+        # Ordres live : limite IOC bornée à ±max_slippage_pct du dernier prix (0 = ordres market)
+        self.max_slippage_pct: float = float(trading_cfg.get("max_slippage_pct", 0.5))
         # En live, plafonne le capital considéré par le bot (0 = pas de plafond)
         self.max_capital: float = float(trading_cfg.get("max_capital", 0) or 0)
 
@@ -46,20 +104,10 @@ class TradingEngine:
 
         self.db = Database(config["database"]["path"])
 
-        strat_cfg = config["strategy"]
-        self.strategy = get_strategy(strat_cfg["name"], strat_cfg.get("params", {}))
-
-        risk_cfg = config["risk"]
-        self.risk = RiskManager(
-            RiskParams(
-                max_open_positions=int(risk_cfg["max_open_positions"]),
-                stop_loss_pct=float(risk_cfg["stop_loss_pct"]),
-                take_profit_pct=float(risk_cfg["take_profit_pct"]),
-                trailing_stop_pct=float(risk_cfg.get("trailing_stop_pct", 0)),
-                max_daily_loss_pct=float(risk_cfg["max_daily_loss_pct"]),
-            ),
-            self.db,
-        )
+        self.slots = build_strategy_slots(config, self.db)
+        # Limite globale de positions ouvertes toutes stratégies confondues
+        self.max_open_positions = int(config["risk"]["max_open_positions"])
+        self._ohlcv_cache: dict[tuple[str, str], pd.DataFrame] = {}
 
         tg_cfg = config.get("telegram", {})
         self.notifier = TelegramNotifier(
@@ -146,7 +194,23 @@ class TradingEngine:
             total += price * pos["amount"]
         return total
 
-    def _execute_buy(self, symbol: str, price: float, amount: float) -> None:
+    def _place_live_order(self, symbol: str, side: str, amount: float, ref_price: float) -> tuple[float, float, float]:
+        """Passe l'ordre live et retourne (quantité exécutée, prix moyen, frais)."""
+        if self.max_slippage_pct > 0:
+            order = self.exchange.create_guarded_order(symbol, side, amount, ref_price, self.max_slippage_pct)
+        else:
+            order = self.exchange.create_market_order(symbol, side, amount)
+        filled = float(order.get("filled") or 0.0)
+        avg = float(order.get("average") or ref_price)
+        fee = float((order.get("fee") or {}).get("cost") or (avg * filled * self.fee_pct / 100.0))
+        if filled < amount:
+            self.logger.warning(
+                "[%s %s] exécution partielle: %.8f / %.8f (garde-fou slippage %.2f%%)",
+                symbol, side, filled, amount, self.max_slippage_pct,
+            )
+        return filled, avg, fee
+
+    def _execute_buy(self, slot: StrategySlot, symbol: str, price: float, amount: float) -> None:
         if self.mode == "live":
             amount = self.exchange.amount_to_precision(symbol, amount)
             if amount <= 0:
@@ -155,48 +219,52 @@ class TradingEngine:
         cost = price * amount
         fee = cost * (self.fee_pct / 100.0)
         if self.mode == "live":
-            order = self.exchange.create_market_order(symbol, "buy", amount)
-            filled = float(order.get("filled") or amount)
-            avg = float(order.get("average") or price)
-            fee = float((order.get("fee") or {}).get("cost") or fee)
+            filled, avg, fee = self._place_live_order(symbol, "buy", amount, price)
+            if filled <= 0:
+                self.logger.warning("[%s] achat %s non exécuté (prix hors garde-fou), on réessaiera au prochain cycle", slot.name, symbol)
+                return
             amount, price, cost = filled, avg, avg * filled
         else:
             self.portfolio.apply_buy(cost + fee)
 
-        stop_loss, take_profit = self.risk.compute_stop_and_target(price)
-        self.db.open_position(symbol, "long", price, amount, stop_loss, take_profit)
-        self.db.record_trade(symbol, "buy", price, amount, cost, self.mode, fee=fee, reason="signal")
-        msg = f"🟢 ACHAT {symbol} @ {price:.4f} (qty {amount:.6f}) SL={stop_loss:.4f} TP={take_profit:.4f}"
+        stop_loss, take_profit = slot.risk.compute_stop_and_target(price)
+        self.db.open_position(symbol, "long", price, amount, stop_loss, take_profit, strategy=slot.name)
+        self.db.record_trade(symbol, "buy", price, amount, cost, self.mode, fee=fee, reason="signal", strategy=slot.name)
+        msg = f"🟢 [{slot.name}] ACHAT {symbol} @ {price:.4f} (qty {amount:.6f}) SL={stop_loss:.4f} TP={take_profit:.4f}"
         self.logger.info(msg)
         self.notifier.send(msg)
 
-    def _execute_sell(self, symbol: str, price: float, position, reason: str) -> None:
+    def _execute_sell(self, slot: StrategySlot, symbol: str, price: float, position, reason: str) -> None:
         amount = position["amount"]
         if self.mode == "live":
             amount = self.exchange.amount_to_precision(symbol, amount)
+        requested = amount
         cost = price * amount
         fee = cost * (self.fee_pct / 100.0)
 
         if self.mode == "live":
-            order = self.exchange.create_market_order(symbol, "sell", amount)
-            filled = float(order.get("filled") or amount)
-            avg = float(order.get("average") or price)
-            fee = float((order.get("fee") or {}).get("cost") or fee)
+            filled, avg, fee = self._place_live_order(symbol, "sell", amount, price)
+            if filled <= 0:
+                self.logger.warning("[%s] vente %s non exécutée (prix hors garde-fou), position conservée", slot.name, symbol)
+                return
             amount, price, cost = filled, avg, avg * filled
         else:
             self.portfolio.apply_sell(cost - fee)
         pnl = (price - position["entry_price"]) * amount - fee
 
-        self.db.close_position(symbol)
-        self.db.record_trade(symbol, "sell", price, amount, cost, self.mode, fee=fee, pnl=pnl, reason=reason)
+        if self.mode == "live" and amount < requested:
+            self.db.update_position_amount(symbol, requested - amount, strategy=slot.name)
+        else:
+            self.db.close_position(symbol, strategy=slot.name)
+        self.db.record_trade(symbol, "sell", price, amount, cost, self.mode, fee=fee, pnl=pnl, reason=reason, strategy=slot.name)
 
         if self.rewards is not None and pnl > 0:
             skimmed = self.rewards.skim_profit(pnl)
             if skimmed > 0 and self.mode == "paper":
                 self.portfolio.apply_buy(skimmed)  # débite le solde de trading vers le coffre
 
-        emoji = "🔴" if pnl < 0 else "✅"
-        msg = f"{emoji} VENTE {symbol} @ {price:.4f} PnL={pnl:.4f} ({reason})"
+        emoji = "\U0001f534" if pnl < 0 else "\u2705"
+        msg = f"{emoji} [{slot.name}] VENTE {symbol} @ {price:.4f} PnL={pnl:.4f} ({reason})"
         self.logger.info(msg)
         self.notifier.send(msg)
 
@@ -251,62 +319,80 @@ class TradingEngine:
         except Exception:
             self.logger.exception("Erreur lors du transfert vers le vault")
 
-    def process_symbol(self, symbol: str) -> None:
-        df = self.exchange.fetch_ohlcv_df(symbol, self.timeframe, limit=max(200, self.strategy.min_candles + 10))
+    def _ohlcv(self, symbol: str, timeframe: str, min_candles: int) -> pd.DataFrame:
+        """Bougies mises en cache pour le cycle courant (partagées entre stratégies)."""
+        key = (symbol, timeframe)
+        df = self._ohlcv_cache.get(key)
+        if df is None or len(df) < min_candles:
+            df = self.exchange.fetch_ohlcv_df(symbol, timeframe, limit=max(200, min_candles + 10))
+            self._ohlcv_cache[key] = df
+        return df
+
+    def process_slot_symbol(self, slot: StrategySlot, symbol: str) -> None:
+        df = self._ohlcv(symbol, slot.timeframe, slot.strategy.min_candles)
         current_price = float(df["close"].iloc[-1])
-        self._record_spread(symbol, current_price)
-        position = self.db.get_position(symbol)
+        position = self.db.get_position(symbol, strategy=slot.name)
 
         if position is not None:
             highest = max(position["entry_price"], current_price)
-            trailing = self.risk.updated_trailing_stop(current_price, highest, position["trailing_stop"])
+            trailing = slot.risk.updated_trailing_stop(current_price, highest, position["trailing_stop"])
             if trailing != position["trailing_stop"]:
-                self.db.update_trailing_stop(symbol, trailing)
+                self.db.update_trailing_stop(symbol, trailing, strategy=slot.name)
 
-            exit_reason = self.risk.should_exit(
+            exit_reason = slot.risk.should_exit(
                 position["entry_price"], current_price, position["stop_loss"], position["take_profit"], trailing
             )
-            if exit_reason is None:
-                signal_ = self.strategy.generate_signal(df)
-                if signal_ == Signal.SELL:
-                    exit_reason = "signal"
+            if exit_reason is None and slot.strategy.generate_signal(df) == Signal.SELL:
+                exit_reason = "signal"
 
             if exit_reason:
-                self._execute_sell(symbol, current_price, position, exit_reason)
+                self._execute_sell(slot, symbol, current_price, position, exit_reason)
             return
 
-        # Pas de position ouverte : chercher une opportunité d'achat
+        # Pas de position ouverte pour cette stratégie : chercher une opportunité d'achat
         balance = self._get_balance()
         open_count = len(self.db.get_all_positions())
-        if not self.risk.can_open_new_position(open_count, balance):
+        if open_count >= self.max_open_positions or not slot.risk.can_open_new_position(open_count, balance):
             return
 
-        signal_ = self.strategy.generate_signal(df)
-        if signal_ == Signal.BUY:
-            amount = self.risk.position_size(balance, current_price, self.allocation_pct)
+        if slot.strategy.generate_signal(df) == Signal.BUY:
+            amount = slot.risk.position_size(balance, current_price, slot.allocation_pct)
             if amount > 0:
-                self._execute_buy(symbol, current_price, amount)
+                self._execute_buy(slot, symbol, current_price, amount)
+
+    def run_cycle(self) -> None:
+        """Un passage complet : chaque stratégie sur chacun de ses symboles."""
+        self._ohlcv_cache.clear()
+        spread_done: set[str] = set()
+        for slot in self.slots:
+            for symbol in slot.symbols:
+                if self._stop:
+                    return
+                try:
+                    self.process_slot_symbol(slot, symbol)
+                    if symbol not in spread_done:
+                        df = self._ohlcv_cache.get((symbol, slot.timeframe))
+                        if df is not None:
+                            self._record_spread(symbol, float(df["close"].iloc[-1]))
+                        spread_done.add(symbol)
+                except Exception:
+                    self.logger.exception("Erreur [%s] lors du traitement de %s", slot.name, symbol)
+                    self.notifier.send(f"⚠️ Erreur [{slot.name}] sur {symbol}, voir les logs")
 
     def run(self) -> None:
         self.logger.info(
-            "Démarrage du bot | mode=%s | exchange=%s | symbols=%s | timeframe=%s",
+            "Démarrage du bot | mode=%s | exchange=%s | stratégies=%s",
             self.mode,
             self.config["exchange"]["name"],
-            self.symbols,
-            self.timeframe,
+            [f"{s.name}@{s.timeframe} {s.symbols} trailing={s.risk.params.trailing_stop_pct}" for s in self.slots],
         )
-        self.notifier.send(f"🤖 Bot démarré en mode {self.mode}")
+        self.notifier.send(
+            f"🤖 Bot démarré en mode {self.mode} — {len(self.slots)} stratégie(s): {', '.join(s.name for s in self.slots)}"
+        )
 
         while not self._stop:
             cycle_start = time.time()
-            for symbol in self.symbols:
-                if self._stop:
-                    break
-                try:
-                    self.process_symbol(symbol)
-                except Exception:
-                    self.logger.exception("Erreur lors du traitement de %s", symbol)
-                    self.notifier.send(f"⚠️ Erreur sur {symbol}, voir les logs")
+            self.run_cycle()
 
             self._manage_treasury()
             self._manage_onchain_treasury()

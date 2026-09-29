@@ -137,7 +137,7 @@ function fillTable(tableId, rows, renderRow, emptyMsg) {
   const tbody = $(tableId).querySelector("tbody");
   tbody.innerHTML = "";
   if (!rows.length) {
-    tbody.innerHTML = `<tr class="empty"><td colspan="7">${emptyMsg}</td></tr>`;
+    tbody.innerHTML = `<tr class="empty"><td colspan="8">${emptyMsg}</td></tr>`;
     return;
   }
   for (const r of rows) {
@@ -155,6 +155,7 @@ async function loadPositions() {
     "positions-table",
     rows,
     (p) => `
+      <td><span class="tag">${esc(p.strategy)}</span></td>
       <td>${esc(p.symbol)}</td>
       <td class="num">${fmt(p.entry_price, 4)}</td>
       <td class="num">${fmt(p.amount, 6)}</td>
@@ -173,6 +174,7 @@ async function loadTrades() {
     rows,
     (t) => `
       <td>${fmtDate(t.timestamp)}</td>
+      <td><span class="tag">${esc(t.strategy)}</span></td>
       <td>${esc(t.symbol)}</td>
       <td class="side-${esc(t.side)}">${t.side === "buy" ? "ACHAT" : "VENTE"}</td>
       <td class="num">${fmt(t.price, 4)}</td>
@@ -180,6 +182,21 @@ async function loadTrades() {
       <td class="num ${t.side === "sell" ? signClass(t.pnl) : ""}">${t.side === "sell" ? signed(t.pnl, 4) : "—"}</td>
       <td>${esc(t.reason)}</td>`,
     "Aucun trade enregistré"
+  );
+}
+
+async function loadStrategies() {
+  const rows = await getJSON("/api/pnl_by_strategy");
+  fillTable(
+    "strategies-table",
+    rows,
+    (s) => `
+      <td><span class="tag">${esc(s.strategy)}</span></td>
+      <td class="num">${s.n}</td>
+      <td class="num">${s.wins}</td>
+      <td class="num">${s.n ? fmt((s.wins / s.n) * 100, 0) : "—"} %</td>
+      <td class="num ${signClass(s.pnl)}">${signed(s.pnl, 4)} ${quote}</td>`,
+    "Aucun trade clôturé"
   );
 }
 
@@ -208,7 +225,7 @@ async function loadLogs() {
 
 // ---------------------------------------------------------------------------
 async function refreshAll() {
-  const tasks = [loadOverview, loadEquity, loadPnlBySymbol, loadSpreads, loadPositions, loadTrades, loadLogs];
+  const tasks = [loadOverview, loadEquity, loadPnlBySymbol, loadStrategies, loadSpreads, loadPositions, loadTrades, loadLogs];
   for (const task of tasks) {
     try {
       await task();

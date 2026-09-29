@@ -231,6 +231,16 @@ tr.empty td {
     font-weight: 600;
 }
 
+.tag {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 4px;
+    background: #1e2a3d;
+    color: #93c5fd;
+    font-size: 11px;
+    font-family: monospace;
+}
+
 .btn {
     background: var(--border);
     color: var(--text);

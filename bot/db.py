@@ -43,18 +43,21 @@ class Database:
                     fee REAL DEFAULT 0,
                     pnl REAL DEFAULT 0,
                     mode TEXT NOT NULL,
-                    reason TEXT
+                    reason TEXT,
+                    strategy TEXT NOT NULL DEFAULT 'ema_rsi'
                 );
 
                 CREATE TABLE IF NOT EXISTS positions (
-                    symbol TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    strategy TEXT NOT NULL DEFAULT 'ema_rsi',
                     side TEXT NOT NULL,
                     entry_price REAL NOT NULL,
                     amount REAL NOT NULL,
                     stop_loss REAL,
                     take_profit REAL,
                     trailing_stop REAL,
-                    opened_at REAL NOT NULL
+                    opened_at REAL NOT NULL,
+                    PRIMARY KEY (symbol, strategy)
                 );
 
                 CREATE TABLE IF NOT EXISTS equity (
@@ -79,16 +82,47 @@ class Database:
                 );
                 """
             )
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Fait évoluer les bases créées avant le support multi-stratégies."""
+        trade_cols = {r["name"] for r in conn.execute("PRAGMA table_info(trades)")}
+        if "strategy" not in trade_cols:
+            conn.execute("ALTER TABLE trades ADD COLUMN strategy TEXT NOT NULL DEFAULT 'ema_rsi'")
+
+        pos_cols = {r["name"] for r in conn.execute("PRAGMA table_info(positions)")}
+        if "strategy" not in pos_cols:
+            conn.executescript(
+                """
+                ALTER TABLE positions RENAME TO positions_old;
+                CREATE TABLE positions (
+                    symbol TEXT NOT NULL,
+                    strategy TEXT NOT NULL DEFAULT 'ema_rsi',
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    amount REAL NOT NULL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    trailing_stop REAL,
+                    opened_at REAL NOT NULL,
+                    PRIMARY KEY (symbol, strategy)
+                );
+                INSERT INTO positions (symbol, strategy, side, entry_price, amount, stop_loss, take_profit, trailing_stop, opened_at)
+                    SELECT symbol, 'ema_rsi', side, entry_price, amount, stop_loss, take_profit, trailing_stop, opened_at
+                    FROM positions_old;
+                DROP TABLE positions_old;
+                """
+            )
 
     # --- Positions -----------------------------------------------------
-    def get_position(self, symbol: str) -> Optional[sqlite3.Row]:
+    def get_position(self, symbol: str, strategy: str = "ema_rsi") -> Optional[sqlite3.Row]:
         with self._connect() as conn:
-            cur = conn.execute("SELECT * FROM positions WHERE symbol = ?", (symbol,))
+            cur = conn.execute("SELECT * FROM positions WHERE symbol = ? AND strategy = ?", (symbol, strategy))
             return cur.fetchone()
 
     def get_all_positions(self) -> list[sqlite3.Row]:
         with self._connect() as conn:
-            return conn.execute("SELECT * FROM positions").fetchall()
+            return conn.execute("SELECT * FROM positions ORDER BY opened_at").fetchall()
 
     def open_position(
         self,
@@ -98,22 +132,33 @@ class Database:
         amount: float,
         stop_loss: float | None,
         take_profit: float | None,
+        strategy: str = "ema_rsi",
     ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO positions
-                   (symbol, side, entry_price, amount, stop_loss, take_profit, trailing_stop, opened_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (symbol, side, entry_price, amount, stop_loss, take_profit, None, time.time()),
+                   (symbol, strategy, side, entry_price, amount, stop_loss, take_profit, trailing_stop, opened_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (symbol, strategy, side, entry_price, amount, stop_loss, take_profit, None, time.time()),
             )
 
-    def update_trailing_stop(self, symbol: str, trailing_stop: float) -> None:
+    def update_trailing_stop(self, symbol: str, trailing_stop: float, strategy: str = "ema_rsi") -> None:
         with self._connect() as conn:
-            conn.execute("UPDATE positions SET trailing_stop = ? WHERE symbol = ?", (trailing_stop, symbol))
+            conn.execute(
+                "UPDATE positions SET trailing_stop = ? WHERE symbol = ? AND strategy = ?",
+                (trailing_stop, symbol, strategy),
+            )
 
-    def close_position(self, symbol: str) -> None:
+    def update_position_amount(self, symbol: str, amount: float, strategy: str = "ema_rsi") -> None:
         with self._connect() as conn:
-            conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
+            conn.execute(
+                "UPDATE positions SET amount = ? WHERE symbol = ? AND strategy = ?",
+                (amount, symbol, strategy),
+            )
+
+    def close_position(self, symbol: str, strategy: str = "ema_rsi") -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM positions WHERE symbol = ? AND strategy = ?", (symbol, strategy))
 
     # --- Trades ----------------------------------------------------------
     def record_trade(
@@ -127,12 +172,13 @@ class Database:
         fee: float = 0.0,
         pnl: float = 0.0,
         reason: str = "",
+        strategy: str = "ema_rsi",
     ) -> None:
         with self._connect() as conn:
             conn.execute(
-                """INSERT INTO trades (timestamp, symbol, side, price, amount, cost, fee, pnl, mode, reason)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (time.time(), symbol, side, price, amount, cost, fee, pnl, mode, reason),
+                """INSERT INTO trades (timestamp, symbol, side, price, amount, cost, fee, pnl, mode, reason, strategy)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (time.time(), symbol, side, price, amount, cost, fee, pnl, mode, reason, strategy),
             )
 
     def get_recent_trades(self, limit: int = 20) -> list[sqlite3.Row]:
@@ -191,6 +237,15 @@ class Database:
             return conn.execute(
                 """SELECT symbol, COUNT(*) AS n, COALESCE(SUM(pnl), 0) AS pnl
                    FROM trades WHERE side = 'sell' GROUP BY symbol ORDER BY pnl DESC"""
+            ).fetchall()
+
+    def get_pnl_by_strategy(self) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                """SELECT strategy, COUNT(*) AS n,
+                          COALESCE(SUM(pnl), 0) AS pnl,
+                          COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins
+                   FROM trades WHERE side = 'sell' GROUP BY strategy ORDER BY pnl DESC"""
             ).fetchall()
 
     # --- Vault (coffre de récompenses) ---------------------------------

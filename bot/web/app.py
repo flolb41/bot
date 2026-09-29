@@ -92,7 +92,7 @@ def create_app(config: Config) -> Flask:
                 "exchange": config["exchange"]["name"],
                 "symbols": trading["symbols"],
                 "timeframe": trading["timeframe"],
-                "strategy": config["strategy"]["name"],
+                "strategy": ", ".join(s["name"] for s in (config.get("strategies") or [config["strategy"]]) if s.get("enabled", True)),
                 "quote_currency": quote,
                 "bot_alive": bot_alive,
                 "balance": float(latest["balance"]) if latest else None,
@@ -135,6 +135,11 @@ def create_app(config: Config) -> Flask:
     @protected
     def api_pnl_by_symbol():
         return jsonify([dict(r) for r in db.get_pnl_by_symbol()])
+
+    @app.route("/api/pnl_by_strategy")
+    @protected
+    def api_pnl_by_strategy():
+        return jsonify([dict(r) for r in db.get_pnl_by_strategy()])
 
     @app.route("/api/logs")
     @protected
