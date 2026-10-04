@@ -20,13 +20,16 @@ class EmaRsiStrategy(Strategy):
         rsi_period: int = 14,
         rsi_overbought: float = 70,
         rsi_oversold: float = 30,
+        trend_ema: int = 0,
     ):
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
         self.rsi_period = rsi_period
         self.rsi_overbought = rsi_overbought
         self.rsi_oversold = rsi_oversold
-        self.min_candles = max(ema_slow, rsi_period) + 5
+        # Filtre de régime : n'achète que si le prix est au-dessus de cette EMA longue (0 = désactivé)
+        self.trend_ema = trend_ema
+        self.min_candles = max(ema_slow, rsi_period, trend_ema) + 5
 
     def generate_signal(self, df: pd.DataFrame) -> Signal:
         if len(df) < self.min_candles:
@@ -44,7 +47,11 @@ class EmaRsiStrategy(Strategy):
         crossed_up = prev_fast <= prev_slow and curr_fast > curr_slow
         crossed_down = prev_fast >= prev_slow and curr_fast < curr_slow
 
-        if crossed_up and curr_rsi < self.rsi_overbought:
+        uptrend = True
+        if self.trend_ema > 0:
+            uptrend = close.iloc[-1] > ema(close, self.trend_ema).iloc[-1]
+
+        if crossed_up and uptrend and curr_rsi < self.rsi_overbought:
             return Signal.BUY
         if crossed_down and curr_rsi > self.rsi_oversold:
             return Signal.SELL

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from bot.indicators import bollinger, rsi
+from bot.indicators import bollinger, ema, rsi
 from bot.strategies.base import Signal, Strategy
 
 
@@ -26,6 +26,7 @@ class BollingerRsiStrategy(Strategy):
         rsi_oversold_max: float = 35,
         rsi_overbought: float = 70,
         exit_at: str = "middle",  # "middle" (moyenne) ou "upper" (bande haute, plus ambitieux)
+        trend_ema: int = 0,
     ):
         self.bb_period = bb_period
         self.bb_std = bb_std
@@ -33,7 +34,9 @@ class BollingerRsiStrategy(Strategy):
         self.rsi_oversold_max = rsi_oversold_max
         self.rsi_overbought = rsi_overbought
         self.exit_at = exit_at
-        self.min_candles = max(bb_period, rsi_period) + 5
+        # Filtre de régime : n'achète les creux que dans une tendance de fond haussière (0 = désactivé)
+        self.trend_ema = trend_ema
+        self.min_candles = max(bb_period, rsi_period, trend_ema) + 5
 
     def generate_signal(self, df: pd.DataFrame) -> Signal:
         if len(df) < self.min_candles:
@@ -52,7 +55,10 @@ class BollingerRsiStrategy(Strategy):
 
         # Rebond confirmé : sortie sous la bande basse puis retour au-dessus
         bounced = prev_close < prev_lower and curr_close > curr_lower
-        if bounced and curr_rsi < self.rsi_oversold_max:
+        uptrend = True
+        if self.trend_ema > 0:
+            uptrend = curr_close > ema(close, self.trend_ema).iloc[-1]
+        if bounced and uptrend and curr_rsi < self.rsi_oversold_max:
             return Signal.BUY
 
         target = middle.iloc[-1] if self.exit_at == "middle" else upper.iloc[-1]

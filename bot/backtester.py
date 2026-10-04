@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from bot.exchange import ExchangeClient
+from bot.indicators import atr
 from bot.risk import RiskManager, RiskParams
 from bot.strategies import Signal, Strategy, get_strategy
 
@@ -93,16 +94,19 @@ def run_backtest(
     highest_since_entry = 0.0
 
     min_candles = strategy.min_candles
-    # Fenêtre bornée : les EMA (adjust=False) convergent bien avant 10x la période max,
+    # ATR précalculé une fois sur tout l'historique (utilisé seulement si le risque est en mode ATR)
+    atr_series = atr(df, 14) if risk.uses_atr() else None
+    # Fenêtre bornée : une EMA (adjust=False) a convergé à >99,7 % après 4x sa période,
     # inutile de recalculer sur tout l'historique à chaque bougie.
-    lookback = max(300, min_candles * 10)
+    lookback = max(300, min_candles * 4)
     for i in range(min_candles, len(df)):
         window = df.iloc[max(0, i + 1 - lookback) : i + 1]
         price = float(window["close"].iloc[-1])
+        cur_atr = float(atr_series.iloc[i]) if atr_series is not None and not pd.isna(atr_series.iloc[i]) else None
 
         if position is not None:
             highest_since_entry = max(highest_since_entry, price)
-            trailing = risk.updated_trailing_stop(price, highest_since_entry, position["trailing_stop"])
+            trailing = risk.updated_trailing_stop(price, highest_since_entry, position["trailing_stop"], cur_atr)
             position["trailing_stop"] = trailing
             reason = risk.should_exit(position["entry_price"], price, position["stop_loss"], position["take_profit"], trailing)
             if reason is None and strategy.generate_signal(window) == Signal.SELL:
@@ -123,7 +127,7 @@ def run_backtest(
                 cost = price * amount
                 fee = cost * (fee_pct / 100.0)
                 balance -= cost + fee
-                stop_loss, take_profit = risk.compute_stop_and_target(price)
+                stop_loss, take_profit = risk.compute_stop_and_target(price, cur_atr)
                 position = {
                     "entry_price": price,
                     "amount": amount,

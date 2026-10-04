@@ -3,9 +3,11 @@ __pycache__/
 *.pyc
 .env
 data/*.db
+data/ohlcv_cache/
 data/*.db-journal
 data/keystore.json
 data/keystore_vault.json
 logs/*.log
 *.egg-info/
 .pytest_cache/
+ohlcv_cache/

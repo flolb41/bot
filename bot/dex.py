@@ -14,14 +14,20 @@ _GET_AMOUNTS_OUT = "d06ca61f"
 
 PANCAKE_V2_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 
-# Tokens BSC (BEP-20) courants — tous en 18 décimales sur BSC
+# Tokens BSC (BEP-20) courants
 DEFAULT_TOKENS = {
     "USDT": "0x55d398326f99059fF775485246999027B3197955",
     "BTC": "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c",  # BTCB
     "ETH": "0x2170Ed0880ac9A755fd29B2688956BD959F933F8",
     "BNB": "0xbb4CdB9CBd36B01bD1cBaEbF2De08d9173bc095c",  # WBNB
     "BUSD": "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56",
+    "SOL": "0x570A5D26f7765Ecb712C0924E4De545B89fD43dF",
+    "DOGE": "0xbA2aE424d960c26247Dd6c32edC70B295c744C43",
+    "XRP": "0x1D2F0da169ceB9fC7B3144628dB156f3F6c60dBE",
+    "ADA": "0x3EE2200Efb3400fAbB9AacF31297cBdD1d435D47",
 }
+# Tous en 18 décimales sauf exceptions
+DEFAULT_DECIMALS = {"DOGE": 8}
 
 
 class DexError(Exception):
@@ -70,7 +76,7 @@ class PancakeQuoter:
         self.rpc_url = rpc_url
         self.router = router
         self.tokens = {**DEFAULT_TOKENS, **(tokens or {})}
-        self.decimals = decimals or {}
+        self.decimals = {**DEFAULT_DECIMALS, **(decimals or {})}
         self.quote_currency = quote_currency
         self.logger = logging.getLogger("bot.dex")
 
