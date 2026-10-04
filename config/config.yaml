@@ -12,6 +12,9 @@ trading:
   symbols:
     - "BTC/USDT"
     - "ETH/USDT"
+    - "SOL/USDT"
+    - "BNB/USDT"
+    - "DOGE/USDT" # demandé ; attention : perdant sur 180j pour les 2 stratégies (-0,9 % / -0,2 %), à surveiller
   timeframe: "1h" # bougies utilisées pour l'analyse (1h validé par backtest 90j ; 15m perdant à cause des frais)
   poll_interval_seconds: 60 # fréquence de vérification du marché
   starting_balance: 1000.0 # solde virtuel de départ en mode paper
@@ -25,14 +28,16 @@ trading:
 # son risque, son timeframe et ses symboles ; le capital est partagé.
 # Champs optionnels par stratégie : enabled, timeframe, symbols, allocation_pct, risk (surcharges de `risk:`).
 strategies:
-  - name: ema_rsi # suivi de tendance (90j 1h : +0,87 %, 99 trades, win 30 %)
+  - name: ema_rsi # suivi de tendance (180j 1h 6 paires : +0,29 % avec trend_ema 200 vs +0,05 % sans)
     params:
       ema_fast: 9
       ema_slow: 21
       rsi_period: 14
       rsi_overbought: 70
       rsi_oversold: 30
-  - name: bollinger_rsi # retour à la moyenne (90j 1h : +0,46 %, 31 trades, win 81 %, DD 0,14 %)
+      trend_ema: 200 # n'achète qu'au-dessus de l'EMA 200 : divise les trades et le drawdown par 2
+    allocation_pct: 15 # 25 % double le drawdown (4 %) pour un gain marginal ; 319 trades/180j : payer les frais en BNB triple son rendement
+  - name: bollinger_rsi # retour à la moyenne (180j 1h 6 paires : +0,25 % avec trend_ema 200, win 80 %, DD 0,17 %)
     params:
       bb_period: 20
       bb_std: 2.0
@@ -40,6 +45,8 @@ strategies:
       rsi_oversold_max: 35
       rsi_overbought: 70
       exit_at: middle
+      trend_ema: 200 # sans filtre la stratégie est perdante sur 180j (-0,20 %)
+    allocation_pct: 25 # supporte bien 25 % : 180j 7 paires +0,46 %, DD 1,0 %, win 76 %
     risk:
       trailing_stop_pct: 0 # le trailing coupe le rebond avant la moyenne : désactivé pour cette stratégie
       stop_loss_pct: 3.0
@@ -53,13 +60,18 @@ strategy:
     rsi_period: 14
     rsi_overbought: 70
     rsi_oversold: 30
+    trend_ema: 200
 
 risk:
-  max_open_positions: 3
+  max_open_positions: 4 # toutes stratégies confondues (5 paires × 2 stratégies = 10 slots possibles)
   stop_loss_pct: 2.0
   take_profit_pct: 4.0
   trailing_stop_pct: 1.5 # 0 pour désactiver le trailing stop
   max_daily_loss_pct: 5.0 # arrête l'ouverture de nouveaux trades passé ce seuil
+  # Stops en multiples d'ATR(14) au lieu de % fixes (0 = désactivé). Testé sur 180j : aucun gain, laissé à 0.
+  atr_stop_mult: 0
+  atr_tp_mult: 0
+  atr_trailing_mult: 0
 
 telegram:
   enabled: false
@@ -70,6 +82,7 @@ telegram:
 # auto-compounding des profits. En mode paper, le coffre est simulé avec paper_apr_pct.
 rewards:
   enabled: true
+  asset: USDC # actif placé dans Simple Earn (défaut : quote_currency). USDT indisponible en Earn pour les comptes UE
   collect_interval_hours: 6 # fréquence de la collecte périodique
   profit_skim_pct: 30 # % des profits de trading envoyés au coffre
   min_idle_to_subscribe: 50 # place le solde libre excédentaire dans Earn au-delà de ce montant

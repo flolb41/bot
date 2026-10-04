@@ -13,6 +13,7 @@ from bot.config import Config
 from bot.db import Database
 from bot.dex import PancakeQuoter
 from bot.exchange import ExchangeClient
+from bot.indicators import atr
 from bot.notifier import TelegramNotifier
 from bot.portfolio import PaperPortfolio
 from bot.rewards import RewardsCollector
@@ -54,6 +55,9 @@ def build_strategy_slots(config: Config, db: Database) -> list[StrategySlot]:
                 take_profit_pct=float(risk_over.get("take_profit_pct", base_risk["take_profit_pct"])),
                 trailing_stop_pct=float(risk_over.get("trailing_stop_pct", base_risk.get("trailing_stop_pct", 0))),
                 max_daily_loss_pct=float(risk_over.get("max_daily_loss_pct", base_risk["max_daily_loss_pct"])),
+                atr_stop_mult=float(risk_over.get("atr_stop_mult", base_risk.get("atr_stop_mult", 0))),
+                atr_tp_mult=float(risk_over.get("atr_tp_mult", base_risk.get("atr_tp_mult", 0))),
+                atr_trailing_mult=float(risk_over.get("atr_trailing_mult", base_risk.get("atr_trailing_mult", 0))),
             ),
             db,
         )
@@ -130,7 +134,7 @@ class TradingEngine:
                 mode=self.mode,
                 exchange=self.exchange,
                 notifier=self.notifier,
-                asset=self.quote_currency,
+                asset=rewards_cfg.get("asset") or self.quote_currency,
                 paper_apr_pct=float(rewards_cfg.get("paper_apr_pct", 5.0)),
                 profit_skim_pct=float(rewards_cfg.get("profit_skim_pct", 30.0)),
                 min_idle_to_subscribe=float(rewards_cfg.get("min_idle_to_subscribe", 50.0)),
@@ -210,7 +214,7 @@ class TradingEngine:
             )
         return filled, avg, fee
 
-    def _execute_buy(self, slot: StrategySlot, symbol: str, price: float, amount: float) -> None:
+    def _execute_buy(self, slot: StrategySlot, symbol: str, price: float, amount: float, cur_atr: float | None = None) -> None:
         if self.mode == "live":
             amount = self.exchange.amount_to_precision(symbol, amount)
             if amount <= 0:
@@ -227,7 +231,7 @@ class TradingEngine:
         else:
             self.portfolio.apply_buy(cost + fee)
 
-        stop_loss, take_profit = slot.risk.compute_stop_and_target(price)
+        stop_loss, take_profit = slot.risk.compute_stop_and_target(price, cur_atr)
         self.db.open_position(symbol, "long", price, amount, stop_loss, take_profit, strategy=slot.name)
         self.db.record_trade(symbol, "buy", price, amount, cost, self.mode, fee=fee, reason="signal", strategy=slot.name)
         msg = f"🟢 [{slot.name}] ACHAT {symbol} @ {price:.4f} (qty {amount:.6f}) SL={stop_loss:.4f} TP={take_profit:.4f}"
@@ -331,11 +335,12 @@ class TradingEngine:
     def process_slot_symbol(self, slot: StrategySlot, symbol: str) -> None:
         df = self._ohlcv(symbol, slot.timeframe, slot.strategy.min_candles)
         current_price = float(df["close"].iloc[-1])
+        cur_atr = float(atr(df, 14).iloc[-1]) if slot.risk.uses_atr() else None
         position = self.db.get_position(symbol, strategy=slot.name)
 
         if position is not None:
             highest = max(position["entry_price"], current_price)
-            trailing = slot.risk.updated_trailing_stop(current_price, highest, position["trailing_stop"])
+            trailing = slot.risk.updated_trailing_stop(current_price, highest, position["trailing_stop"], cur_atr)
             if trailing != position["trailing_stop"]:
                 self.db.update_trailing_stop(symbol, trailing, strategy=slot.name)
 
@@ -358,7 +363,7 @@ class TradingEngine:
         if slot.strategy.generate_signal(df) == Signal.BUY:
             amount = slot.risk.position_size(balance, current_price, slot.allocation_pct)
             if amount > 0:
-                self._execute_buy(slot, symbol, current_price, amount)
+                self._execute_buy(slot, symbol, current_price, amount, cur_atr)
 
     def run_cycle(self) -> None:
         """Un passage complet : chaque stratégie sur chacun de ses symboles."""

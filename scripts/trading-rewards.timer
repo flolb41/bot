@@ -1,0 +1,11 @@
+[Unit]
+Description=Collecte Simple Earn toutes les 6 heures
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

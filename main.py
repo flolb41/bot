@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 
 from tabulate import tabulate
 
@@ -131,7 +132,7 @@ def _get_wallet(config, role: str = "bot"):
     ), wallet_cfg
 
 
-def _wallet_password(role: str = "bot") -> str:
+def _wallet_password(role: str = "bot", confirm: bool = False) -> str:
     import getpass
     import os
 
@@ -139,6 +140,10 @@ def _wallet_password(role: str = "bot") -> str:
     password = os.environ.get(env_var, "")
     if not password:
         password = getpass.getpass(f"Mot de passe du wallet {role.upper()}: ")
+        if confirm:
+            confirmation = getpass.getpass(f"Confirme le mot de passe du wallet {role.upper()}: ")
+            if password != confirmation:
+                raise SystemExit("Les mots de passe ne correspondent pas; aucun wallet créé.")
     return password
 
 
@@ -165,7 +170,7 @@ def cmd_wallet(args: argparse.Namespace) -> None:
     wallet, wallet_cfg = _get_wallet(config, role)
 
     if args.wallet_command == "create":
-        password = _wallet_password(role)
+        password = _wallet_password(role, confirm=True)
         if not password:
             raise SystemExit("Mot de passe vide refusé.")
         address = wallet.create(wallet.keystore_path, password)
@@ -258,23 +263,38 @@ def cmd_rewards(args: argparse.Namespace) -> None:
     db = Database(config["database"]["path"])
     trading_cfg = config["trading"]
     rewards_cfg = config.get("rewards", {}) or {}
-    mode = trading_cfg["mode"]
+    live_override = bool(getattr(args, "live", False))
+    mode = "live" if live_override else trading_cfg["mode"]
 
     exchange = None
     if mode == "live":
         exch_cfg = config["exchange"]
+        if live_override:
+            api_key = os.environ.get("REWARDS_API_KEY", "")
+            api_secret = os.environ.get("REWARDS_API_SECRET", "")
+            if not api_key or not api_secret:
+                raise SystemExit("Renseigne REWARDS_API_KEY et REWARDS_API_SECRET pour le compte Binance réel.")
+        else:
+            if bool(exch_cfg.get("sandbox", True)):
+                raise SystemExit("Collecte live refusée: le mode sandbox du compte trading est actif.")
+            api_key = exch_cfg.get("api_key", "")
+            api_secret = exch_cfg.get("api_secret", "")
+
+        if not live_override and args.rewards_command == "collect" and not rewards_cfg.get("enabled", False):
+            raise SystemExit("Collecte live refusée: active rewards.enabled dans la configuration.")
         exchange = ExchangeClient(
             name=exch_cfg["name"],
-            api_key=exch_cfg.get("api_key", ""),
-            api_secret=exch_cfg.get("api_secret", ""),
-            sandbox=bool(exch_cfg.get("sandbox", True)),
+            api_key=api_key,
+            api_secret=api_secret,
+            sandbox=False,
         )
 
+    asset = rewards_cfg.get("asset") or trading_cfg["quote_currency"]
     collector = RewardsCollector(
         db=db,
         mode=mode,
         exchange=exchange,
-        asset=trading_cfg["quote_currency"],
+        asset=asset,
         paper_apr_pct=float(rewards_cfg.get("paper_apr_pct", 5.0)),
         profit_skim_pct=float(rewards_cfg.get("profit_skim_pct", 30.0)),
         min_idle_to_subscribe=float(rewards_cfg.get("min_idle_to_subscribe", 50.0)),
@@ -284,10 +304,17 @@ def cmd_rewards(args: argparse.Namespace) -> None:
     )
 
     if args.rewards_command == "collect":
+        if mode == "live":
+            collector.validate_live_access()
         collector.collect()
-        print("Collecte effectuée.")
+        if mode == "live":
+            free_balance = exchange.fetch_balance(asset)
+            subscribed = collector.subscribe_idle(free_balance)
+            print(f"Collecte live terminée. Souscription Simple Earn: {subscribed:.4f} {asset}.")
+        else:
+            print("Collecte effectuée.")
 
-    print(f"Coffre ({trading_cfg['quote_currency']}) : {collector.vault_balance():.4f}")
+    print(f"Coffre ({asset}) : {collector.vault_balance():.4f}")
     print(f"Récompenses cumulées : {collector.total_rewards():.4f}")
 
 
@@ -374,8 +401,10 @@ def main() -> None:
 
     p_rewards = sub.add_parser("rewards", help="Coffre et collecte de récompenses")
     rewards_sub = p_rewards.add_subparsers(dest="rewards_command", required=True)
-    rewards_sub.add_parser("status", help="Affiche le solde du coffre et les récompenses cumulées")
-    rewards_sub.add_parser("collect", help="Lance un cycle de collecte immédiat")
+    p_rewards_status = rewards_sub.add_parser("status", help="Affiche le solde du coffre et les récompenses cumulées")
+    p_rewards_status.add_argument("--live", action="store_true", help="Lit le coffre Simple Earn du compte réel")
+    p_rewards_collect = rewards_sub.add_parser("collect", help="Lance un cycle de collecte immédiat")
+    p_rewards_collect.add_argument("--live", action="store_true", help="Collecte sur le compte réel sans lancer le trading")
     p_rewards.set_defaults(func=cmd_rewards)
 
     p_web = sub.add_parser("web", help="Démarre le dashboard web")

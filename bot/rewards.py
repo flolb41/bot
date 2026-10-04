@@ -47,6 +47,9 @@ class RewardsCollector:
         self.min_trading_balance = min_trading_balance
         self.dust_enabled = dust_enabled
         self.logger = logging.getLogger("bot.rewards")
+        self._earn_product_id_cache: str | None = None
+        self._earn_product_id_cache_ts = 0.0
+        self._earn_product_id_ttl = 300.0
 
     def _notify(self, msg: str) -> None:
         if self.notifier:
@@ -55,7 +58,9 @@ class RewardsCollector:
     # --- Coffre -----------------------------------------------------------
     def vault_balance(self) -> float:
         if self.mode == "live":
-            return self._earn_balance_live()
+            live_balance = self._earn_balance_live()
+            if live_balance is not None:
+                return live_balance
         amount, _, _ = self.db.get_vault(self.asset)
         return amount
 
@@ -122,6 +127,15 @@ class RewardsCollector:
             if self.dust_enabled:
                 self._convert_dust_live()
 
+    def validate_live_access(self) -> None:
+        """Vérifie les lectures Simple Earn avant une collecte réelle."""
+        if self.mode != "live" or self.exchange is None:
+            raise RuntimeError("Le collecteur doit être configuré en mode live avec un exchange.")
+        if self._earn_product_id() is None:
+            raise RuntimeError(f"Produit Simple Earn {self.asset} inaccessible ou indisponible.")
+        if self._earn_balance_live() is None:
+            raise RuntimeError("Lecture du solde Simple Earn impossible; collecte annulée.")
+
     def _accrue_paper(self) -> None:
         amount, rewards, updated_at = self.db.get_vault(self.asset)
         if amount <= 0:
@@ -134,22 +148,39 @@ class RewardsCollector:
 
     # --- Implémentation Binance (mode live) ------------------------------------
     def _earn_product_id(self) -> str | None:
+        now = time.time()
+        if self._earn_product_id_cache is not None and now - self._earn_product_id_cache_ts < self._earn_product_id_ttl:
+            return self._earn_product_id_cache
+
+        if self.exchange is None:
+            self._earn_product_id_cache = None
+            self._earn_product_id_cache_ts = now
+            return None
+
         try:
             resp = self.exchange.exchange.sapi_get_simple_earn_flexible_list({"asset": self.asset})
             rows = resp.get("rows", [])
-            if rows:
-                return rows[0]["productId"]
+            product_id = rows[0]["productId"] if rows else None
+            if product_id:
+                self._earn_product_id_cache = product_id
+                self._earn_product_id_cache_ts = now
+                return product_id
         except Exception as exc:
             self.logger.warning("Impossible de récupérer le produit Earn %s: %s", self.asset, exc)
+
+        self._earn_product_id_cache = None
+        self._earn_product_id_cache_ts = now
         return None
 
-    def _earn_balance_live(self) -> float:
+    def _earn_balance_live(self) -> float | None:
+        if self.exchange is None:
+            return None
         try:
             resp = self.exchange.exchange.sapi_get_simple_earn_flexible_position({"asset": self.asset})
             return sum(float(r["totalAmount"]) for r in resp.get("rows", []))
         except Exception as exc:
             self.logger.warning("Lecture du solde Earn impossible: %s", exc)
-            return 0.0
+            return None
 
     def _earn_subscribe_live(self, amount: float) -> bool:
         product_id = self._earn_product_id()
@@ -180,8 +211,12 @@ class RewardsCollector:
     def _sync_vault_live(self) -> None:
         """Aligne le coffre local sur le solde Earn réel et trace les intérêts gagnés."""
         live_balance = self._earn_balance_live()
+        if live_balance is None:
+            return
         amount, rewards, _ = self.db.get_vault(self.asset)
         gained = max(0.0, live_balance - amount)
+        if live_balance == amount and gained == 0:
+            return
         self.db.set_vault(self.asset, live_balance, rewards + gained)
 
     def _convert_dust_live(self) -> None:

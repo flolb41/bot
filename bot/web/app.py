@@ -51,6 +51,7 @@ def create_app(config: Config) -> Flask:
 
     db = Database(config["database"]["path"])
     quote = config["trading"]["quote_currency"]
+    vault_asset = (config.get("rewards") or {}).get("asset") or quote
     log_file = Path(config["logging"]["file"])
     wallet_cfg = config.get("wallet", {}) or {}
     keystore_path = Path(wallet_cfg.get("keystore_path", "data/keystore.json"))
@@ -79,7 +80,7 @@ def create_app(config: Config) -> Flask:
         trading = config["trading"]
         latest = db.get_latest_equity()
         stats = db.get_trade_stats()
-        vault_amount, vault_rewards, _ = db.get_vault(quote)
+        vault_amount, vault_rewards, _ = db.get_vault(vault_asset)
 
         # Le bot est considéré actif si un snapshot equity date de moins de 3 cycles
         bot_alive = False
@@ -100,7 +101,7 @@ def create_app(config: Config) -> Flask:
                 "starting_balance": float(trading.get("starting_balance", 0)),
                 "daily_pnl": db.get_daily_pnl(),
                 "stats": stats,
-                "vault": {"amount": vault_amount, "total_rewards": vault_rewards},
+                "vault": {"asset": vault_asset, "amount": vault_amount, "total_rewards": vault_rewards},
                 "wallet_address": _address_of(keystore_path),
                 "vault_wallet_address": _address_of(vault_keystore_path),
                 "open_positions": len(db.get_all_positions()),

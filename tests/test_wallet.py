@@ -1,8 +1,10 @@
 from pathlib import Path
+import getpass
 
 import pytest
 
 from bot.wallet import Wallet, WalletError
+from main import _wallet_password
 
 
 def test_create_and_reload_wallet(tmp_path: Path):
@@ -41,3 +43,12 @@ def test_unlock_with_correct_password(tmp_path: Path):
     wallet = Wallet(str(keystore), rpc_url="http://localhost:0")
     key = wallet._unlock("motdepasse123")
     assert len(bytes(key)) == 32
+
+
+def test_wallet_creation_rejects_password_mismatch(monkeypatch):
+    answers = iter(["motdepasse123", "motdepasse456"])
+    monkeypatch.delenv("WALLET_PASSWORD", raising=False)
+    monkeypatch.setattr(getpass, "getpass", lambda _prompt: next(answers))
+
+    with pytest.raises(SystemExit, match="ne correspondent pas"):
+        _wallet_password("bot", confirm=True)

@@ -59,8 +59,9 @@ async function loadOverview() {
   setText("kpi-trades", `${o.stats.closed_trades} trades clôturés`);
   setText("kpi-winrate", `${fmt(o.stats.win_rate_pct, 1)} %`);
   setText("kpi-fees", `frais : ${fmt(o.stats.total_fees, 4)} ${quote}`);
-  setText("kpi-vault", fmtMoney(o.vault.amount));
-  setText("kpi-rewards", `récompenses : +${fmt(o.vault.total_rewards, 4)} ${quote}`);
+  const vaultAsset = o.vault.asset || quote;
+  setText("kpi-vault", `${fmt(o.vault.amount)} ${vaultAsset}`);
+  setText("kpi-rewards", `récompenses : +${fmt(o.vault.total_rewards, 4)} ${vaultAsset}`);
   setText("kpi-positions", `${o.open_positions} / ${o.max_open_positions}`);
   setText("kpi-wallet", o.wallet_address || "non créé");
   setText("kpi-vault-wallet", o.vault_wallet_address || "non créé");

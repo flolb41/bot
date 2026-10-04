@@ -106,6 +106,22 @@ solde inactif ──────┘          │
 ```bash
 .venv/bin/python main.py rewards status    # solde du coffre + récompenses cumulées
 .venv/bin/python main.py rewards collect   # cycle de collecte immédiat
+.venv/bin/python main.py rewards status --live          # lit le compte Simple Earn réel
+.venv/bin/python main.py rewards collect --live         # collecte réelle isolée, sans démarrer le trading
+```
+
+La collecte `--live` utilise les clés réelles dédiées `REWARDS_API_KEY` et `REWARDS_API_SECRET` dans `.env`;
+elle reste indépendante de `trading.mode`, `exchange.sandbox` et `rewards.enabled`, qui continuent à contrôler
+le bot de trading. Donne à ces clés les droits de lecture et Simple Earn requis, mais aucun droit de retrait.
+La commande convertit les poussières si activé et place le solde libre excédant `keep_free` dans Simple Earn;
+elle ne passe aucun ordre de trading et ne nécessite pas les wallets BSC.
+
+Pour l'automatiser toutes les 6 h sur le Pi (indépendamment du service de trading) :
+
+```bash
+sudo cp scripts/trading-rewards.service scripts/trading-rewards.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now trading-rewards.timer
+journalctl -u trading-rewards -n 20     # résultat des dernières collectes
 ```
 
 > ⚠️ Le farming automatisé de faucets/airdrops n'est volontairement pas implémenté :
@@ -126,13 +142,15 @@ si le bot ou une autorisation DeFi est compromis, le VAULT reste isolé.
 
 ```bash
 .venv/bin/python main.py wallet create                       # crée le wallet BOT
-.venv/bin/python main.py --role vault wallet create          # crée le wallet VAULT (mot de passe différent !)
+.venv/bin/python main.py wallet --role vault create          # crée le wallet VAULT (mot de passe différent !)
 .venv/bin/python main.py wallet balance                      # soldes BNB/USDT des deux wallets
 .venv/bin/python main.py wallet sweep --amount 100           # retire 100 USDT de Binance vers le BOT
 .venv/bin/python main.py wallet to-vault                     # déplace l'excédent BOT -> VAULT
 .venv/bin/python main.py wallet to-vault --amount 50         # ou un montant précis
 .venv/bin/python main.py --role vault wallet send --to 0x... --amount 50   # retrait du VAULT (VAULT_PASSWORD demandé)
 ```
+
+Les wallets BSC BOT/VAULT servent uniquement aux transferts on-chain; ils ne sont pas requis pour Binance Simple Earn.
 
 `wallet.auto_sweep.enabled: true` dans la config = le bot déplace seul l'excédent BOT → VAULT toutes les heures
 dès que le BOT dépasse `threshold` USDT (en gardant `keep_on_bot`).
