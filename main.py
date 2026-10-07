@@ -10,6 +10,7 @@ Usage:
     python main.py status               # affiche un résumé en texte dans le terminal
     python main.py create-autosigner-wallet  # génère le wallet dédié à l'auto-signature (RPi3 uniquement)
     python main.py scan-opportunities   # scanne manuellement les micro-récompenses auto-réclamables
+    python main.py discover-projects    # cherche manuellement de nouveaux projets (sources publiques)
 """
 from __future__ import annotations
 
@@ -75,6 +76,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         deadline_check_hour=scheduler_cfg.get("deadline_check_hour", 8),
         digest_hour=scheduler_cfg.get("digest_hour", 9),
         opportunity_scan_interval_minutes=scheduler_cfg.get("opportunity_scan_interval_minutes", 120),
+        discovery_scan_interval_minutes=scheduler_cfg.get("discovery_scan_interval_minutes", 1440),
     )
     scheduler.start()
     logger.info("Scheduler démarré.")
@@ -140,6 +142,22 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     _, db, _ = _build_components(args.config)
     print(build_dashboard_text(db))
+
+
+def cmd_discover_projects(args: argparse.Namespace) -> None:
+    """Lance manuellement une découverte de nouveaux projets (debug/test)."""
+    from app.discovery.scanner import run_discovery
+
+    config, db, _ = _build_components(args.config)
+    found = run_discovery(db)
+    if not found:
+        print("Aucun nouveau candidat (ou toutes les sources ont déjà été vues). "
+              "Consulte 'python main.py' puis le dashboard, section Projets découverts, "
+              "pour la liste complète en attente de validation.")
+        return
+    for e in found:
+        hint = f" {e['risk_hint']}" if e.get("risk_hint") else ""
+        print(f"- [{e['source']}] {e['title']}\n  {e['url']}{hint}")
 
 
 def cmd_scan_opportunities(args: argparse.Namespace) -> None:
@@ -214,6 +232,11 @@ def build_parser() -> argparse.ArgumentParser:
         "scan-opportunities",
         help="Scanne manuellement les micro-récompenses auto-réclamables (debug/test, sans attendre le scheduler).",
     ).set_defaults(func=cmd_scan_opportunities)
+
+    sub.add_parser(
+        "discover-projects",
+        help="Lance manuellement une découverte de nouveaux projets via les sources publiques (debug/test).",
+    ).set_defaults(func=cmd_discover_projects)
     return parser
 
 

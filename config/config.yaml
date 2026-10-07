@@ -17,6 +17,7 @@ scheduler:
   deadline_check_hour: 8      # heure UTC de vérification des échéances
   digest_hour: 9              # heure UTC d'envoi du digest quotidien "opportunité du jour"
   opportunity_scan_interval_minutes: 120  # fréquence du scan de micro-récompenses (section 16 étendue)
+  discovery_scan_interval_minutes: 1440   # fréquence de découverte de nouveaux projets (1x/jour, sources publiques limitées en débit)
 
 dashboard:
   enabled: true

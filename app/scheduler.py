@@ -12,6 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.database import Database
+from app.discovery.scanner import run_discovery as _run_discovery_scan
 from app.killswitch import is_stopped
 from app.projects import all_projects
 from app.scoring import score_from_project_row
@@ -112,6 +113,23 @@ def run_opportunity_scan(db: Database, telegram=None) -> list[dict]:
     return results
 
 
+def run_project_discovery(db: Database, telegram=None) -> list[dict]:
+    """Détecte de nouveaux projets potentiels via des sources publiques (option 2
+    du scanner de micro-récompenses, voir app/discovery/). N'ajoute jamais un
+    projet au suivi actif automatiquement : validation humaine obligatoire."""
+    if is_stopped(db):
+        return []
+    newly_found = _run_discovery_scan(db)
+    if newly_found and telegram:
+        lines = [f"• [{e['source']}] {e['title']}" for e in newly_found[:5]]
+        telegram.send(
+            f"🔭 <b>{len(newly_found)} nouveau(x) projet(s) potentiel(s) détecté(s)</b> "
+            "(à valider manuellement sur le dashboard)\n" + "\n".join(lines),
+            level="info",
+        )
+    return newly_found
+
+
 def build_scheduler(
     db: Database,
     telegram=None,
@@ -119,6 +137,7 @@ def build_scheduler(
     deadline_check_hour: int = 8,
     digest_hour: int = 9,
     opportunity_scan_interval_minutes: int = 120,
+    discovery_scan_interval_minutes: int = 1440,
 ) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="UTC")
 
@@ -137,5 +156,9 @@ def build_scheduler(
     scheduler.add_job(
         run_opportunity_scan, IntervalTrigger(minutes=opportunity_scan_interval_minutes),
         args=[db, telegram], id="opportunity_scan", replace_existing=True,
+    )
+    scheduler.add_job(
+        run_project_discovery, IntervalTrigger(minutes=discovery_scan_interval_minutes),
+        args=[db, telegram], id="project_discovery", replace_existing=True,
     )
     return scheduler

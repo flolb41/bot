@@ -108,10 +108,26 @@ CREATE TABLE IF NOT EXISTS notifications (
     created_at REAL DEFAULT (strftime('%s','now'))
 );
 
+-- Candidats de projets détectés automatiquement (section "découverte de nouveaux
+-- projets") à partir de sources publiques (flux RSS airdrops.io, r/airdrops...).
+-- Jamais promu automatiquement vers `projects` : validation humaine obligatoire
+-- avant tout suivi actif (golden rule anti-scam du projet).
+CREATE TABLE IF NOT EXISTS discovered_projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL UNIQUE,
+    summary TEXT,
+    published_at TEXT,
+    status TEXT DEFAULT 'pending_review',
+    first_seen_at REAL DEFAULT (strftime('%s','now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_rewards_project ON rewards(project_id);
 CREATE INDEX IF NOT EXISTS idx_points_history_project ON points_history(project_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_discovered_status ON discovered_projects(status);
 """
 
 
@@ -304,3 +320,35 @@ class Database:
 
     def mark_notifications_read(self) -> None:
         self.execute("UPDATE notifications SET is_read = 1 WHERE is_read = 0")
+
+    # --- découverte automatique de nouveaux projets (sources publiques) -
+    def discovered_project_exists(self, url: str) -> bool:
+        return self.fetch_one("SELECT 1 FROM discovered_projects WHERE url = ?", (url,)) is not None
+
+    def add_discovered_project(self, source: str, title: str, url: str,
+                                summary: str = "", published_at: str | None = None) -> int | None:
+        """Insère un candidat détecté. Ne fait rien s'il existe déjà (URL unique).
+        Ne touche jamais `projects` : reste 'pending_review' jusqu'à validation humaine."""
+        if self.discovered_project_exists(url):
+            return None
+        return self.execute(
+            "INSERT INTO discovered_projects (source, title, url, summary, published_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (source, title, url, summary, published_at),
+        )
+
+    def list_discovered_projects(self, status: str | None = "pending_review",
+                                  limit: int = 100) -> list[dict[str, Any]]:
+        query = "SELECT * FROM discovered_projects"
+        params: tuple = ()
+        if status:
+            query += " WHERE status = ?"
+            params = (status,)
+        query += " ORDER BY first_seen_at DESC LIMIT ?"
+        return self.fetch_all(query, params + (limit,))
+
+    def set_discovered_project_status(self, discovered_id: int, status: str) -> None:
+        self.execute(
+            "UPDATE discovered_projects SET status = ? WHERE id = ?",
+            (status, discovered_id),
+        )

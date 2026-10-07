@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.database import Database
+from app.discovery.scanner import risk_hint as _risk_hint_for_display
 from app.killswitch import is_stopped
 from app.scoring import score_from_project_row
 from app.trackers.deadlines import upcoming_deadlines
@@ -212,6 +213,35 @@ def build_dashboard_html(db: Database) -> str:
             "</section>"
         )
 
+    discovered = db.list_discovered_projects(status="pending_review", limit=30)
+    if discovered:
+        disc_rows = []
+        for d in discovered:
+            hint = _risk_hint_for_display(d["title"], d.get("summary") or "")
+            hint_html = f"<br><span style='color:#fbbf24;font-size:11px'>{escape(hint)}</span>" if hint else ""
+            disc_rows.append(
+                f"<tr><td>{escape(d['source'])}</td>"
+                f"<td><a href='{escape(d['url'])}' target='_blank' rel='noopener'>{escape(d['title'])}</a>{hint_html}</td>"
+                f"<td>{escape(str(d.get('published_at') or '—'))}</td></tr>"
+            )
+        discovery_section = (
+            "<section>"
+            "<h2>🔭 Projets découverts — à valider manuellement (lecture seule)</h2>"
+            "<table><tr><th>Source</th><th>Titre</th><th>Publié le</th></tr>"
+            + "".join(disc_rows) + "</table>"
+            "<p class='subtitle'>Détection automatique via des flux publics (airdrops.io, r/airdrops). "
+            "Aucun de ces candidats n'est suivi activement ni whitelisté : chacun doit être vérifié "
+            "manuellement (légitimité, arnaque potentielle) avant tout ajout au suivi.</p>"
+            "</section>"
+        )
+    else:
+        discovery_section = (
+            "<section>"
+            "<h2>🔭 Projets découverts — à valider manuellement (lecture seule)</h2>"
+            "<p class='subtitle'>Aucun candidat en attente pour l'instant.</p>"
+            "</section>"
+        )
+
     killswitch_banner = (
         "<div class='banner stop'>🛑 Killswitch actif : scans et notifications automatiques coupés.</div>"
         if stopped else ""
@@ -331,11 +361,13 @@ def build_dashboard_html(db: Database) -> str:
 
 {opportunity_section}
 
+{discovery_section}
+
 <section>
   <p class="subtitle">API JSON disponible : <a href="/api/projects">/api/projects</a> ·
   <a href="/api/rewards">/api/rewards</a> · <a href="/api/wallets">/api/wallets</a> ·
   <a href="/api/status">/api/status</a> · <a href="/api/notifications">/api/notifications</a> ·
-  <a href="/api/opportunities">/api/opportunities</a></p>
+  <a href="/api/opportunities">/api/opportunities</a> · <a href="/api/discovered">/api/discovered</a></p>
 </section>
 <script>
   // Panneau de notifications web (alternative à Telegram) : poll léger toutes les 15s,
@@ -437,6 +469,10 @@ def create_app(db: Database) -> FastAPI:
     @app.get("/api/opportunities")
     def api_opportunities() -> JSONResponse:
         return JSONResponse(last_scan_results(db))
+
+    @app.get("/api/discovered")
+    def api_discovered() -> JSONResponse:
+        return JSONResponse(db.list_discovered_projects(status=None, limit=200))
 
     @app.get("/api/status")
     def api_status() -> JSONResponse:
