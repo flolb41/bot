@@ -75,6 +75,8 @@ def max_gas_price_gwei() -> float:
 
 
 def max_tx_per_day() -> int:
+    """`TRADING_MAX_TX_PER_DAY=0` (ou négatif) désactive explicitement ce
+    garde-fou (quota illimité) — voir l'appel dans `send_trading_transaction`."""
     return _env_int("TRADING_MAX_TX_PER_DAY", 5)
 
 
@@ -167,7 +169,7 @@ def send_trading_transaction(
     )
     wallet_address = signer_account.address
 
-    if count_against_daily_limit and db.today_executed_trades_count() >= max_tx_per_day():
+    if count_against_daily_limit and max_tx_per_day() > 0 and db.today_executed_trades_count() >= max_tx_per_day():
         raise TradingRefused(f"Limite quotidienne de trades atteinte (TRADING_MAX_TX_PER_DAY={max_tx_per_day()}).")
 
     gas_price_wei = w3.eth.gas_price
