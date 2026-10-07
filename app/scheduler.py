@@ -31,6 +31,29 @@ def seed_initial_data(db: Database) -> None:
         logger.info("Projet initialisé: %s", project.id)
 
 
+def seed_wallets(db: Database, config) -> None:
+    """Enregistre en base les wallets déclarés dans la config (adresses publiques uniquement).
+
+    Aucune seed phrase ni private key ne transite jamais ici : seules les
+    entrées `address` (publiques) de la section `wallets` du config.yaml,
+    elles-mêmes injectées via des variables d'environnement, sont utilisées.
+    """
+    for wallet in config.get("wallets", []) or []:
+        address = (wallet.get("address") or "").strip()
+        if not address:
+            # Pas d'adresse configurée pour ce wallet : on ignore silencieusement
+            # (évite de polluer la base avec des wallets vides tant que l'utilisateur
+            # n'a pas créé et renseigné son wallet FARMING dédié).
+            continue
+        db.upsert_wallet(
+            name=wallet.get("name", "wallet"),
+            address=address,
+            network=wallet.get("network", ""),
+            purpose=wallet.get("purpose", ""),
+        )
+        logger.info("Wallet enregistré (adresse publique uniquement): %s", wallet.get("name"))
+
+
 def run_scan_once(db: Database, telegram=None) -> list[dict]:
     """Exécute un cycle de scan complet : fetch + hash + score + notifications de changement."""
     if is_stopped(db):

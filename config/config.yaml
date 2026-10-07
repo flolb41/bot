@@ -33,3 +33,17 @@ rewards_allocation:
   keep_percent: 50
   stablecoin_percent: 25
   trading_reserve_percent: 25
+
+# Wallets suivis en LECTURE SEULE (balances only, section 4 du TODO).
+# Les adresses viennent exclusivement du .env : tant que WALLET_*_EVM_ADDRESS
+# est vide, le wallet correspondant n'est pas enregistré. Aucune seed phrase
+# ni private key ne doit JAMAIS apparaître ici ni dans le .env.
+wallets:
+  - name: farming
+    address: "${WALLET_FARM_EVM_ADDRESS}"
+    network: "${WALLET_FARM_EVM_NETWORK}"
+    purpose: "Wallet dédié au farming d'airdrops/testnets — jamais le wallet personnel."
+  - name: rewards
+    address: "${WALLET_REWARDS_EVM_ADDRESS}"
+    network: "${WALLET_REWARDS_EVM_NETWORK}"
+    purpose: "Wallet de réception des rewards convertis (section 11 du TODO)."

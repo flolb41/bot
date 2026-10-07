@@ -26,7 +26,7 @@ from app.config import load_config
 from app.database import Database
 from app.logger import setup_logger
 from app.notifications.telegram import TelegramBot
-from app.scheduler import build_scheduler, run_scan_once, seed_initial_data
+from app.scheduler import build_scheduler, run_scan_once, seed_initial_data, seed_wallets
 
 
 def _build_components(config_path: str):
@@ -45,14 +45,17 @@ def _build_components(config_path: str):
 
 
 def cmd_seed(args: argparse.Namespace) -> None:
-    _, db, _ = _build_components(args.config)
+    config, db, _ = _build_components(args.config)
     seed_initial_data(db)
+    seed_wallets(db, config)
     print(f"{len(db.list_projects())} projet(s) initialisé(s) en base.")
+    print(f"{len(db.list_wallets())} wallet(s) enregistré(s) (adresses publiques).")
 
 
 def cmd_scan(args: argparse.Namespace) -> None:
-    _, db, telegram = _build_components(args.config)
+    config, db, telegram = _build_components(args.config)
     seed_initial_data(db)  # garantit que les projets existent avant le premier scan
+    seed_wallets(db, config)
     changes = run_scan_once(db, telegram)
     print(f"Scan terminé : {len(changes)} changement(s) détecté(s).")
 
@@ -61,6 +64,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     config, db, telegram = _build_components(args.config)
     logger = logging.getLogger("app.main")
     seed_initial_data(db)
+    seed_wallets(db, config)
 
     scheduler_cfg = config.get("scheduler", {})
     scheduler = build_scheduler(
@@ -108,8 +112,9 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_telegram(args: argparse.Namespace) -> None:
-    _, db, telegram = _build_components(args.config)
+    config, db, telegram = _build_components(args.config)
     seed_initial_data(db)
+    seed_wallets(db, config)
     telegram.run_forever()
 
 
