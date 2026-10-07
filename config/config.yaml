@@ -25,8 +25,22 @@ dashboard:
 # Plafond de coût accepté pour qu'une campagne reste considérée "0 € de capital".
 risk:
   max_acceptable_cost_eur: 0.0
-  max_gas_per_tx_native: 0.01       # limite indicative pour une future phase 4 (non utilisée en phase 1-3)
+  max_gas_per_tx_native: 0.01       # limite indicative (reprise par AUTOSIGN_MAX_GAS_PRICE_GWEI)
   max_amount_per_tx_eur: 0.0        # aucune transaction automatique n'est signée en phase 1-3
+
+# Auto-signature (Phase 4 du TODO — "interactions"). Garde-fous obligatoires avant
+# toute automatisation : whitelist de contrats, limites de gas/montant, simulation
+# préalable, arrêt automatique en cas d'anomalie (voir app/wallet/autosign.py).
+# TOUT vient du .env — par défaut AUTOSIGN_ENABLED=false : aucune transaction n'est
+# envoyée tant que tu ne l'actives pas explicitement après des tests en dry-run.
+autosign:
+  enabled: "${AUTOSIGN_ENABLED}"
+  wallet_address: "${WALLET_AUTOSIGNER_ADDRESS}"
+  wallet_network: "${WALLET_AUTOSIGNER_NETWORK}"
+  contract_whitelist: "${AUTOSIGN_CONTRACT_WHITELIST}"   # adresses séparées par des virgules
+  max_value_native: "${AUTOSIGN_MAX_VALUE_NATIVE}"
+  max_gas_price_gwei: "${AUTOSIGN_MAX_GAS_PRICE_GWEI}"
+  max_tx_per_day: "${AUTOSIGN_MAX_TX_PER_DAY}"
 
 # Répartition indicative des rewards reçus (section 11 du TODO) — appliquée manuellement.
 rewards_allocation:

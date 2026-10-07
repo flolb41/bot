@@ -8,6 +8,7 @@ Usage:
     python main.py telegram             # démarre uniquement le polling Telegram
     python main.py dashboard            # démarre uniquement le serveur dashboard (uvicorn)
     python main.py status               # affiche un résumé en texte dans le terminal
+    python main.py create-autosigner-wallet  # génère le wallet dédié à l'auto-signature (RPi3 uniquement)
 """
 from __future__ import annotations
 
@@ -139,6 +140,36 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(build_dashboard_text(db))
 
 
+def cmd_create_autosigner_wallet(args: argparse.Namespace) -> None:
+    """Génère le wallet dédié à l'auto-signature (Phase 4). À exécuter UNIQUEMENT
+    sur la machine qui fera tourner le bot (le RPi3) : la clé privée est générée
+    et chiffrée localement, jamais transmise ailleurs."""
+    from app.wallet.signer import DEFAULT_KEYSTORE_PATH, create_autosigner_wallet
+
+    result = create_autosigner_wallet(keystore_path=args.keystore_path or DEFAULT_KEYSTORE_PATH)
+    print("Wallet auto-signature créé.")
+    print(f"  Adresse publique : {result['address']}")
+    print(f"  Keystore chiffré : {result['keystore_path']}")
+    if result["passphrase_was_generated"]:
+        print()
+        print("  ⚠️  Passphrase générée automatiquement (affichée UNE SEULE FOIS, non récupérable) :")
+        print(f"      {result['passphrase']}")
+        print()
+        print("  Ajoute ces lignes dans ton .env :")
+        print(f"      WALLET_AUTOSIGNER_ADDRESS={result['address']}")
+        print(f"      WALLET_AUTOSIGNER_KEYSTORE_PATH={result['keystore_path']}")
+        print(f"      WALLET_AUTOSIGNER_PASSPHRASE={result['passphrase']}")
+        print("      AUTOSIGN_ENABLED=false")
+    else:
+        print("  (Passphrase reprise depuis WALLET_AUTOSIGNER_PASSPHRASE déjà présent dans l'environnement.)")
+        print(f"  Ajoute : WALLET_AUTOSIGNER_ADDRESS={result['address']}")
+        print(f"           WALLET_AUTOSIGNER_KEYSTORE_PATH={result['keystore_path']}")
+    print()
+    print("Ne transfère des fonds sur cette adresse qu'en petite quantité : c'est un wallet")
+    print("opérationnel \"chaud\" dédié à l'automatisation, pas un coffre. Vire régulièrement")
+    print("les rewards accumulés vers ton wallet personnel (MetaMask, seed sauvegardée hors-ligne).")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Crypto Reward Hunter / Airdrop Farmer")
     parser.add_argument("--config", default="config/config.yaml", help="Chemin du fichier de config YAML")
@@ -150,6 +181,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("telegram").set_defaults(func=cmd_telegram)
     sub.add_parser("dashboard").set_defaults(func=cmd_dashboard)
     sub.add_parser("status").set_defaults(func=cmd_status)
+
+    autosigner_parser = sub.add_parser(
+        "create-autosigner-wallet",
+        help="Génère (une seule fois) le wallet dédié à l'auto-signature — à exécuter sur le RPi3.",
+    )
+    autosigner_parser.add_argument("--keystore-path", default=None, help="Chemin du keystore chiffré à créer")
+    autosigner_parser.set_defaults(func=cmd_create_autosigner_wallet)
     return parser
 
 

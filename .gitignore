@@ -7,6 +7,7 @@ data/ohlcv_cache/
 data/*.db-journal
 data/keystore.json
 data/keystore_vault.json
+data/autosigner_keystore.json
 logs/*.log
 *.egg-info/
 .pytest_cache/

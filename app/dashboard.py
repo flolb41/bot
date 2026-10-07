@@ -11,7 +11,9 @@ from app.killswitch import is_stopped
 from app.scoring import score_from_project_row
 from app.trackers.deadlines import upcoming_deadlines
 from app.trackers.rewards import rewards_summary
+from app.wallet.autosign import autosign_enabled, contract_whitelist, max_tx_per_day, max_value_native
 from app.wallet.balances import get_all_balances
+from app.wallet.signer import get_autosigner_address
 
 _EMOJI_BY_CLASS = {
     "PRIORITÉ CRITIQUE": "🔴",
@@ -106,6 +108,27 @@ def build_dashboard_html(db: Database) -> str:
             f"<tr><td>{escape(w['name'])}</td><td>{escape(w['network'])}</td>"
             f"<td><code>{escape(w['address'])}</code></td><td>{balance_display}</td></tr>"
         )
+
+    autosigner_address = get_autosigner_address()
+    autosign_status_badge = "🟢 activée" if autosign_enabled() else "⚪ désactivée (par défaut)"
+    autosign_section = (
+        "<section>"
+        "<h2>Auto-signature (Phase 4 — lecture seule)</h2>"
+        "<table>"
+        "<tr><th>Statut</th><th>Wallet</th><th>Whitelist contrats</th>"
+        "<th>Max/tx</th><th>Max tx/jour</th></tr>"
+        "<tr>"
+        f"<td>{autosign_status_badge}</td>"
+        f"<td><code>{escape(autosigner_address or '— non créé —')}</code></td>"
+        f"<td>{len(contract_whitelist())} contrat(s)</td>"
+        f"<td>{max_value_native()}</td>"
+        f"<td>{max_tx_per_day()}</td>"
+        "</tr>"
+        "</table>"
+        "<p class='subtitle'>Activation/désactivation uniquement via le .env (AUTOSIGN_ENABLED) — "
+        "aucun bouton web, par sécurité.</p>"
+        "</section>"
+    )
 
     killswitch_banner = (
         "<div class='banner stop'>🛑 Killswitch actif : scans et notifications automatiques coupés.</div>"
@@ -203,6 +226,8 @@ def build_dashboard_html(db: Database) -> str:
   </table>
 </section>
 
+{autosign_section}
+
 <section>
   <p class="subtitle">API JSON disponible : <a href="/api/projects">/api/projects</a> ·
   <a href="/api/rewards">/api/rewards</a> · <a href="/api/wallets">/api/wallets</a> ·
@@ -294,6 +319,16 @@ def create_app(db: Database) -> FastAPI:
     @app.get("/api/wallets")
     def api_wallets() -> JSONResponse:
         return JSONResponse(get_all_balances(db.list_wallets()))
+
+    @app.get("/api/autosign/status")
+    def api_autosign_status() -> JSONResponse:
+        return JSONResponse({
+            "enabled": autosign_enabled(),
+            "wallet_address": get_autosigner_address(),
+            "contract_whitelist_count": len(contract_whitelist()),
+            "max_value_native": max_value_native(),
+            "max_tx_per_day": max_tx_per_day(),
+        })
 
     @app.get("/api/status")
     def api_status() -> JSONResponse:
