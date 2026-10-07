@@ -13,6 +13,7 @@ from app.scoring import score_from_project_row
 from app.trackers.deadlines import upcoming_deadlines
 from app.trackers.opportunities import last_scan_results
 from app.trackers.rewards import rewards_summary
+from app.trading.executor import _NO_SALE_CLOSED_SENTINEL
 from app.wallet.autosign import autosign_enabled, contract_whitelist, max_tx_per_day, max_value_native
 from app.wallet.balances import get_all_balances
 from app.wallet.signer import get_autosigner_address
@@ -306,10 +307,13 @@ def build_dashboard_html(db: Database) -> str:
             )
             exec_tag = ""
             if s.get("mode") == "live" and s.get("tx_hash_buy"):
-                exec_tag = (
-                    " <span class='badge' style='background:#b91c1c'>exécuté réel</span>" if not s.get("tx_hash_sell")
-                    else " <span class='badge' style='background:#166534'>round-trip réel complet</span>"
-                )
+                tx_sell = s.get("tx_hash_sell")
+                if not tx_sell:
+                    exec_tag = " <span class='badge' style='background:#b91c1c'>exécuté réel</span>"
+                elif tx_sell == _NO_SALE_CLOSED_SENTINEL:
+                    exec_tag = " <span class='badge' style='background:#92400e'>close (solde nul, pas de vente)</span>"
+                else:
+                    exec_tag = " <span class='badge' style='background:#166534'>round-trip réel complet</span>"
             arb_rows.append(
                 f"<tr><td>{escape(s['token_symbol'])}/{escape(s['quote_symbol'])}</td>"
                 f"<td>{escape(s['buy_dex'])} → {escape(s['sell_dex'])}</td>"

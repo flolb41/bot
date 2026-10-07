@@ -424,6 +424,13 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
 # le gas coûterait plus cher que la poussière récupérée.
 _MIN_RECOVERY_VALUE_USD = 0.50
 
+# Valeur sentinelle (non-nulle, mais pas un vrai hash de tx) utilisée pour
+# `tx_hash_sell` quand une position est jugée définitivement close SANS vente
+# réelle (solde on-chain déjà nul). `Database.list_open_positions` filtre sur
+# `tx_hash_sell IS NULL` : y laisser NULL ferait réapparaître indéfiniment la
+# même ligne à chaque cycle (elle ne serait jamais exclue).
+_NO_SALE_CLOSED_SENTINEL = "no-sale:balance-zero"
+
 
 def recover_open_positions(db: Database, config: dict) -> list[dict]:
     """Termine les round-trips restés incomplets (voir `Database.list_open_positions`) :
@@ -474,9 +481,11 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
             )
             if token_balance_units <= 0:
                 # Rien à récupérer (déjà revendu manuellement, ou poussière consommée) :
-                # on referme la ligne pour ne plus la retenter à chaque cycle.
+                # on referme réellement la ligne (sentinelle non-nulle) pour ne plus la
+                # retenter à chaque cycle — laisser tx_hash_sell=None ne l'aurait pas
+                # exclue de `list_open_positions` (déjà NULL avant cet appel).
                 db.mark_arbitrage_signal_executed(
-                    position["id"], tx_hash_buy=position["tx_hash_buy"], tx_hash_sell=None,
+                    position["id"], tx_hash_buy=position["tx_hash_buy"], tx_hash_sell=_NO_SALE_CLOSED_SENTINEL,
                     execution_error="Position considérée close : solde on-chain nul au moment de la relance.",
                 )
                 continue
@@ -484,18 +493,24 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
             token_decimals = _get_decimals(w3, token_address)
             quote_decimals = _get_decimals(w3, quote_address)
 
-            # Cherche le meilleur prix de vente disponible parmi les DEX exécutables
-            # (pas forcément le sell_dex d'origine : le marché a pu bouger depuis).
-            best_dex, best_price = None, 0.0
+            # Classe tous les DEX exécutables par prix décroissant, puis tente la vente
+            # sur chacun jusqu'au premier succès. Le prix affiché par `_refresh_price_usd`
+            # n'est qu'une estimation (quote API/on-chain) : la transaction peut échouer
+            # on-chain pour ce DEX précis (liquidité insuffisante pour honorer
+            # min_amount_out, pool inexistant pour cette paire, etc.) sans que les autres
+            # DEX exécutables soient affectés — d'où le repli au lieu d'abandonner.
+            dex_prices = []
             for dex in EXECUTABLE_DEXES:
                 price = _refresh_price_usd(position["chain"], token_address, quote_address, dex)
-                if price and price > best_price:
-                    best_dex, best_price = dex, price
-            if best_dex is None:
+                if price:
+                    dex_prices.append((dex, price))
+            if not dex_prices:
                 outcome["error"] = "Aucun prix de vente disponible sur les DEX exécutables — nouvelle tentative au prochain cycle."
                 results.append(outcome)
                 continue
+            dex_prices.sort(key=lambda dp: dp[1], reverse=True)
 
+            best_price = dex_prices[0][1]
             estimated_value_usd = token_balance_units / (10 ** token_decimals) * best_price
             if estimated_value_usd < _MIN_RECOVERY_VALUE_USD:
                 outcome["error"] = (
@@ -507,49 +522,53 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
 
             slip = slippage_pct() / 100.0
             deadline = int(time.time()) + 180
-            min_quote_out_units = int(
-                token_balance_units / (10 ** token_decimals) * best_price * (1 - slip) * (10 ** quote_decimals)
-            )
+            last_error = None
+            for dex, price in dex_prices:
+                min_quote_out_units = int(
+                    token_balance_units / (10 ** token_decimals) * price * (1 - slip) * (10 ** quote_decimals)
+                )
 
-            approve_result = _ensure_allowance(
-                db, w3, token_address=token_address, owner=wallet_address,
-                spender=ROUTER_ADDRESSES[best_dex], amount=token_balance_units,
-                count_against_daily_limit=False,
-            )
-            if approve_result["error"]:
-                outcome["error"] = f"Approve échoué : {approve_result['error']}"
-                results.append(outcome)
-                continue
+                approve_result = _ensure_allowance(
+                    db, w3, token_address=token_address, owner=wallet_address,
+                    spender=ROUTER_ADDRESSES[dex], amount=token_balance_units,
+                    count_against_daily_limit=False,
+                )
+                if approve_result["error"]:
+                    last_error = f"Approve échoué sur {dex} : {approve_result['error']}"
+                    continue
 
-            contract_address, abi, fn_name, args = _build_swap_call(
-                best_dex, w3, token_in=token_address, token_out=quote_address,
-                amount_in=token_balance_units, min_amount_out=min_quote_out_units,
-                recipient=wallet_address, deadline=deadline,
-            )
-            sell_result = send_trading_transaction(
-                db, rpc_url=_resolve_rpc_url(), contract_address=contract_address, abi=abi,
-                function_name=fn_name, args=args, whitelist_target=contract_address,
-                action_label=f"récupération position {position['token_symbol']} sur {best_dex}",
-                count_against_daily_limit=False,
-            )
-            outcome["tx_hash_sell"] = sell_result["tx_hash"]
-            if sell_result["error"]:
-                outcome["error"] = sell_result["error"]
-                results.append(outcome)
-                continue
+                contract_address, abi, fn_name, args = _build_swap_call(
+                    dex, w3, token_in=token_address, token_out=quote_address,
+                    amount_in=token_balance_units, min_amount_out=min_quote_out_units,
+                    recipient=wallet_address, deadline=deadline,
+                )
+                sell_result = send_trading_transaction(
+                    db, rpc_url=_resolve_rpc_url(), contract_address=contract_address, abi=abi,
+                    function_name=fn_name, args=args, whitelist_target=contract_address,
+                    action_label=f"récupération position {position['token_symbol']} sur {dex}",
+                    count_against_daily_limit=False,
+                )
+                if sell_result["error"]:
+                    last_error = f"Vente échouée sur {dex} : {sell_result['error']}"
+                    continue
 
-            db.mark_arbitrage_signal_executed(
-                position["id"], tx_hash_buy=position["tx_hash_buy"], tx_hash_sell=outcome["tx_hash_sell"],
-            )
-            db.add_notification(
-                title="✅ Position résiduelle clôturée",
-                message=(
-                    f"{position['token_symbol']} revendu sur {best_dex} (~{estimated_value_usd:.2f}$) — "
-                    f"tx {outcome['tx_hash_sell']}"
-                ),
-                level="info",
-            )
-            outcome["recovered"] = True
+                outcome["tx_hash_sell"] = sell_result["tx_hash"]
+                db.mark_arbitrage_signal_executed(
+                    position["id"], tx_hash_buy=position["tx_hash_buy"], tx_hash_sell=outcome["tx_hash_sell"],
+                )
+                db.add_notification(
+                    title="✅ Position résiduelle clôturée",
+                    message=(
+                        f"{position['token_symbol']} revendu sur {dex} (~{estimated_value_usd:.2f}$) — "
+                        f"tx {outcome['tx_hash_sell']}"
+                    ),
+                    level="info",
+                )
+                outcome["recovered"] = True
+                break
+
+            if not outcome["recovered"]:
+                outcome["error"] = last_error or "Vente impossible sur tous les DEX exécutables."
             results.append(outcome)
         except TradingRefused as exc:
             outcome["error"] = f"Refusé par un garde-fou : {exc}"
