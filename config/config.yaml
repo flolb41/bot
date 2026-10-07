@@ -18,7 +18,12 @@ scheduler:
   digest_hour: 9              # heure UTC d'envoi du digest quotidien "opportunité du jour"
   opportunity_scan_interval_minutes: 120  # fréquence du scan de micro-récompenses (section 16 étendue)
   discovery_scan_interval_minutes: 1440   # fréquence de découverte de nouveaux projets (1x/jour, sources publiques limitées en débit)
-  arbitrage_scan_interval_minutes: 5      # fréquence du scan d'arbitrage inter-DEX (bot de trading, phase simulation)
+  # Fréquence du scan d'arbitrage inter-DEX (bot de trading, LIVE). 5 appels
+  # DEX Screener par scan (1 par token seed), throttlés à 1,1s d'intervalle
+  # (voir app/trading/dex_sources.py) : même à 1 min, on reste ~5 req/min,
+  # très en dessous de la limite documentée de 60 req/min. CoinGecko est mis
+  # en cache 10 min indépendamment de cette fréquence (pas d'appel supplémentaire).
+  arbitrage_scan_interval_minutes: 1
 
 dashboard:
   enabled: true
