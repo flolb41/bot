@@ -140,9 +140,17 @@ def send_guarded_transaction(
             "AUTOSIGN_ENABLED=false : l'auto-signature est désactivée par défaut. "
             "Active-la explicitement dans le .env après avoir validé le comportement en dry-run."
         )
-    if contract_address_l not in contract_whitelist():
+    whitelist = contract_whitelist()
+    # Si AUTOSIGN_CONTRACT_WHITELIST est vide (réglage par défaut), tout candidat
+    # provenant de claim_candidates() est autorisé : ces candidats ne peuvent
+    # venir QUE du code source d'un projet revu par un humain (jamais d'un
+    # projet découvert automatiquement, dont claim_candidates() reste [] en
+    # dur, voir app/discovery/auto_projects.py). Si l'utilisateur renseigne
+    # AUTOSIGN_CONTRACT_WHITELIST, elle redevient une restriction stricte :
+    # seuls les contrats listés y sont autorisés.
+    if whitelist and contract_address_l not in whitelist:
         raise AutosignRefused(
-            f"Contrat {contract_address} absent de AUTOSIGN_CONTRACT_WHITELIST : refusé par garde-fou."
+            f"Contrat {contract_address} absent de AUTOSIGN_CONTRACT_WHITELIST (liste non vide = restriction explicite active)."
         )
     if value_native > max_value_native():
         raise AutosignRefused(

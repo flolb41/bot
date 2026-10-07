@@ -6,23 +6,28 @@ par un projet (`BaseProject.claim_candidates()`), on effectue dans l'ordre :
 
     1. Lecture on-chain (lecture seule, gratuite) du montant réellement
        réclamable pour le wallet auto-signature.
-    2. Vérification de légitimité minimale : le contrat doit être
-       EXPLICITEMENT whitelisté par l'utilisateur (AUTOSIGN_CONTRACT_WHITELIST)
-       — ce module ne whitelist jamais rien automatiquement, il notifie
-       seulement qu'une opportunité existe et attend une décision humaine.
+    2. Vérification de légitimité minimale : par défaut (AUTOSIGN_CONTRACT_WHITELIST
+       vide), tout candidat est considéré pré-vérifié — car `claim_candidates()`
+       ne peut provenir QUE du code source d'un projet, écrit et revu par un
+       humain au moment du développement (jamais d'un projet découvert
+       automatiquement via RSS : voir app/discovery/auto_projects.py, dont
+       claim_candidates() reste [] en dur, en permanence). Si l'utilisateur
+       renseigne explicitement AUTOSIGN_CONTRACT_WHITELIST, elle redevient une
+       restriction stricte (allow-list) en plus des autres garde-fous.
     3. Estimation de la valeur en EUR de la récompense (CoinGecko). Si le
        token n'est pas coté, on NE RÉCLAME PAS (prudence : mieux vaut rater
        une récompense que de signer à l'aveugle).
     4. Estimation des frais de gas en EUR.
-    5. Claim automatique UNIQUEMENT si : whitelisté + valeur > frais (+ marge)
-       + AUTOSIGN_ENABLED=true — via `send_guarded_transaction`, qui revérifie
-       indépendamment tous les garde-fous (y compris la rentabilité, au cas où
-       les prix auraient bougé entre le pré-filtre ici et l'envoi réel).
+    5. Claim automatique UNIQUEMENT si : whitelist (si définie) respectée +
+       valeur > frais (+ marge) + AUTOSIGN_ENABLED=true — via
+       `send_guarded_transaction`, qui revérifie indépendamment tous les
+       garde-fous (y compris la rentabilité, au cas où les prix auraient bougé
+       entre le pré-filtre ici et l'envoi réel), plus la limite de montant, de
+       gas, de transactions/jour et le killswitch global.
 
-Dans tous les autres cas (non whitelisté, non rentable, autosign désactivé,
-erreur quelconque), une notification informative est envoyée pour que
-l'utilisateur puisse décider manuellement — jamais de transaction "tentée au
-hasard".
+Dans tous les autres cas (non rentable, autosign désactivé, whitelist
+restrictive non respectée, erreur quelconque), une notification informative
+est envoyée — jamais de transaction "tentée au hasard".
 """
 from __future__ import annotations
 
@@ -54,6 +59,8 @@ def _resolve_args(args: tuple, wallet_address: str) -> tuple:
 
 
 def _new_entry(project, candidate: dict) -> dict:
+    whitelist = contract_whitelist()
+    is_whitelisted = (not whitelist) or candidate["contract_address"].lower() in whitelist
     return {
         "project_id": project.id,
         "project_name": project.name,
@@ -63,7 +70,7 @@ def _new_entry(project, candidate: dict) -> dict:
         "claimable_amount": None,
         "value_eur": None,
         "fee_eur": None,
-        "whitelisted": candidate["contract_address"].lower() in contract_whitelist(),
+        "whitelisted": is_whitelisted,
         "profitable": None,
         "claimed": False,
         "error": None,
@@ -166,12 +173,12 @@ def scan_opportunities(db: Database) -> list[dict]:
 
             if not entry["whitelisted"]:
                 db.add_notification(
-                    title=f"💰 Micro-récompense détectée : {project.name}",
+                    title=f"💰 Micro-récompense détectée mais exclue par ta whitelist : {project.name}",
                     message=(
                         f"{amount:.6f} token(s) réclamable(s) (~{value_eur:.4f} € estimés, "
-                        f"~{fee_eur:.4f} € de frais). Contrat non whitelisté — ajoute "
-                        f"{candidate['contract_address']} à AUTOSIGN_CONTRACT_WHITELIST après "
-                        "avoir vérifié toi-même sa légitimité pour autoriser le claim automatique."
+                        f"~{fee_eur:.4f} € de frais). AUTOSIGN_CONTRACT_WHITELIST est définie "
+                        f"et n'inclut pas {candidate['contract_address']} — ajoute-le à la liste "
+                        "si tu veux autoriser ce claim automatique."
                     ),
                     level="info", project_id=project.id,
                 )
