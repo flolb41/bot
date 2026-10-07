@@ -75,6 +75,59 @@ def create_autosigner_wallet(keystore_path: str | Path = DEFAULT_KEYSTORE_PATH,
     }
 
 
+def import_wallet_from_private_key(private_key: str,
+                                    keystore_path: str | Path = DEFAULT_KEYSTORE_PATH,
+                                    passphrase: str | None = None,
+                                    overwrite: bool = False) -> dict:
+    """Chiffre une clé privée EXISTANTE (fournie par l'appelant, jamais générée
+    ici) dans le même format keystore que `create_autosigner_wallet`. Permet
+    d'utiliser un wallet déjà existant (ex: wallet MetaMask principal de
+    l'utilisateur) comme wallet d'auto-signature pour le trading.
+
+    SÉCURITÉ — règles strictes de cette fonction :
+    - Ne journalise JAMAIS `private_key`, même en cas d'erreur.
+    - Ne doit être appelée QUE depuis une invite interactive locale sur la
+      machine qui exécute le bot (voir `main.py` commande `import-trading-wallet`,
+      qui utilise `getpass` pour que la saisie ne s'affiche jamais à l'écran
+      et ne reste jamais dans l'historique shell). Ne JAMAIS appeler cette
+      fonction avec une clé passée en argument de ligne de commande (visible
+      dans `ps`/l'historique shell) ni dans un script exécuté à distance.
+    - Retourne uniquement l'adresse publique : la clé privée en clair ne
+      sort jamais de cette fonction.
+    """
+    from eth_account import Account
+
+    path = Path(keystore_path)
+    if path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Un keystore existe déjà à {path} — passe overwrite=True explicitement si tu veux "
+            "le remplacer (cela invalidera l'accès à l'ancien wallet d'auto-signature, pas au "
+            "wallet MetaMask original qui reste inchangé)."
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    used_passphrase = passphrase or os.environ.get("WALLET_AUTOSIGNER_PASSPHRASE") or generate_random_passphrase()
+
+    account = Account.from_key(private_key)
+    keystore = Account.encrypt(account.key, used_passphrase)
+
+    path.write_text(json.dumps(keystore), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass  # chmod indisponible (ex: Windows) — sans impact sur Linux/RPi
+
+    address = account.address
+    logger.info("Wallet importé pour le trading : %s (keystore chiffré, clé privée jamais journalisée).", address)
+
+    return {
+        "address": address,
+        "keystore_path": str(path),
+        "passphrase_was_generated": passphrase is None and not os.environ.get("WALLET_AUTOSIGNER_PASSPHRASE"),
+        "passphrase": used_passphrase,
+    }
+
+
 def load_signer(keystore_path: str | Path | None = None, passphrase: str | None = None):
     """Déchiffre le keystore EN MÉMOIRE et retourne un `LocalAccount` capable de signer.
 

@@ -135,24 +135,54 @@ def run_project_discovery(db: Database, telegram=None) -> list[dict]:
     return newly_found
 
 
+# Nombre maximum de round-trips réellement exécutés par cycle de scan (cap
+# conservateur volontairement bas, EN PLUS du cap journalier déjà imposé par
+# `app.trading.guardrails.max_tx_per_day` — jamais tout exécuter d'un coup
+# même si plusieurs signaux rentables apparaissent dans le même cycle).
+_MAX_LIVE_EXECUTIONS_PER_CYCLE = 1
+
+
 def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = None) -> list[dict]:
-    """Scanne les écarts de prix inter-DEX (bot de trading, phase simulation —
-    voir app/trading/arbitrage.py). Ne notifie que les signaux jugés rentables
-    après coûts (would_execute=True), purement informatif : aucune transaction
-    n'est jamais envoyée tant que la phase live n'a pas été développée et
-    validée séparément."""
+    """Scanne les écarts de prix inter-DEX (bot de trading — voir
+    app/trading/arbitrage.py). Les signaux rentables (would_execute=True) sont
+    toujours notifiés. Si et SEULEMENT SI le trading live est activé (tous les
+    garde-fous de `app.trading.guardrails.is_trading_live` réunis), tente
+    d'exécuter réellement au maximum `_MAX_LIVE_EXECUTIONS_PER_CYCLE` round-trip(s)
+    par cycle via `app.trading.executor.execute_signal` — sinon reste purement
+    informatif, comme avant (aucune transaction envoyée)."""
     if is_stopped(db):
         return []
     signals = run_arbitrage_scan(db, config)
     profitable = [s for s in signals if s["would_execute"]]
+
+    from app.trading.guardrails import is_trading_live
+    live = is_trading_live(config or {})
+
+    executed_count = 0
+    if live:
+        from app.trading.executor import execute_signal
+        for signal in profitable:
+            if executed_count >= _MAX_LIVE_EXECUTIONS_PER_CYCLE:
+                break
+            exec_result = execute_signal(db, config, signal)
+            if exec_result["executed"]:
+                executed_count += 1
+            elif telegram and exec_result["error"]:
+                telegram.send(
+                    f"⚠️ <b>Exécution d'arbitrage refusée/échouée</b> "
+                    f"({signal['token_symbol']}/{signal['quote_symbol']}) : {exec_result['error']}",
+                    level="warning",
+                )
+
     if profitable and telegram:
+        tag = "LIVE" if live else "SIMULATION"
         lines = [
             f"• {s['token_symbol']}/{s['quote_symbol']} : achat {s['buy_dex']} → vente {s['sell_dex']} "
             f"(spread {s['spread_pct']:.2f}%, net≈{s['net_profit_usd']:.2f}$)"
             for s in profitable[:5]
         ]
         telegram.send(
-            f"📈 <b>{len(profitable)} opportunité(s) d'arbitrage rentable(s) détectée(s) [SIMULATION]</b>\n"
+            f"📈 <b>{len(profitable)} opportunité(s) d'arbitrage rentable(s) détectée(s) [{tag}]</b>\n"
             + "\n".join(lines),
             level="info",
         )

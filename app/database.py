@@ -8,6 +8,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -182,6 +183,23 @@ class Database:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._run_migrations(conn)
+
+    def _run_migrations(self, conn: sqlite3.Connection) -> None:
+        """Ajoute des colonnes à des tables existantes sans casser les bases déjà
+        déployées (SQLite ne supporte pas `ADD COLUMN IF NOT EXISTS`, donc on
+        catch l'erreur "duplicate column" qui signifie juste que c'est déjà fait)."""
+        migrations = [
+            "ALTER TABLE arbitrage_signals ADD COLUMN tx_hash_buy TEXT",
+            "ALTER TABLE arbitrage_signals ADD COLUMN tx_hash_sell TEXT",
+            "ALTER TABLE arbitrage_signals ADD COLUMN execution_error TEXT",
+        ]
+        for stmt in migrations:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -419,6 +437,29 @@ class Database:
             query += " WHERE would_execute = 1"
         query += " ORDER BY detected_at DESC LIMIT ?"
         return self.fetch_all(query, (limit,))
+
+    def mark_arbitrage_signal_executed(self, signal_id: int, *, tx_hash_buy: str | None = None,
+                                        tx_hash_sell: str | None = None,
+                                        execution_error: str | None = None) -> None:
+        """Enregistre le résultat réel (Phase 2) d'une tentative d'exécution d'un
+        signal d'arbitrage. `execution_error` non-null signifie un round-trip
+        incomplet/échoué (voir app/trading/executor.py pour la gestion du risque
+        non-atomique : tx_hash_buy peut être renseigné seul si la 2e jambe échoue)."""
+        self.execute(
+            "UPDATE arbitrage_signals SET executed = 1, tx_hash_buy = ?, tx_hash_sell = ?, "
+            "execution_error = ?, mode = 'live' WHERE id = ?",
+            (tx_hash_buy, tx_hash_sell, execution_error, signal_id),
+        )
+
+    def today_executed_trades_count(self) -> int:
+        """Nombre de round-trips d'arbitrage réellement exécutés depuis minuit UTC
+        (garde-fou de plafond quotidien, voir app/trading/guardrails.py)."""
+        start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        row = self.fetch_one(
+            "SELECT COUNT(*) AS n FROM arbitrage_signals WHERE executed = 1 AND detected_at >= ?",
+            (start_of_day,),
+        )
+        return int(row["n"]) if row else 0
 
     def arbitrage_stats_summary(self) -> dict[str, Any]:
         """Agrégat utile pour le dashboard : nombre de signaux, nombre de signaux

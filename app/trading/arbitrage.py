@@ -238,7 +238,7 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
                 "mode": "simulation",
                 "executed": False,
             }
-            db.add_arbitrage_signal(signal)
+            signal["id"] = db.add_arbitrage_signal(signal)
             signals.append(signal)
 
     logger.info("Arbitrage scan terminé : %d signal(aux) détecté(s), %d rentable(s) après coûts.",

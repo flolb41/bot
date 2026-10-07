@@ -231,6 +231,94 @@ def cmd_create_autosigner_wallet(args: argparse.Namespace) -> None:
     print("les rewards accumulés vers ton wallet personnel (MetaMask, seed sauvegardée hors-ligne).")
 
 
+def cmd_import_trading_wallet(args: argparse.Namespace) -> None:
+    """Importe le wallet MetaMask PRINCIPAL de l'utilisateur comme wallet de
+    TRADING (distinct du wallet auto-signature). ⚠️ COMMANDE À RISQUE :
+    - Exécute cette commande UNIQUEMENT en te connectant toi-même en SSH
+      directement sur le Pi (jamais via un script tiers, jamais via l'IA).
+    - La clé privée est saisie via `getpass` : elle ne s'affiche jamais à
+      l'écran et n'est jamais écrite dans l'historique shell.
+    - Après import, le trading réel reste DÉSACTIVÉ par défaut (plusieurs
+      garde-fous séparés à activer volontairement, voir message final)."""
+    import getpass
+
+    from app.trading.guardrails import DEFAULT_TRADING_KEYSTORE_PATH, LIVE_CONFIRMATION_PHRASE
+    from app.wallet.signer import import_wallet_from_private_key
+
+    print("=" * 70)
+    print("IMPORT DU WALLET DE TRADING (wallet MetaMask PRINCIPAL)")
+    print("=" * 70)
+    print("⚠️  Ne fais JAMAIS cela dans un terminal partagé, un script, ou via un")
+    print("   assistant distant. Cette commande doit être tapée par TOI, en direct,")
+    print("   dans une session SSH que tu contrôles sur le Pi.")
+    print()
+    private_key = getpass.getpass("Clé privée du wallet (saisie masquée, jamais affichée) : ").strip()
+    if not private_key:
+        print("Aucune clé saisie — abandon.")
+        return
+    keystore_path = args.keystore_path or DEFAULT_TRADING_KEYSTORE_PATH
+    try:
+        result = import_wallet_from_private_key(private_key, keystore_path=keystore_path)
+    finally:
+        private_key = None  # noqa: F841 - abandon de la référence au plus vite
+    print()
+    print("Wallet de trading importé avec succès.")
+    print(f"  Adresse publique : {result['address']}")
+    print(f"  Keystore chiffré : {result['keystore_path']}")
+    if result["passphrase_was_generated"]:
+        print()
+        print("  ⚠️  Passphrase générée automatiquement (affichée UNE SEULE FOIS) :")
+        print(f"      {result['passphrase']}")
+    print()
+    print("Ajoute ces lignes dans ton .env (sur le Pi, jamais dans Git) :")
+    print(f"      WALLET_TRADING_KEYSTORE_PATH={result['keystore_path']}")
+    if result["passphrase_was_generated"]:
+        print(f"      WALLET_TRADING_PASSPHRASE={result['passphrase']}")
+    print("      TRADING_ENABLED=false")
+    print()
+    print("Le trading réel reste DÉSACTIVÉ tant que TOUTES ces conditions ne sont pas")
+    print("réunies volontairement (voir app/trading/guardrails.py) :")
+    print("  1. trading.enabled: true dans config/config.yaml")
+    print("  2. TRADING_ENABLED=true dans le .env")
+    print(f"  3. TRADING_LIVE_CONFIRMED=\"{LIVE_CONFIRMATION_PHRASE}\" dans le .env")
+    print("  4. Le killswitch n'est pas actif")
+    print()
+    print("Ne transfère sur cette adresse QUE la petite somme que tu es prêt à risquer")
+    print("(le capital de test, ex. 5$) — ce n'est pas fait pour stocker ton épargne.")
+
+
+def cmd_execute_arbitrage(args: argparse.Namespace) -> None:
+    """Scanne puis tente d'EXÉCUTER RÉELLEMENT les signaux rentables (debug/test
+    manuel du chemin live). Ne fait rien de plus dangereux que le scheduler : tous
+    les mêmes garde-fous s'appliquent (is_trading_live, whitelist, simulation
+    préalable, caps quotidiens, etc.) — reste sans effet tant qu'ils ne sont pas
+    tous explicitement activés."""
+    from app.trading.arbitrage import run_arbitrage_scan
+    from app.trading.executor import execute_signal
+    from app.trading.guardrails import is_trading_live
+
+    config, db, _ = _build_components(args.config)
+    if not is_trading_live(config):
+        print("Trading live désactivé (voir app/trading/guardrails.py::is_trading_live) — "
+              "cette commande ne fera qu'un scan en simulation, aucune transaction.")
+    signals = run_arbitrage_scan(db, config)
+    profitable = [s for s in signals if s["would_execute"]]
+    if not profitable:
+        print("Aucune opportunité rentable détectée pour le moment.")
+        return
+    for signal in profitable:
+        result = execute_signal(db, config, signal)
+        status = "✅ EXÉCUTÉ" if result["executed"] else "⚪ non exécuté"
+        print(f"- {signal['token_symbol']}/{signal['quote_symbol']} ({signal['buy_dex']}→{signal['sell_dex']}) : "
+              f"{status}")
+        if result["tx_hash_buy"]:
+            print(f"    tx achat : {result['tx_hash_buy']}")
+        if result["tx_hash_sell"]:
+            print(f"    tx vente : {result['tx_hash_sell']}")
+        if result["error"]:
+            print(f"    détail  : {result['error']}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Crypto Reward Hunter / Airdrop Farmer")
     parser.add_argument("--config", default="config/config.yaml", help="Chemin du fichier de config YAML")
@@ -264,6 +352,20 @@ def build_parser() -> argparse.ArgumentParser:
         "scan-arbitrage",
         help="Lance manuellement un scan d'arbitrage inter-DEX (debug/test, SIMULATION uniquement).",
     ).set_defaults(func=cmd_scan_arbitrage)
+
+    import_trading_parser = sub.add_parser(
+        "import-trading-wallet",
+        help="⚠️ Importe ton wallet MetaMask PRINCIPAL comme wallet de trading. "
+             "À exécuter TOI-MÊME en SSH direct sur le Pi, jamais à distance.",
+    )
+    import_trading_parser.add_argument("--keystore-path", default=None, help="Chemin du keystore chiffré à créer")
+    import_trading_parser.set_defaults(func=cmd_import_trading_wallet)
+
+    sub.add_parser(
+        "execute-arbitrage",
+        help="Scanne et tente d'exécuter réellement les opportunités rentables "
+             "(sans effet tant que le trading live n'est pas explicitement activé).",
+    ).set_defaults(func=cmd_execute_arbitrage)
     return parser
 
 

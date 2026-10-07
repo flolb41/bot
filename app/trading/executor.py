@@ -1,131 +1,359 @@
-"""Moteur d'EXÉCUTION LIVE de l'arbitrage inter-DEX — Phase 2 (NON ACTIVÉE).
+"""Moteur d'EXÉCUTION LIVE de l'arbitrage inter-DEX — Phase 2.
 
-CE FICHIER NE CONTIENT ENCORE AUCUN CODE D'EXÉCUTION FONCTIONNEL.
-C'est un squelette d'architecture : chaque fonction documente précisément ce
-qu'elle fera et lève `NotImplementedError`. Objectif : réfléchir/valider le
-design AVANT d'écrire le moindre code qui pourrait toucher à du capital réel
-(demande explicite de l'utilisateur : "commence à réfléchir à l'architecture
-de la Phase 2, sans encore l'activer").
-
-Rien ici n'est câblé au scheduler ni à aucune commande CLI : ce module est
-actuellement mort (jamais importé en dehors de lui-même), par sécurité.
+LIS EN ENTIER AVANT DE MODIFIER CE FICHIER : il manipule de vraies transactions
+avec le wallet MetaMask PRINCIPAL de l'utilisateur (voir `app/wallet/signer.py`
+`import_wallet_from_private_key` et `app/trading/guardrails.py`).
 
 ─────────────────────────────────────────────────────────────────────────────
-CONTEXTE ET CONTRAINTES VALIDÉES AVEC L'UTILISATEUR
+CONDITIONS QUI DOIVENT TOUTES ÊTRE RÉUNIES AVANT QU'UNE SEULE TRANSACTION
+RÉELLE PUISSE ÊTRE ENVOYÉE (voir `app.trading.guardrails.is_trading_live`) :
 ─────────────────────────────────────────────────────────────────────────────
-- Capital de test : 5 $ (voir config.yaml `trading.max_trade_size_usd: 3`).
-- Wallet : le wallet MetaMask PRINCIPAL de l'utilisateur (décision explicite,
-  risque signalé à deux reprises : la clé privée exportée sur le Pi expose
-  TOUT le solde du wallet, pas seulement les 5 $ alloués à ce test — accepté
-  en connaissance de cause).
-- Non-négociable : tant que `trading.enabled` reste `false` dans config.yaml,
-  aucune des fonctions ci-dessous ne doit jamais être appelée par le reste du
-  code. Le passage à `true` doit lui-même exiger une confirmation explicite
-  supplémentaire au moment de l'implémentation réelle (voir `confirm_go_live`
-  plus bas) — pas un simple changement de config silencieux.
+1. `trading.enabled: true` dans config.yaml
+2. `TRADING_ENABLED=true` dans l'environnement (.env du Pi, jamais Git)
+3. `TRADING_LIVE_CONFIRMED=<phrase exacte>` dans l'environnement
+4. Un keystore existe à `WALLET_TRADING_KEYSTORE_PATH` (créé une seule fois,
+   manuellement, via `python main.py import-trading-wallet` exécuté EN SSH
+   DIRECTEMENT SUR LE PI — jamais via un script/commande distante)
+5. Le killswitch global n'est pas actif
 
-─────────────────────────────────────────────────────────────────────────────
-PIÈCES MANQUANTES AVANT TOUTE IMPLÉMENTATION RÉELLE (à construire une par une,
-avec validation explicite de l'utilisateur à chaque étape sensible)
-─────────────────────────────────────────────────────────────────────────────
-1. IMPORT DE LA CLÉ PRIVÉE DU WALLET PRINCIPAL
-   `app/wallet/signer.py` sait aujourd'hui uniquement GÉNÉRER un nouveau
-   wallet dédié chiffré (`create_autosigner_wallet`). Il faudra une nouvelle
-   fonction `import_wallet_from_private_key(private_key, passphrase)` qui :
-     - ne doit JAMAIS afficher/logger la clé privée en clair, même une fois,
-     - chiffre immédiatement avec le même format keystore (eth-account /
-       `Account.encrypt`) que l'autosigner existant,
-     - doit être appelée UNE SEULE FOIS, manuellement, directement sur le Pi
-       (jamais via une commande distante/scriptée automatiquement), avec
-       suppression immédiate de la clé en clair de l'historique shell/.env
-       une fois le keystore créé.
-   Tant que cette fonction n'existe pas et n'a pas été exécutée manuellement
-   par l'utilisateur, aucune transaction ne peut techniquement être signée.
-
-2. ADRESSES DES ROUTERS DE SWAP (À VÉRIFIER, jamais à deviner)
-   Chaque DEX whitelisté a un contrat "router" dont la fonction de swap doit
-   être appelée avec les bons paramètres (minAmountOut notamment, pour une
-   protection anti-slippage au niveau du contrat lui-même, pas seulement
-   dans nos calculs). Adresses à vérifier individuellement (doc officielle +
-   BaseScan vérifié + recoupement avec une 2e source) avant tout usage réel,
-   suivant la même rigueur que pour les seed_tokens de arbitrage.py :
-     - Uniswap V3 SwapRouter02 (Base)
-     - Aerodrome Router (Base)
-     - SushiSwap Router (Base)
-     - PancakeSwap SmartRouter (Base)
-
-3. GARDE-FOUS SPÉCIFIQUES AU TRADING (extension de app/wallet/autosign.py)
-   `send_guarded_transaction()` existant est conçu pour UN appel de contrat
-   isolé (claim). L'arbitrage nécessite DEUX swaps séquentiels (non-atomiques
-   sans contrat dédié — voir point 5) avec des garde-fous supplémentaires :
-     - plafond strict par trade = `trading.max_trade_size_usd` (3 $ pour ce
-       test), jamais dépassable même si le signal calculé suggère plus,
-     - plafond de solde réel : ne jamais trader plus que le solde ACTUELLEMENT
-       disponible dans le wallet (lecture on-chain juste avant d'agir, pas de
-       confiance dans une valeur en cache),
-     - whitelist stricte des adresses de router (point 2) — jamais d'adresse
-       de contrat arbitraire,
-     - simulation obligatoire (`eth_call`) de chaque swap AVANT envoi réel,
-     - vérification du prix juste avant la 2e transaction (le marché a pu
-       bouger depuis la détection) : annuler le round-trip si le profit net
-       recalculé est tombé sous le seuil,
-     - limite de transactions/jour réutilisée telle quelle (AUTOSIGN_MAX_TX_PER_DAY),
-     - le killswitch existant (`app.killswitch.is_stopped`) coupe tout, comme
-       pour l'auto-signature actuelle.
-
-4. RISQUE NON-ATOMIQUE (2 transactions séparées, pas une seule)
-   Sans contrat dédié (point 5), le round-trip est : swap sur `buy_dex` PUIS
-   swap sur `sell_dex`, dans deux transactions distinctes. Entre les deux, le
-   prix peut bouger et la 2e jambe devenir perdante. Mitigation prévue :
-     - ne tenter le round-trip QUE si le profit net estimé dépasse largement
-       le seuil minimal (marge de sécurité supplémentaire, à calibrer avec
-       les données de simulation accumulées),
-     - revérifier le prix juste avant la 2e transaction (point 3),
-     - accepter le risque résiduel qu'une seule jambe soit exécutée en cas de
-       mouvement brutal — sur un capital de 5 $, la perte maximale possible
-       dans ce scénario reste bornée et faible, mais doit être explicitement
-       acceptée avant activation.
-
-5. (Hors scope immédiat) CONTRAT D'ARBITRAGE ATOMIQUE — Phase 3 distincte
-   Un contrat Solidity qui enchaîne les deux swaps dans UNE seule transaction
-   (annulée entièrement si non-rentable) éliminerait le risque du point 4.
-   Nécessite déploiement et financement d'un contrat : phase à part entière,
-   non commencée, nécessitant un accord explicite séparé.
-
-6. CONFIRMATION DE PASSAGE EN LIVE
-   `confirm_go_live()` ci-dessous doit exiger une confirmation explicite et
-   non-ambiguë (ex: variable d'environnement dédiée + phrase de confirmation
-   tapée manuellement), pas uniquement `trading.enabled: true` dans un fichier
-   de config qui pourrait être modifié par erreur.
+Tant qu'une seule de ces conditions manque (c'est le cas par défaut), ce
+module se comporte exactement comme avant : aucune transaction n'est tentée,
+tout reste en mode simulation (voir `app/trading/arbitrage.py`).
 
 ─────────────────────────────────────────────────────────────────────────────
+PÉRIMÈTRE VOLONTAIREMENT RESTREINT (choix de sécurité explicites)
+─────────────────────────────────────────────────────────────────────────────
+- DEX exécutables : uniquement uniswap, aerodrome, sushiswap (voir
+  `app.trading.routers.EXECUTABLE_DEXES`). PancakeSwap reste détecté/comparé
+  mais jamais exécuté (son "Smart Router" a un encodage multi-route trop
+  complexe pour être codé en dur sans risque excessif à ce stade).
+- Quote token exécutable : uniquement USDC (`EXECUTABLE_QUOTE_TOKENS`). Un
+  round-trip part et termine en USDC — jamais dans un token volatile — pour
+  ne jamais finir avec un "reste" de valeur imprévisible si la 2e jambe échoue.
+- Risque non-atomique assumé : 2 transactions séparées (achat puis vente), pas
+  un contrat atomique. Avant la 2e jambe, le prix est revérifié en direct ; si
+  l'écart s'est refermé, le round-trip est annulé et le wallet garde le token
+  acheté (pas de perte "forcée", juste un round-trip interrompu — à revendre
+  manuellement ou au prochain cycle si le marché redevient favorable).
 """
 from __future__ import annotations
 
+import logging
+import os
+import time
+
 from app.database import Database
+from app.trading import dex_sources, fees
+from app.trading.guardrails import TradingRefused, is_trading_live, send_trading_transaction, slippage_pct
+from app.trading.routers import (
+    AERODROME_ROUTER_ABI,
+    ERC20_ABI,
+    EXECUTABLE_DEXES,
+    ROUTER_ADDRESSES,
+    UNISWAP_V2_ROUTER_ABI,
+    UNISWAP_V3_FACTORY_ABI,
+    UNISWAP_V3_FACTORY_ADDRESS,
+    UNISWAP_V3_FEE_TIERS,
+    UNISWAP_V3_ROUTER_ABI,
+)
+
+logger = logging.getLogger("app.trading.executor")
+
+# USDC sur Base — seul token "quote" exécutable (voir docstring ci-dessus).
+EXECUTABLE_QUOTE_TOKENS = frozenset({"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"})
+
+_DECIMALS_CACHE: dict[str, int] = {}
 
 
-class LiveExecutionNotImplemented(Exception):
-    """Levée par toute fonction de ce module : aucune exécution live n'existe encore."""
+def _resolve_rpc_url() -> str:
+    return os.environ.get("RPC_BASE") or "https://mainnet.base.org"
 
 
-def confirm_go_live(db: Database, config: dict) -> bool:
-    """[SQUELETTE] Vérifiera, en plus de `trading.enabled: true`, une
-    confirmation explicite distincte (ex: variable d'environnement
-    `TRADING_LIVE_CONFIRMED=<phrase exacte choisie avec l'utilisateur>`)
-    avant d'autoriser quoi que ce soit dans ce module. Retourne toujours
-    False tant que ce n'est pas implémenté."""
-    raise LiveExecutionNotImplemented(
-        "Phase 2 non implémentée : aucune confirmation de passage en live n'existe encore."
+def _get_decimals(w3, token_address: str) -> int:
+    key = token_address.lower()
+    if key not in _DECIMALS_CACHE:
+        from web3 import Web3
+        contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
+        _DECIMALS_CACHE[key] = int(contract.functions.decimals().call())
+    return _DECIMALS_CACHE[key]
+
+
+def _ensure_allowance(db: Database, w3, *, token_address: str, owner: str, spender: str, amount: int) -> dict:
+    """Vérifie l'allowance ERC20 courante ; envoie un `approve` SEULEMENT si
+    insuffisante (évite une transaction superflue à chaque round-trip)."""
+    from web3 import Web3
+    token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
+    current = int(token.functions.allowance(Web3.to_checksum_address(owner), Web3.to_checksum_address(spender)).call())
+    if current >= amount:
+        return {"sent": False, "tx_hash": None, "error": None}
+    return send_trading_transaction(
+        db,
+        rpc_url=_resolve_rpc_url(),
+        contract_address=token_address,
+        abi=ERC20_ABI,
+        function_name="approve",
+        args=(Web3.to_checksum_address(spender), amount),
+        whitelist_target=spender,
+        action_label=f"approve {token_address} -> {spender}",
     )
+
+
+def _find_uniswap_v3_fee_tier(w3, token_in: str, token_out: str) -> int:
+    from web3 import Web3
+    factory = w3.eth.contract(address=Web3.to_checksum_address(UNISWAP_V3_FACTORY_ADDRESS), abi=UNISWAP_V3_FACTORY_ABI)
+    for fee_tier in UNISWAP_V3_FEE_TIERS:
+        pool = factory.functions.getPool(
+            Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out), fee_tier
+        ).call()
+        if int(pool, 16) != 0:
+            return fee_tier
+    raise TradingRefused(
+        f"Aucune pool Uniswap V3 trouvée pour {token_in}/{token_out} (fee tiers testés: {UNISWAP_V3_FEE_TIERS})."
+    )
+
+
+def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: int,
+                      min_amount_out: int, recipient: str, deadline: int) -> tuple[str, list[dict], str, tuple]:
+    """Construit (contract_address, abi, function_name, args) pour le DEX demandé.
+    Lève `TradingRefused` si le DEX n'est pas dans EXECUTABLE_DEXES."""
+    from web3 import Web3
+    if dex not in EXECUTABLE_DEXES:
+        raise TradingRefused(f"Exécution non implémentée pour le DEX '{dex}' (voir EXECUTABLE_DEXES).")
+    router_address = ROUTER_ADDRESSES[dex]
+    token_in_cs = Web3.to_checksum_address(token_in)
+    token_out_cs = Web3.to_checksum_address(token_out)
+    recipient_cs = Web3.to_checksum_address(recipient)
+
+    if dex == "uniswap":
+        fee_tier = _find_uniswap_v3_fee_tier(w3, token_in, token_out)
+        params = (token_in_cs, token_out_cs, fee_tier, recipient_cs, amount_in, min_amount_out, 0)
+        return router_address, UNISWAP_V3_ROUTER_ABI, "exactInputSingle", (params,)
+
+    if dex == "aerodrome":
+        router = w3.eth.contract(address=Web3.to_checksum_address(router_address), abi=AERODROME_ROUTER_ABI)
+        default_factory = router.functions.defaultFactory().call()
+        routes = [(token_in_cs, token_out_cs, False, default_factory)]
+        return router_address, AERODROME_ROUTER_ABI, "swapExactTokensForTokens", (
+            amount_in, min_amount_out, routes, recipient_cs, deadline,
+        )
+
+    # sushiswap
+    path = [token_in_cs, token_out_cs]
+    return router_address, UNISWAP_V2_ROUTER_ABI, "swapExactTokensForTokens", (
+        amount_in, min_amount_out, path, recipient_cs, deadline,
+    )
+
+
+def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, dex: str) -> float | None:
+    """Revérifie le prix courant sur `dex` juste avant d'agir (mitigation du
+    risque non-atomique documenté en tête de fichier). Retourne None si
+    indisponible (dans ce cas l'appelant doit refuser, pas supposer)."""
+    try:
+        pairs = dex_sources.fetch_token_pairs(chain_id, token_address)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Revérification de prix échouée pour %s sur %s: %s", token_address, dex, exc)
+        return None
+    for raw in pairs or []:
+        if raw.get("chainId") != chain_id or raw.get("dexId") != dex:
+            continue
+        base = raw.get("baseToken") or {}
+        quote = raw.get("quoteToken") or {}
+        price_usd = raw.get("priceUsd")
+        price_native = raw.get("priceNative")
+        if price_usd is None:
+            continue
+        try:
+            price_usd = float(price_usd)
+        except (TypeError, ValueError):
+            continue
+        if base.get("address", "").lower() == token_address.lower():
+            return price_usd
+        if quote.get("address", "").lower() == token_address.lower() and price_native:
+            try:
+                return price_usd / float(price_native)
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+    return None
 
 
 def execute_signal(db: Database, config: dict, signal: dict) -> dict:
-    """[SQUELETTE] Exécuterait le round-trip (swap buy_dex -> swap sell_dex)
-    pour un signal d'arbitrage marqué `would_execute=True`, avec tous les
-    garde-fous listés en tête de fichier. Ne fait rien d'autre qu'expliquer
-    pourquoi ce n'est pas encore possible."""
-    raise LiveExecutionNotImplemented(
-        "Phase 2 non implémentée : aucune transaction d'arbitrage n'est envoyée. "
-        "Voir app/trading/executor.py pour la liste des prérequis avant activation."
-    )
+    """Tente d'exécuter réellement un round-trip d'arbitrage pour `signal`
+    (dict au format retourné par `app.trading.arbitrage.run_arbitrage_scan`).
+
+    Retourne toujours un dict `{"executed": bool, "tx_hash_buy": str|None,
+    "tx_hash_sell": str|None, "error": str|None}`. Ne lève jamais d'exception
+    pour un refus de garde-fou normal (catché et retourné comme `error`) ;
+    seules des erreurs de programmation inattendues remonteraient.
+    """
+    result = {"executed": False, "tx_hash_buy": None, "tx_hash_sell": None, "error": None}
+
+    if not is_trading_live(config):
+        result["error"] = "Trading live désactivé (voir app.trading.guardrails.is_trading_live)."
+        return result
+
+    if signal["buy_dex"] not in EXECUTABLE_DEXES or signal["sell_dex"] not in EXECUTABLE_DEXES:
+        result["error"] = (
+            f"DEX non exécutable ({signal['buy_dex']}/{signal['sell_dex']}) "
+            f"— seuls {sorted(EXECUTABLE_DEXES)} sont implémentés."
+        )
+        return result
+
+    if signal["quote_address"].lower() not in EXECUTABLE_QUOTE_TOKENS:
+        result["error"] = (
+            f"Quote token {signal['quote_symbol']} non exécutable — seul USDC est supporté pour l'instant."
+        )
+        return result
+
+    if not signal.get("would_execute"):
+        result["error"] = "Signal non marqué rentable (would_execute=False) — refus par prudence."
+        return result
+
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
+        if not w3.is_connected():
+            result["error"] = "RPC Base injoignable."
+            return result
+
+        from app.trading.guardrails import trading_keystore_path
+        from app.wallet.signer import load_signer
+        signer_account = load_signer(
+            keystore_path=trading_keystore_path(), passphrase=os.environ.get("WALLET_TRADING_PASSPHRASE")
+        )
+        wallet_address = signer_account.address
+        signer_account = None  # on n'a besoin que de l'adresse ici ; la signature se fait dans guardrails
+
+        token_address = signal["token_address"]
+        quote_address = signal["quote_address"]
+        trade_size_usd = float(signal["trade_size_usd"])
+        slip = slippage_pct() / 100.0
+        deadline = int(time.time()) + 180
+
+        quote_decimals = _get_decimals(w3, quote_address)
+        token_decimals = _get_decimals(w3, token_address)
+
+        # --- Garde-fou solde réel : ne jamais trader plus que ce qui est dispo ---
+        quote_contract = w3.eth.contract(address=Web3.to_checksum_address(quote_address), abi=ERC20_ABI)
+        quote_balance_units = int(quote_contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call())
+        amount_in_units = int(trade_size_usd * (10 ** quote_decimals))
+        if amount_in_units > quote_balance_units:
+            result["error"] = (
+                f"Solde USDC insuffisant ({quote_balance_units / 10**quote_decimals:.4f} < "
+                f"{trade_size_usd:.4f} requis) — refus."
+            )
+            return result
+
+        # --- Jambe 1 : achat de token_address avec quote_address sur buy_dex ---
+        expected_token_out = trade_size_usd / signal["buy_price_usd"]
+        min_token_out_units = int(expected_token_out * (1 - slip) * (10 ** token_decimals))
+
+        approve_result = _ensure_allowance(
+            db, w3, token_address=quote_address, owner=wallet_address,
+            spender=ROUTER_ADDRESSES[signal["buy_dex"]], amount=amount_in_units,
+        )
+        if approve_result["error"]:
+            result["error"] = f"Approve (jambe achat) échoué : {approve_result['error']}"
+            return result
+
+        contract_address, abi, fn_name, args = _build_swap_call(
+            signal["buy_dex"], w3, token_in=quote_address, token_out=token_address,
+            amount_in=amount_in_units, min_amount_out=min_token_out_units,
+            recipient=wallet_address, deadline=deadline,
+        )
+        buy_result = send_trading_transaction(
+            db, rpc_url=_resolve_rpc_url(), contract_address=contract_address, abi=abi,
+            function_name=fn_name, args=args, whitelist_target=contract_address,
+            action_label=f"arbitrage achat {signal['token_symbol']} sur {signal['buy_dex']}",
+        )
+        result["tx_hash_buy"] = buy_result["tx_hash"]
+        if buy_result["error"]:
+            result["error"] = f"Jambe achat échouée : {buy_result['error']}"
+            db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
+                                               execution_error=result["error"])
+            return result
+
+        # --- Solde réel de token_address reçu (robuste au slippage réel) ---
+        token_contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
+        token_balance_units = int(token_contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call())
+        if token_balance_units <= 0:
+            result["error"] = "Jambe achat confirmée mais solde du token reçu est nul — anomalie."
+            db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
+                                               execution_error=result["error"])
+            return result
+
+        # --- Revérification du prix avant la jambe 2 (mitigation non-atomique) ---
+        fresh_sell_price = _refresh_price_usd(signal["chain"], token_address, quote_address, signal["sell_dex"])
+        fresh_buy_price = _refresh_price_usd(signal["chain"], token_address, quote_address, signal["buy_dex"])
+        if fresh_sell_price is None:
+            result["error"] = (
+                "Impossible de revérifier le prix de vente avant la 2e jambe — round-trip interrompu "
+                "par prudence (le token acheté reste dans le wallet, revente manuelle possible)."
+            )
+            db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
+                                               execution_error=result["error"])
+            return result
+
+        fresh_spread_pct = (
+            (fresh_sell_price - fresh_buy_price) / fresh_buy_price * 100 if fresh_buy_price else 0.0
+        )
+        min_required_spread_pct = fees.dex_fee_pct(signal["buy_dex"]) + fees.dex_fee_pct(signal["sell_dex"])
+        if fresh_spread_pct < min_required_spread_pct:
+            result["error"] = (
+                f"Écart refermé avant la 2e jambe ({fresh_spread_pct:.3f}% < {min_required_spread_pct:.3f}% "
+                "de frais minimum) — round-trip interrompu, le token acheté reste dans le wallet."
+            )
+            db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
+                                               execution_error=result["error"])
+            return result
+
+        # --- Jambe 2 : vente de token_address contre quote_address sur sell_dex ---
+        expected_quote_out = token_balance_units / (10 ** token_decimals) * fresh_sell_price
+        min_quote_out_units = int(expected_quote_out * (1 - slip) * (10 ** quote_decimals))
+
+        approve_result = _ensure_allowance(
+            db, w3, token_address=token_address, owner=wallet_address,
+            spender=ROUTER_ADDRESSES[signal["sell_dex"]], amount=token_balance_units,
+        )
+        if approve_result["error"]:
+            result["error"] = f"Approve (jambe vente) échoué : {approve_result['error']}"
+            db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
+                                               execution_error=result["error"])
+            return result
+
+        contract_address, abi, fn_name, args = _build_swap_call(
+            signal["sell_dex"], w3, token_in=token_address, token_out=quote_address,
+            amount_in=token_balance_units, min_amount_out=min_quote_out_units,
+            recipient=wallet_address, deadline=deadline,
+        )
+        sell_result = send_trading_transaction(
+            db, rpc_url=_resolve_rpc_url(), contract_address=contract_address, abi=abi,
+            function_name=fn_name, args=args, whitelist_target=contract_address,
+            action_label=f"arbitrage vente {signal['token_symbol']} sur {signal['sell_dex']}",
+        )
+        result["tx_hash_sell"] = sell_result["tx_hash"]
+        if sell_result["error"]:
+            result["error"] = f"Jambe vente échouée : {sell_result['error']}"
+            db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
+                                               tx_hash_sell=result["tx_hash_sell"], execution_error=result["error"])
+            return result
+
+        result["executed"] = True
+        db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
+                                           tx_hash_sell=result["tx_hash_sell"])
+        db.add_notification(
+            title="✅ Round-trip d'arbitrage exécuté",
+            message=(
+                f"{signal['token_symbol']}/{signal['quote_symbol']} : achat {signal['buy_dex']} -> "
+                f"vente {signal['sell_dex']} — tx achat {result['tx_hash_buy']}, tx vente {result['tx_hash_sell']}"
+            ),
+            level="info",
+        )
+        return result
+
+    except TradingRefused as exc:
+        result["error"] = f"Refusé par un garde-fou : {exc}"
+        return result
+    except Exception as exc:  # noqa: BLE001 - jamais de crash du scheduler pour une tentative de trade
+        logger.exception("Erreur inattendue pendant execute_signal")
+        result["error"] = f"Erreur inattendue : {exc}"
+        return result
