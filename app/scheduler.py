@@ -16,6 +16,7 @@ from app.killswitch import is_stopped
 from app.projects import all_projects
 from app.scoring import score_from_project_row
 from app.trackers.deadlines import upcoming_deadlines
+from app.trackers.opportunities import scan_opportunities
 
 logger = logging.getLogger("app.scheduler")
 
@@ -98,12 +99,26 @@ def run_daily_digest(db: Database, telegram=None) -> None:
     telegram.cmd_today()
 
 
+def run_opportunity_scan(db: Database, telegram=None) -> list[dict]:
+    """Scanne les micro-récompenses auto-réclamables (section 16 étendue, voir
+    app/trackers/opportunities.py) et notifie des claims effectués."""
+    if is_stopped(db):
+        return []
+    results = scan_opportunities(db)
+    claimed = [r for r in results if r["claimed"]]
+    if claimed and telegram:
+        lines = [f"✅ {r['project_name']} : ~{r['value_eur']:.4f} € réclamés" for r in claimed]
+        telegram.send("💰 <b>Micro-récompenses réclamées automatiquement</b>\n" + "\n".join(lines), level="info")
+    return results
+
+
 def build_scheduler(
     db: Database,
     telegram=None,
     scan_interval_minutes: int = 30,
     deadline_check_hour: int = 8,
     digest_hour: int = 9,
+    opportunity_scan_interval_minutes: int = 120,
 ) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="UTC")
 
@@ -118,5 +133,9 @@ def build_scheduler(
     scheduler.add_job(
         run_daily_digest, CronTrigger(hour=digest_hour, minute=0),
         args=[db, telegram], id="daily_digest", replace_existing=True,
+    )
+    scheduler.add_job(
+        run_opportunity_scan, IntervalTrigger(minutes=opportunity_scan_interval_minutes),
+        args=[db, telegram], id="opportunity_scan", replace_existing=True,
     )
     return scheduler

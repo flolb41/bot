@@ -81,6 +81,37 @@ class BaseProject:
         """Liste de tâches de référence (section 1 du TODO). À ajuster manuellement."""
         return []
 
+    def claim_candidates(self) -> list[dict]:
+        """Micro-récompenses on-chain potentiellement auto-réclamables (section 16 étendue).
+
+        Liste vide par défaut, VOLONTAIREMENT : un projet ne doit déclarer une
+        entrée ici que s'il existe un contrat de claim PUBLIC, PERMISSIONLESS
+        et déjà vérifié sur l'explorateur officiel du réseau (jamais une UI
+        protégée par captcha/KYC/wallet-connect — ça reste une tâche manuelle
+        dans `default_tasks()`). Le moteur (`app/trackers/opportunities.py`)
+        ne réclame automatiquement que si : le contrat est explicitement
+        whitelisté par l'utilisateur, la valeur de la récompense est
+        vérifiable (prix CoinGecko disponible) et dépasse les frais de gas
+        estimés + marge. Sinon il se contente de notifier pour décision
+        manuelle.
+
+        Chaque entrée est un dict :
+            {
+                "contract_address": "0x...",
+                "network": "...",                 # doit matcher un RPC_<NETWORK> configuré
+                "abi": [...],                       # ABI minimal (fonctions lecture + claim)
+                "view_function": "claimable",       # fonction de lecture du montant réclamable
+                "view_args": (),                    # args positionnels ; "{wallet}" est remplacé
+                                                     # automatiquement par l'adresse du wallet auto-signature
+                "claim_function": "claim",          # fonction qui envoie la récompense
+                "claim_args": (),                   # idem, "{wallet}" supporté
+                "token_decimals": 18,
+                "token_coingecko_id": None,          # id CoinGecko pour estimer la valeur EUR
+                "action_label": "Claim ...",
+            }
+        """
+        return []
+
     def scan(self, timeout: float = 15.0) -> ScanResult:
         """Récupère la page officielle et calcule un hash de contenu normalisé."""
         if not self.official_url:

@@ -10,6 +10,7 @@ from app.database import Database
 from app.killswitch import is_stopped
 from app.scoring import score_from_project_row
 from app.trackers.deadlines import upcoming_deadlines
+from app.trackers.opportunities import last_scan_results
 from app.trackers.rewards import rewards_summary
 from app.wallet.autosign import autosign_enabled, contract_whitelist, max_tx_per_day, max_value_native
 from app.wallet.balances import get_all_balances
@@ -173,6 +174,44 @@ def build_dashboard_html(db: Database) -> str:
         "</section>"
     )
 
+    opportunity_results = last_scan_results(db)
+    if opportunity_results:
+        opp_rows = []
+        for r in opportunity_results:
+            if r["claimed"]:
+                status = "<span class='badge' style='background:#2f855a'>✅ réclamé</span>"
+            elif r["profitable"] is False:
+                status = "<span class='badge' style='background:#4a5568'>⚪ non rentable</span>"
+            elif r["error"]:
+                status = f"<span class='badge' style='background:#b7791f'>⚠️ {escape(r['error'])}</span>"
+            else:
+                status = "<span class='badge' style='background:#2563eb'>ℹ️ à vérifier manuellement</span>"
+            value_display = f"{r['value_eur']:.4f} €" if r["value_eur"] is not None else "inconnue"
+            fee_display = f"{r['fee_eur']:.4f} €" if r["fee_eur"] is not None else "inconnue"
+            opp_rows.append(
+                f"<tr><td>{escape(r['project_name'])}</td><td>{escape(r['action_label'])}</td>"
+                f"<td>{status}</td><td>{value_display}</td><td>{fee_display}</td></tr>"
+            )
+        opportunity_section = (
+            "<section>"
+            "<h2>Micro-récompenses — scan de rentabilité (lecture seule)</h2>"
+            "<table><tr><th>Projet</th><th>Action</th><th>Statut</th><th>Valeur est.</th><th>Frais est.</th></tr>"
+            + "".join(opp_rows) + "</table>"
+            "<p class='subtitle'>Une micro-récompense n'est réclamée automatiquement que si le contrat est "
+            "whitelisté ET si sa valeur estimée (CoinGecko) dépasse les frais de gas + la marge configurée. "
+            "Sinon, elle reste affichée ici pour une décision manuelle.</p>"
+            "</section>"
+        )
+    else:
+        opportunity_section = (
+            "<section>"
+            "<h2>Micro-récompenses — scan de rentabilité (lecture seule)</h2>"
+            "<p class='subtitle'>Aucun scan effectué, ou aucun projet suivi n'expose encore de contrat de "
+            "claim public/permissionless vérifié. Le moteur est actif et prêt, mais n'a rien à réclamer "
+            "pour l'instant.</p>"
+            "</section>"
+        )
+
     killswitch_banner = (
         "<div class='banner stop'>🛑 Killswitch actif : scans et notifications automatiques coupés.</div>"
         if stopped else ""
@@ -290,10 +329,13 @@ def build_dashboard_html(db: Database) -> str:
 
 {autosign_section}
 
+{opportunity_section}
+
 <section>
   <p class="subtitle">API JSON disponible : <a href="/api/projects">/api/projects</a> ·
   <a href="/api/rewards">/api/rewards</a> · <a href="/api/wallets">/api/wallets</a> ·
-  <a href="/api/status">/api/status</a> · <a href="/api/notifications">/api/notifications</a></p>
+  <a href="/api/status">/api/status</a> · <a href="/api/notifications">/api/notifications</a> ·
+  <a href="/api/opportunities">/api/opportunities</a></p>
 </section>
 <script>
   // Panneau de notifications web (alternative à Telegram) : poll léger toutes les 15s,
@@ -391,6 +433,10 @@ def create_app(db: Database) -> FastAPI:
             "max_value_native": max_value_native(),
             "max_tx_per_day": max_tx_per_day(),
         })
+
+    @app.get("/api/opportunities")
+    def api_opportunities() -> JSONResponse:
+        return JSONResponse(last_scan_results(db))
 
     @app.get("/api/status")
     def api_status() -> JSONResponse:

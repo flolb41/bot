@@ -16,6 +16,7 @@ scheduler:
   scan_interval_minutes: 30   # fréquence de scan des pages officielles (Phase 1)
   deadline_check_hour: 8      # heure UTC de vérification des échéances
   digest_hour: 9              # heure UTC d'envoi du digest quotidien "opportunité du jour"
+  opportunity_scan_interval_minutes: 120  # fréquence du scan de micro-récompenses (section 16 étendue)
 
 dashboard:
   enabled: true
@@ -41,6 +42,7 @@ autosign:
   max_value_native: "${AUTOSIGN_MAX_VALUE_NATIVE}"
   max_gas_price_gwei: "${AUTOSIGN_MAX_GAS_PRICE_GWEI}"
   max_tx_per_day: "${AUTOSIGN_MAX_TX_PER_DAY}"
+  min_profit_margin_eur: "${AUTOSIGN_MIN_PROFIT_MARGIN_EUR}"  # marge exigée en plus des frais (section 16 étendue)
 
 # Répartition indicative des rewards reçus (section 11 du TODO) — appliquée manuellement.
 rewards_allocation:

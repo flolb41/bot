@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from app.database import Database
 from app.killswitch import is_stopped, stop as killswitch_stop
 from app.wallet.balances import _resolve_rpc_url
+from app.wallet.pricing import get_price_eur, native_coingecko_id
 from app.wallet.signer import load_signer
 
 logger = logging.getLogger("app.wallet.autosign")
@@ -76,6 +77,14 @@ def max_tx_per_day() -> int:
     return _env_int("AUTOSIGN_MAX_TX_PER_DAY", 3)
 
 
+def min_profit_margin_eur() -> float:
+    """Marge minimale (en EUR) exigée EN PLUS des frais pour qu'un claim soit jugé rentable.
+
+    0.0 par défaut = le gain doit simplement dépasser strictement les frais estimés.
+    """
+    return _env_float("AUTOSIGN_MIN_PROFIT_MARGIN_EUR", 0.0)
+
+
 def _today_tx_count(db: Database, wallet_address: str) -> int:
     start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     rows = db.fetch_all(
@@ -105,8 +114,18 @@ def send_guarded_transaction(
     args: tuple = (),
     value_native: float = 0.0,
     action_label: str = "",
+    value_eur_estimate: float | None = None,
 ) -> dict:
     """Simule puis (si tout est vert) signe et diffuse un appel de contrat.
+
+    Si `value_eur_estimate` est fourni (ce que fait `app.trackers.opportunities`
+    pour toute micro-récompense), un garde-fou de RENTABILITÉ s'ajoute : la
+    transaction est refusée si le prix du token de gas est inconnu (impossible
+    de vérifier quoi que ce soit) ou si la valeur estimée ne dépasse pas les
+    frais de gas réels (estimés juste avant signature) + la marge minimale
+    configurée. Laisser `value_eur_estimate=None` désactive ce garde-fou
+    spécifique (utile pour un appel guardé qui n'a pas de notion de "gain",
+    par ex. une interaction sans token reçu).
 
     Retourne toujours un dict `{"sent": bool, "tx_hash": str|None, "error": str|None}`.
     Ne lève `AutosignRefused` que pour les refus de garde-fou (comportement normal,
@@ -167,6 +186,24 @@ def send_guarded_transaction(
     except Exception as exc:  # noqa: BLE001
         _anomaly_stop(db, f"Simulation échouée pour {action_label or function_name} sur {contract_address}: {exc}")
         return {"sent": False, "tx_hash": None, "error": f"Simulation échouée : {exc}"}
+
+    # --- Garde-fou RENTABILITÉ : gain > frais (si une valeur a été estimée) ---
+    if value_eur_estimate is not None:
+        native_price_eur = get_price_eur(native_coingecko_id(network))
+        if native_price_eur is None:
+            raise AutosignRefused(
+                f"Prix du token de gas de {network} introuvable (configure PRICE_NATIVE_"
+                f"{network.upper()} dans le .env) : impossible de vérifier que le gain "
+                "dépasse les frais, donc aucun claim automatique."
+            )
+        fee_native = float(Web3.from_wei(estimated_gas * gas_price_wei, "ether"))
+        fee_eur = fee_native * native_price_eur
+        margin = min_profit_margin_eur()
+        if value_eur_estimate <= fee_eur + margin:
+            raise AutosignRefused(
+                f"Non rentable : valeur estimée {value_eur_estimate:.4f} € <= frais estimés "
+                f"{fee_eur:.4f} € (+ marge {margin:.4f} €) pour {action_label or function_name}."
+            )
 
     try:
         tx = fn.build_transaction({

@@ -9,6 +9,7 @@ Usage:
     python main.py dashboard            # démarre uniquement le serveur dashboard (uvicorn)
     python main.py status               # affiche un résumé en texte dans le terminal
     python main.py create-autosigner-wallet  # génère le wallet dédié à l'auto-signature (RPi3 uniquement)
+    python main.py scan-opportunities   # scanne manuellement les micro-récompenses auto-réclamables
 """
 from __future__ import annotations
 
@@ -73,6 +74,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         scan_interval_minutes=scheduler_cfg.get("scan_interval_minutes", 30),
         deadline_check_hour=scheduler_cfg.get("deadline_check_hour", 8),
         digest_hour=scheduler_cfg.get("digest_hour", 9),
+        opportunity_scan_interval_minutes=scheduler_cfg.get("opportunity_scan_interval_minutes", 120),
     )
     scheduler.start()
     logger.info("Scheduler démarré.")
@@ -140,6 +142,25 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(build_dashboard_text(db))
 
 
+def cmd_scan_opportunities(args: argparse.Namespace) -> None:
+    """Lance manuellement un scan des micro-récompenses auto-réclamables (debug/test)."""
+    from app.trackers.opportunities import scan_opportunities
+
+    config, db, _ = _build_components(args.config)
+    seed_initial_data(db)
+    seed_wallets(db, config)
+    results = scan_opportunities(db)
+    if not results:
+        print("Aucun candidat de claim déclaré pour l'instant (aucun projet n'expose de contrat "
+              "de claim public/permissionless confirmé) — rien à scanner.")
+        return
+    for r in results:
+        status = "✅ réclamé" if r["claimed"] else ("⚪ non rentable" if r["profitable"] is False else "ℹ️ info")
+        print(f"- {r['project_name']} [{r['contract_address']}] : {status}"
+              f" (valeur≈{r['value_eur']}, frais≈{r['fee_eur']})"
+              + (f" — {r['error']}" if r["error"] else ""))
+
+
 def cmd_create_autosigner_wallet(args: argparse.Namespace) -> None:
     """Génère le wallet dédié à l'auto-signature (Phase 4). À exécuter UNIQUEMENT
     sur la machine qui fera tourner le bot (le RPi3) : la clé privée est générée
@@ -188,6 +209,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     autosigner_parser.add_argument("--keystore-path", default=None, help="Chemin du keystore chiffré à créer")
     autosigner_parser.set_defaults(func=cmd_create_autosigner_wallet)
+
+    sub.add_parser(
+        "scan-opportunities",
+        help="Scanne manuellement les micro-récompenses auto-réclamables (debug/test, sans attendre le scheduler).",
+    ).set_defaults(func=cmd_scan_opportunities)
     return parser
 
 
