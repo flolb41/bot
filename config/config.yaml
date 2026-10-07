@@ -61,3 +61,7 @@ wallets:
     address: "${WALLET_REWARDS_EVM_ADDRESS}"
     network: "${WALLET_REWARDS_EVM_NETWORK}"
     purpose: "Wallet de réception des rewards convertis (section 11 du TODO)."
+  - name: autosigner
+    address: "${WALLET_AUTOSIGNER_ADDRESS}"
+    network: "${WALLET_AUTOSIGNER_NETWORK}"
+    purpose: "Wallet opérationnel pour l'auto-signature (Phase 4) — solde minimal, rewards balayés régulièrement vers le wallet personnel."
