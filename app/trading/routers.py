@@ -10,13 +10,13 @@ explorateur quand c'était pertinent) :
 - Aerodrome Router         : github.com/aerodrome-finance/contracts (IRouter.sol) + BaseScan
 - SushiSwap Router v2      : BaseScan + codeslaw.app (recoupement, contrat à 2M+ tx)
 
-PancakeSwap est VOLONTAIREMENT EXCLU de l'exécution (voir EXECUTABLE_DEXES) :
-son "Smart Router" sur Base utilise un encodage multi-route complexe (façon
-Universal Router) bien plus risqué à encoder correctement qu'une simple
-fonction `swapExactTokensForTokens`. Il reste utilisé pour la DÉTECTION de
-signaux (comparaison de prix), mais aucune transaction réelle n'est jamais
-construite pour ce DEX tant que son intégration n'aura pas été spécifiquement
-revue et testée.
+PancakeSwap v2 Router (classique, `swapExactTokensForTokens`, ABI standard
+UniswapV2Router02) a été vérifié et whitelisté pour l'exécution (voir
+EXECUTABLE_DEXES) — distinct de son "Smart Router"/Universal Router (jamais
+utilisé ici, encodage multi-route trop complexe/risqué) :
+- PancakeSwap Router v2 : docs.pancakeswap.finance → developer.pancakeswap.finance/contracts/v2/addresses
+  (PancakeRouter.sol, "Periphery" Base) + étiquette "PancakeSwap: Router v2.0"
+  vérifiée sur BaseScan (contrat à 265k+ tx).
 
 Ne JAMAIS ajouter une adresse ici sans la vérifier via au moins deux sources
 indépendantes (cf. pratique établie dans app/trading/arbitrage.py pour les
@@ -29,12 +29,13 @@ CHAIN_ID = 8453  # Base mainnet
 # DEX dont l'exécution réelle est implémentée. Les autres DEX whitelistés pour
 # la DÉTECTION (voir config.yaml trading.dex_whitelist) peuvent rester dans la
 # comparaison de prix sans jamais être utilisés comme buy_dex/sell_dex réel.
-EXECUTABLE_DEXES = frozenset({"uniswap", "aerodrome", "sushiswap"})
+EXECUTABLE_DEXES = frozenset({"uniswap", "aerodrome", "sushiswap", "pancakeswap"})
 
 ROUTER_ADDRESSES: dict[str, str] = {
     "uniswap": "0x2626664c2603336E57B271c5C0b26F421741e481",     # SwapRouter02
     "aerodrome": "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43",    # Router.sol
     "sushiswap": "0x6BDED42c6DA8FBf0d2bA55B2fa120C5e0c8D7891",    # UniswapV2Router02-style
+    "pancakeswap": "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb",  # PancakeRouter.sol v2 (UniswapV2Router02-style)
 }
 
 UNISWAP_V3_FACTORY_ADDRESS = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"

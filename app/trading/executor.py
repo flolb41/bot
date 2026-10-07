@@ -23,10 +23,11 @@ tout reste en mode simulation (voir `app/trading/arbitrage.py`).
 ─────────────────────────────────────────────────────────────────────────────
 PÉRIMÈTRE VOLONTAIREMENT RESTREINT (choix de sécurité explicites)
 ─────────────────────────────────────────────────────────────────────────────
-- DEX exécutables : uniquement uniswap, aerodrome, sushiswap (voir
-  `app.trading.routers.EXECUTABLE_DEXES`). PancakeSwap reste détecté/comparé
-  mais jamais exécuté (son "Smart Router" a un encodage multi-route trop
-  complexe pour être codé en dur sans risque excessif à ce stade).
+- DEX exécutables : uniquement uniswap, aerodrome, sushiswap, pancakeswap
+  (voir `app.trading.routers.EXECUTABLE_DEXES`). PancakeSwap utilise ici
+  uniquement son Router v2 classique (`swapExactTokensForTokens`, vérifié sur
+  deux sources indépendantes — voir `app/trading/routers.py`) ; son "Smart
+  Router"/Universal Router (encodage multi-route) n'est jamais utilisé.
 - Quote token exécutable : uniquement USDC (`EXECUTABLE_QUOTE_TOKENS`). Un
   round-trip part et termine en USDC — jamais dans un token volatile — pour
   ne jamais finir avec un "reste" de valeur imprévisible si la 2e jambe échoue.
@@ -137,11 +138,14 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
             amount_in, min_amount_out, routes, recipient_cs, deadline,
         )
 
-    # sushiswap
-    path = [token_in_cs, token_out_cs]
-    return router_address, UNISWAP_V2_ROUTER_ABI, "swapExactTokensForTokens", (
-        amount_in, min_amount_out, path, recipient_cs, deadline,
-    )
+    # sushiswap / pancakeswap : ABI UniswapV2Router02 standard, chemin direct token_in->token_out.
+    if dex in ("sushiswap", "pancakeswap"):
+        path = [token_in_cs, token_out_cs]
+        return router_address, UNISWAP_V2_ROUTER_ABI, "swapExactTokensForTokens", (
+            amount_in, min_amount_out, path, recipient_cs, deadline,
+        )
+
+    raise TradingRefused(f"Exécution non implémentée pour le DEX '{dex}' (voir EXECUTABLE_DEXES).")
 
 
 def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, dex: str) -> float | None:
@@ -273,10 +277,29 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
             return result
 
         # --- Solde réel de token_address reçu (robuste au slippage réel) ---
+        # Quelques tentatives avec backoff : certains endpoints RPC publics sont
+        # répartis sur plusieurs nœuds qui ne sont pas rigoureusement synchronisés
+        # entre eux — lire le solde immédiatement après le receipt de la jambe
+        # d'achat peut retomber sur un nœud légèrement en retard et renvoyer un
+        # faux zéro, alors que la transaction a bien transféré les tokens (vu
+        # a posteriori via les logs Transfer). Sans cette tolérance, le bot
+        # annule la jambe de vente à tort et laisse le wallet exposé au token
+        # acheté au lieu de boucler proprement en USDC.
         token_contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
-        token_balance_units = int(token_contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call())
+        token_balance_units = 0
+        for attempt in range(4):
+            token_balance_units = int(
+                token_contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
+            )
+            if token_balance_units > 0:
+                break
+            if attempt < 3:
+                time.sleep(3)
         if token_balance_units <= 0:
-            result["error"] = "Jambe achat confirmée mais solde du token reçu est nul — anomalie."
+            result["error"] = (
+                "Jambe achat confirmée on-chain mais solde du token reçu toujours nul après "
+                "plusieurs tentatives — anomalie."
+            )
             db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
                                                execution_error=result["error"])
             return result
