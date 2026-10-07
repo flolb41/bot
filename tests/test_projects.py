@@ -1,8 +1,8 @@
 from app.projects import PROJECT_REGISTRY, all_projects, get_project
 
 
-def test_registry_has_ten_projects():
-    assert len(PROJECT_REGISTRY) == 10
+def test_registry_has_eleven_projects():
+    assert len(PROJECT_REGISTRY) == 11
 
 
 def test_all_project_ids_are_unique():

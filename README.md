@@ -44,10 +44,14 @@ config/config.yaml      # configuration (intervalles, seuils de risque, réparti
 scripts/                # déploiement RPi3, systemd, watchdog, sauvegarde SQLite
 ```
 
-## Les 10 projets suivis en priorité
+## Les 10 projets suivis en priorité + 1 bonus
 
 Push Chain, Canopy, Analog, Kryvora Network, vibe/vibe, Polyester, Flop (FLOPAI),
-Orbinum, Asentum, IRIS Credit (ordre de priorité défini par `TODO.md` section 1).
+Orbinum, Asentum, IRIS Credit (ordre de priorité défini par `TODO.md` section 1),
+plus **Binance Learn & Earn** (section 2 du TODO) ajouté en tant que simple
+surveillance du site public — aucune clé API Binance n'est utilisée, aucun compte
+n'est connecté : le bot se contente de détecter un changement sur la page des
+campagnes et de rappeler de faire les quiz/cours manuellement.
 
 > ⚠️ Les URLs officielles de chaque projet ont été renseignées à partir de recherches
 > web et **ne sont pas garanties à 100 %** (certains projets, comme `vibe/vibe` ou

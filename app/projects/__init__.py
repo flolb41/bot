@@ -4,6 +4,7 @@ from __future__ import annotations
 from app.projects.analog import AnalogProject
 from app.projects.asentum import AsentumProject
 from app.projects.base import BaseProject, ScanResult
+from app.projects.binance_learn import BinanceLearnProject
 from app.projects.canopy import CanopyProject
 from app.projects.flop import FlopProject
 from app.projects.iris_credit import IrisCreditProject
@@ -25,6 +26,7 @@ PROJECT_REGISTRY: list[type[BaseProject]] = [
     OrbinumProject,    # H
     AsentumProject,    # I
     IrisCreditProject,  # J
+    BinanceLearnProject,  # K - section 2 du TODO, surveillance site uniquement
 ]
 
 
