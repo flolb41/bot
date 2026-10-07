@@ -11,6 +11,7 @@ from app.killswitch import is_stopped
 from app.scoring import score_from_project_row
 from app.trackers.deadlines import upcoming_deadlines
 from app.trackers.rewards import rewards_summary
+from app.wallet.balances import get_all_balances
 
 _EMOJI_BY_CLASS = {
     "PRIORITÉ CRITIQUE": "🔴",
@@ -98,6 +99,14 @@ def build_dashboard_html(db: Database) -> str:
             f"<td>{escape(str(d['name']))}</td><td>{escape(str(d['deadline']))}</td></tr>"
         )
 
+    wallet_rows = []
+    for w in get_all_balances(db.list_wallets()):
+        balance_display = f"{w['balance']:.6f}" if w.get("error") is None else f"⚠️ {escape(w['error'])}"
+        wallet_rows.append(
+            f"<tr><td>{escape(w['name'])}</td><td>{escape(w['network'])}</td>"
+            f"<td><code>{escape(w['address'])}</code></td><td>{balance_display}</td></tr>"
+        )
+
     killswitch_banner = (
         "<div class='banner stop'>🛑 Killswitch actif : scans et notifications automatiques coupés.</div>"
         if stopped else ""
@@ -143,6 +152,7 @@ def build_dashboard_html(db: Database) -> str:
   .notif-item.level-alert {{ border-left:3px solid #c53030; }}
   .notif-item.level-warning {{ border-left:3px solid #b7791f; }}
   .notif-item.level-info {{ border-left:3px solid #2563eb; }}
+  code {{ font-size:12px; background:#0f1115; padding:2px 6px; border-radius:4px; }}
 </style>
 </head>
 <body>
@@ -186,9 +196,17 @@ def build_dashboard_html(db: Database) -> str:
 </section>
 
 <section>
+  <h2>Wallets (lecture seule)</h2>
+  <table>
+    <tr><th>Nom</th><th>Réseau</th><th>Adresse</th><th>Balance native</th></tr>
+    {''.join(wallet_rows) if wallet_rows else "<tr><td class='empty' colspan='4'>Aucun wallet configuré (renseigne WALLET_FARM_EVM_ADDRESS dans le .env).</td></tr>"}
+  </table>
+</section>
+
+<section>
   <p class="subtitle">API JSON disponible : <a href="/api/projects">/api/projects</a> ·
-  <a href="/api/rewards">/api/rewards</a> · <a href="/api/status">/api/status</a> ·
-  <a href="/api/notifications">/api/notifications</a></p>
+  <a href="/api/rewards">/api/rewards</a> · <a href="/api/wallets">/api/wallets</a> ·
+  <a href="/api/status">/api/status</a> · <a href="/api/notifications">/api/notifications</a></p>
 </section>
 <script>
   // Panneau de notifications web (alternative à Telegram) : poll léger toutes les 15s,
@@ -272,6 +290,10 @@ def create_app(db: Database) -> FastAPI:
     @app.get("/api/rewards")
     def api_rewards() -> JSONResponse:
         return JSONResponse(rewards_summary(db))
+
+    @app.get("/api/wallets")
+    def api_wallets() -> JSONResponse:
+        return JSONResponse(get_all_balances(db.list_wallets()))
 
     @app.get("/api/status")
     def api_status() -> JSONResponse:
