@@ -73,7 +73,8 @@ def run_scan_once(db: Database, telegram=None) -> list[dict]:
             if telegram:
                 telegram.send(
                     f"🔔 Changement détecté sur <b>{project.name}</b>. "
-                    f"Vérifie la source officielle : {project.official_url}"
+                    f"Vérifie la source officielle : {project.official_url}",
+                    level="alert", project_id=project.id,
                 )
         if not result.reachable and result.error:
             logger.warning("Projet %s injoignable: %s", project.id, result.error)
@@ -88,7 +89,7 @@ def run_deadline_check(db: Database, telegram=None) -> None:
     items = upcoming_deadlines(db)
     if items and telegram:
         lines = [f"⏰ {i['name']} — {i['deadline']}" for i in items]
-        telegram.send("📅 <b>Échéances à surveiller (48h)</b>\n" + "\n".join(lines))
+        telegram.send("📅 <b>Échéances à surveiller (48h)</b>\n" + "\n".join(lines), level="warning")
 
 
 def run_daily_digest(db: Database, telegram=None) -> None:

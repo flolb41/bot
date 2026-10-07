@@ -97,9 +97,21 @@ CREATE TABLE IF NOT EXISTS system_state (
     value TEXT
 );
 
+-- Journal des notifications (alternative/complément à Telegram), consulté par le dashboard web.
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    level TEXT DEFAULT 'info',
+    title TEXT NOT NULL,
+    message TEXT,
+    project_id TEXT,
+    is_read INTEGER DEFAULT 0,
+    created_at REAL DEFAULT (strftime('%s','now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_rewards_project ON rewards(project_id);
 CREATE INDEX IF NOT EXISTS idx_points_history_project ON points_history(project_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC);
 """
 
 
@@ -270,3 +282,25 @@ class Database:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+    # --- notifications (alternative/complément web au Telegram) --------
+    def add_notification(self, title: str, message: str = "", level: str = "info",
+                          project_id: str | None = None) -> int:
+        return self.execute(
+            "INSERT INTO notifications (title, message, level, project_id) VALUES (?, ?, ?, ?)",
+            (title, message, level, project_id),
+        )
+
+    def list_notifications(self, limit: int = 50, unread_only: bool = False) -> list[dict[str, Any]]:
+        query = "SELECT * FROM notifications"
+        if unread_only:
+            query += " WHERE is_read = 0"
+        query += " ORDER BY created_at DESC LIMIT ?"
+        return self.fetch_all(query, (limit,))
+
+    def count_unread_notifications(self) -> int:
+        row = self.fetch_one("SELECT COUNT(*) AS n FROM notifications WHERE is_read = 0")
+        return row["n"] if row else 0
+
+    def mark_notifications_read(self) -> None:
+        self.execute("UPDATE notifications SET is_read = 1 WHERE is_read = 0")

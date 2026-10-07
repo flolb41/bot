@@ -61,14 +61,16 @@ def _status_badge(status: str) -> str:
 def build_dashboard_html(db: Database) -> str:
     """Page HTML du dashboard : tableau des projets, tâches, deadlines et rewards.
 
-    Auto-refresh toutes les 60s (meta refresh, pas de JS requis) pour rester
-    léger sur un Raspberry Pi 3.
+    Auto-refresh toutes les 60s (meta refresh, pas de JS requis pour les données
+    principales) + un panneau de notifications alimenté par un fetch JS léger
+    toutes les 15s (alternative à Telegram, cf. /api/notifications).
     """
     projects = sorted(db.list_projects(), key=lambda p: p["score"], reverse=True)
     summary = rewards_summary(db)
     deadlines = upcoming_deadlines(db)
     pending_tasks = db.list_tasks(status="pending")
     stopped = is_stopped(db)
+    unread_notifications = db.count_unread_notifications()
 
     rows = []
     for p in projects:
@@ -125,11 +127,39 @@ def build_dashboard_html(db: Database) -> str:
   .banner {{ padding:10px 16px; border-radius:8px; margin-bottom:16px; font-weight:600; }}
   .banner.stop {{ background:#7f1d1d; color:#fecaca; }}
   .empty {{ color:#64748b; font-size:13px; padding:12px; }}
+  .topbar {{ display:flex; justify-content:space-between; align-items:flex-start; }}
+  .bell {{ position:relative; background:#1a1d24; border:none; color:#e2e8f0; border-radius:8px;
+           padding:10px 14px; font-size:18px; cursor:pointer; }}
+  .bell .dot {{ position:absolute; top:4px; right:4px; background:#c53030; color:#fff; border-radius:999px;
+                font-size:10px; font-weight:700; padding:1px 5px; display:none; }}
+  .bell.unread .dot {{ display:inline-block; }}
+  .notif-panel {{ display:none; position:absolute; right:24px; top:70px; width:360px; max-height:420px;
+                  overflow-y:auto; background:#1a1d24; border:1px solid #2d323d; border-radius:10px;
+                  padding:8px; z-index:10; box-shadow:0 8px 24px rgba(0,0,0,.4); }}
+  .notif-panel.open {{ display:block; }}
+  .notif-item {{ padding:8px 10px; border-bottom:1px solid #2d323d; font-size:13px; }}
+  .notif-item:last-child {{ border-bottom:none; }}
+  .notif-item .meta {{ color:#64748b; font-size:11px; margin-top:2px; }}
+  .notif-item.level-alert {{ border-left:3px solid #c53030; }}
+  .notif-item.level-warning {{ border-left:3px solid #b7791f; }}
+  .notif-item.level-info {{ border-left:3px solid #2563eb; }}
 </style>
 </head>
 <body>
-<h1>🏹 Crypto Reward Hunter</h1>
-<div class="subtitle">Actualisation automatique toutes les 60s · 0€ de capital · lecture seule</div>
+<div class="topbar">
+  <div>
+    <h1>🏹 Crypto Reward Hunter</h1>
+    <div class="subtitle">Actualisation automatique toutes les 60s · 0€ de capital · lecture seule</div>
+  </div>
+  <div style="position:relative">
+    <button class="bell{' unread' if unread_notifications else ''}" id="notif-bell" onclick="toggleNotifPanel()">
+      🔔<span class="dot" id="notif-count">{unread_notifications}</span>
+    </button>
+    <div class="notif-panel" id="notif-panel">
+      <div id="notif-list" class="empty">Chargement…</div>
+    </div>
+  </div>
+</div>
 {killswitch_banner}
 <div class="cards">
   <div class="card"><div class="label">Capital investi</div><div class="value">0.00 €</div></div>
@@ -157,8 +187,68 @@ def build_dashboard_html(db: Database) -> str:
 
 <section>
   <p class="subtitle">API JSON disponible : <a href="/api/projects">/api/projects</a> ·
-  <a href="/api/rewards">/api/rewards</a> · <a href="/api/status">/api/status</a></p>
+  <a href="/api/rewards">/api/rewards</a> · <a href="/api/status">/api/status</a> ·
+  <a href="/api/notifications">/api/notifications</a></p>
 </section>
+<script>
+  // Panneau de notifications web (alternative à Telegram) : poll léger toutes les 15s,
+  // sans dépendance externe, compatible avec un accès LAN simple (http://, pas besoin de HTTPS).
+  function toggleNotifPanel() {{
+    var panel = document.getElementById('notif-panel');
+    var opening = !panel.classList.contains('open');
+    panel.classList.toggle('open');
+    if (opening) {{
+      loadNotifications();
+      fetch('/api/notifications/mark_read', {{ method: 'POST' }})
+        .then(function () {{ updateBell(0); }})
+        .catch(function () {{}});
+    }}
+  }}
+
+  function updateBell(unreadCount) {{
+    var bell = document.getElementById('notif-bell');
+    var count = document.getElementById('notif-count');
+    count.textContent = unreadCount;
+    bell.classList.toggle('unread', unreadCount > 0);
+  }}
+
+  function escapeHtml(str) {{
+    var div = document.createElement('div');
+    div.textContent = str || '';
+    return div.innerHTML;
+  }}
+
+  function loadNotifications() {{
+    fetch('/api/notifications?limit=30')
+      .then(function (r) {{ return r.json(); }})
+      .then(function (data) {{
+        var list = document.getElementById('notif-list');
+        if (!data.items || data.items.length === 0) {{
+          list.className = 'empty';
+          list.textContent = 'Aucune notification pour le moment.';
+          return;
+        }}
+        list.className = '';
+        list.innerHTML = data.items.map(function (n) {{
+          var date = new Date(n.created_at * 1000).toLocaleString('fr-FR');
+          return '<div class="notif-item level-' + escapeHtml(n.level) + '">'
+            + '<div>' + escapeHtml(n.title) + '</div>'
+            + '<div class="meta">' + date + '</div>'
+            + '</div>';
+        }}).join('');
+      }})
+      .catch(function () {{}});
+  }}
+
+  function pollUnreadCount() {{
+    fetch('/api/notifications?limit=1')
+      .then(function (r) {{ return r.json(); }})
+      .then(function (data) {{ updateBell(data.unread_count || 0); }})
+      .catch(function () {{}});
+  }}
+
+  setInterval(pollUnreadCount, 15000);
+</script>
 </body>
 </html>"""
 
@@ -190,5 +280,17 @@ def create_app(db: Database) -> FastAPI:
             "nb_projects": len(db.list_projects()),
             "nb_tasks_pending": len(db.list_tasks(status="pending")),
         })
+
+    @app.get("/api/notifications")
+    def api_notifications(limit: int = 50, unread_only: bool = False) -> JSONResponse:
+        return JSONResponse({
+            "unread_count": db.count_unread_notifications(),
+            "items": db.list_notifications(limit=limit, unread_only=unread_only),
+        })
+
+    @app.post("/api/notifications/mark_read")
+    def api_notifications_mark_read() -> JSONResponse:
+        db.mark_notifications_read()
+        return JSONResponse({"ok": True})
 
     return app

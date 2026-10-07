@@ -3,10 +3,15 @@
 Utilise l'API HTTP Telegram directement (pas de dépendance lourde), adapté
 aux ressources limitées du Raspberry Pi 3. Toutes les commandes sont en
 LECTURE SEULE sauf /stop et /start qui pilotent le killswitch global.
+
+Chaque message envoyé via `send()` est aussi journalisé en base (table
+`notifications`), consultable depuis le dashboard web — ainsi Telegram est
+optionnel : le dashboard affiche les mêmes alertes même sans bot configuré.
 """
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Callable
 
@@ -22,6 +27,14 @@ from app.wallet.balances import get_all_balances
 logger = logging.getLogger("app.telegram")
 
 API_BASE = "https://api.telegram.org/bot{token}"
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _plain_title(text: str, max_len: int = 80) -> str:
+    """Dérive un titre lisible (sans HTML) à partir de la première ligne du message."""
+    first_line = text.strip().split("\n", 1)[0]
+    title = _TAG_RE.sub("", first_line).strip() or "Notification"
+    return title[:max_len]
 
 
 class TelegramBot:
@@ -38,7 +51,16 @@ class TelegramBot:
     def _url(self, method: str) -> str:
         return f"{API_BASE.format(token=self.token)}/{method}"
 
-    def send(self, text: str, chat_id: str | None = None) -> None:
+    def send(self, text: str, chat_id: str | None = None, level: str = "info",
+             project_id: str | None = None) -> None:
+        # Toujours journalisé en base (visible dans le dashboard web), que
+        # Telegram soit configuré ou non.
+        try:
+            self.db.add_notification(title=_plain_title(text), message=text,
+                                      level=level, project_id=project_id)
+        except Exception:
+            logger.exception("Échec de l'enregistrement de la notification en base.")
+
         if not self.enabled:
             logger.debug("Telegram désactivé (token/chat_id manquant) - message non envoyé: %s", text[:80])
             return
