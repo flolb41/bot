@@ -51,6 +51,29 @@ def build_dashboard_text(db: Database) -> str:
     return "\n".join(lines)
 
 
+_PASSIVE_TASK_KEYWORDS = (
+    "surveiller",
+    "suivre ",
+    "suivre l'",
+    "vérifier la date",
+    "vérifier les conditions de distribution",
+    "vérifier la future distribution",
+    "vérifier les échéances",
+)
+
+
+def _is_passive_monitoring(title: str) -> bool:
+    """Tâches de simple veille déjà couvertes par le scan auto + les notifications.
+
+    Ces tâches ("surveiller X", "suivre Y") ne demandent aucune action humaine :
+    le bot détecte les changements tout seul et notifie. On les masque par défaut
+    du tableau "actions à faire" pour ne garder que ce qui nécessite réellement
+    un clic/une inscription de ta part.
+    """
+    lowered = title.lower()
+    return any(keyword in lowered for keyword in _PASSIVE_TASK_KEYWORDS)
+
+
 def _status_badge(status: str) -> str:
     colors = {
         "actif": "#1f9d55", "testnet": "#1f9d55", "campagne_claim": "#1f9d55",
@@ -74,6 +97,26 @@ def build_dashboard_html(db: Database) -> str:
     pending_tasks = db.list_tasks(status="pending")
     stopped = is_stopped(db)
     unread_notifications = db.count_unread_notifications()
+
+    project_names = {p["id"]: p["name"] for p in projects}
+    actionable_tasks = [t for t in pending_tasks if not _is_passive_monitoring(t["title"])]
+    passive_tasks = [t for t in pending_tasks if _is_passive_monitoring(t["title"])]
+
+    def _task_row(t: dict) -> str:
+        url = t.get("url") or ""
+        link = f"<a href='{escape(url)}' target='_blank' rel='noopener'>lien</a>" if url else "—"
+        return (
+            "<tr>"
+            f"<td>{escape(project_names.get(t['project_id'], t['project_id']))}</td>"
+            f"<td>{escape(t['title'])}</td>"
+            f"<td>{escape(t.get('difficulty') or '—')}</td>"
+            f"<td>{escape(t.get('reward_type') or '—')}</td>"
+            f"<td>{link}</td>"
+            "</tr>"
+        )
+
+    actionable_task_rows = "".join(_task_row(t) for t in actionable_tasks)
+    passive_task_rows = "".join(_task_row(t) for t in passive_tasks)
 
     rows = []
     for p in projects:
@@ -208,6 +251,25 @@ def build_dashboard_html(db: Database) -> str:
     <tr><th>Score</th><th>Projet</th><th>Réseau</th><th>Statut</th><th>KYC</th><th>Dépôt requis</th><th>Site</th></tr>
     {''.join(rows) if rows else "<tr><td class='empty' colspan='7'>Aucun projet (lance `python main.py seed`).</td></tr>"}
   </table>
+</section>
+
+<section>
+  <h2>Actions concrètes à faire ({len(actionable_tasks)})</h2>
+  <div class="subtitle">Tâches nécessitant une action humaine réelle (inscription, quête, claim…).
+  Les tâches de simple veille sont masquées (voir ci-dessous) : le bot les surveille tout seul.</div>
+  <table>
+    <tr><th>Projet</th><th>Tâche</th><th>Difficulté</th><th>Récompense</th><th>Lien</th></tr>
+    {actionable_task_rows if actionable_task_rows else "<tr><td class='empty' colspan='5'>Aucune action en attente 🎉</td></tr>"}
+  </table>
+  <details style="margin-top:12px">
+    <summary style="cursor:pointer;color:#94a3b8;font-size:13px">
+      Voir aussi les {len(passive_tasks)} tâches de surveillance passive (gérées automatiquement par le bot)
+    </summary>
+    <table style="margin-top:8px">
+      <tr><th>Projet</th><th>Tâche</th><th>Difficulté</th><th>Récompense</th><th>Lien</th></tr>
+      {passive_task_rows if passive_task_rows else "<tr><td class='empty' colspan='5'>Aucune.</td></tr>"}
+    </table>
+  </details>
 </section>
 
 <section>
