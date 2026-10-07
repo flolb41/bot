@@ -106,7 +106,11 @@ def import_wallet_from_private_key(private_key: str,
         )
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    used_passphrase = passphrase or os.environ.get("WALLET_AUTOSIGNER_PASSPHRASE") or generate_random_passphrase()
+    # Bug corrigé : ce fallback doit lire la passphrase du wallet de TRADING
+    # (WALLET_TRADING_PASSPHRASE), jamais celle, sans rapport, de l'autosigner
+    # — réutiliser le secret d'un autre wallet par erreur aurait chiffré ce
+    # keystore avec un mot de passe que l'utilisateur ne connaît pas.
+    used_passphrase = passphrase or os.environ.get("WALLET_TRADING_PASSPHRASE") or generate_random_passphrase()
 
     account = Account.from_key(private_key)
     keystore = Account.encrypt(account.key, used_passphrase)

@@ -238,9 +238,13 @@ def cmd_import_trading_wallet(args: argparse.Namespace) -> None:
       directement sur le Pi (jamais via un script tiers, jamais via l'IA).
     - La clé privée est saisie via `getpass` : elle ne s'affiche jamais à
       l'écran et n'est jamais écrite dans l'historique shell.
+    - La passphrase générée est écrite AUTOMATIQUEMENT dans le `.env` par ce
+      script (évite tout risque de faute de frappe en la recopiant à la main).
     - Après import, le trading réel reste DÉSACTIVÉ par défaut (plusieurs
       garde-fous séparés à activer volontairement, voir message final)."""
     import getpass
+    import os
+    from pathlib import Path
 
     from app.trading.guardrails import DEFAULT_TRADING_KEYSTORE_PATH, LIVE_CONFIRMATION_PHRASE
     from app.wallet.signer import import_wallet_from_private_key
@@ -252,36 +256,59 @@ def cmd_import_trading_wallet(args: argparse.Namespace) -> None:
     print("   assistant distant. Cette commande doit être tapée par TOI, en direct,")
     print("   dans une session SSH que tu contrôles sur le Pi.")
     print()
+    if args.overwrite:
+        print("⚠️  --overwrite : le keystore existant (s'il y en a un) sera REMPLACÉ et sa")
+        print("   passphrase actuelle deviendra définitivement inutilisable.")
+        print()
     private_key = getpass.getpass("Clé privée du wallet (saisie masquée, jamais affichée) : ").strip()
     if not private_key:
         print("Aucune clé saisie — abandon.")
         return
     keystore_path = args.keystore_path or DEFAULT_TRADING_KEYSTORE_PATH
     try:
-        result = import_wallet_from_private_key(private_key, keystore_path=keystore_path)
+        result = import_wallet_from_private_key(private_key, keystore_path=keystore_path, overwrite=args.overwrite)
     finally:
         private_key = None  # noqa: F841 - abandon de la référence au plus vite
     print()
     print("Wallet de trading importé avec succès.")
     print(f"  Adresse publique : {result['address']}")
     print(f"  Keystore chiffré : {result['keystore_path']}")
+
+    env_path = Path(".env")
+    lines_to_write = [f"WALLET_TRADING_KEYSTORE_PATH={result['keystore_path']}"]
     if result["passphrase_was_generated"]:
         print()
         print("  ⚠️  Passphrase générée automatiquement (affichée UNE SEULE FOIS) :")
         print(f"      {result['passphrase']}")
+        lines_to_write.append(f"WALLET_TRADING_PASSPHRASE={result['passphrase']}")
+
+    # Écriture directe dans .env (plutôt que de faire recopier la passphrase à la
+    # main) : élimine le risque de faute de frappe/transcription qui rendrait le
+    # keystore illisible. On ne touche que les clés WALLET_TRADING_*/TRADING_ENABLED
+    # et on retire d'abord les éventuelles anciennes valeurs pour éviter les doublons.
+    existing = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    keys_managed = {"WALLET_TRADING_KEYSTORE_PATH", "WALLET_TRADING_PASSPHRASE"}
+    filtered = [ln for ln in existing if not any(ln.startswith(f"{k}=") for k in keys_managed)]
+    if not any(ln.startswith("TRADING_ENABLED=") for ln in filtered):
+        filtered.append("TRADING_ENABLED=false")
+    filtered.extend(lines_to_write)
+    env_path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+    try:
+        os.chmod(env_path, 0o600)
+    except OSError:
+        pass
+
     print()
-    print("Ajoute ces lignes dans ton .env (sur le Pi, jamais dans Git) :")
-    print(f"      WALLET_TRADING_KEYSTORE_PATH={result['keystore_path']}")
-    if result["passphrase_was_generated"]:
-        print(f"      WALLET_TRADING_PASSPHRASE={result['passphrase']}")
-    print("      TRADING_ENABLED=false")
-    print()
+    print(f"  ✅ .env mis à jour automatiquement ({env_path.resolve()}).")
     print("Le trading réel reste DÉSACTIVÉ tant que TOUTES ces conditions ne sont pas")
     print("réunies volontairement (voir app/trading/guardrails.py) :")
     print("  1. trading.enabled: true dans config/config.yaml")
     print("  2. TRADING_ENABLED=true dans le .env")
     print(f"  3. TRADING_LIVE_CONFIRMED=\"{LIVE_CONFIRMATION_PHRASE}\" dans le .env")
     print("  4. Le killswitch n'est pas actif")
+    print()
+    print("Redémarre le service pour que ces changements soient pris en compte :")
+    print("  sudo systemctl restart crypto-reward-hunter.service")
     print()
     print("Ne transfère sur cette adresse QUE la petite somme que tu es prêt à risquer")
     print("(le capital de test, ex. 5$) — ce n'est pas fait pour stocker ton épargne.")
@@ -359,6 +386,10 @@ def build_parser() -> argparse.ArgumentParser:
              "À exécuter TOI-MÊME en SSH direct sur le Pi, jamais à distance.",
     )
     import_trading_parser.add_argument("--keystore-path", default=None, help="Chemin du keystore chiffré à créer")
+    import_trading_parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Remplace un keystore existant (invalide l'accès via l'ancienne passphrase).",
+    )
     import_trading_parser.set_defaults(func=cmd_import_trading_wallet)
 
     sub.add_parser(
