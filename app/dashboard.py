@@ -1,12 +1,24 @@
-"""Dashboard (section 10 du TODO) : vue texte simple + API JSON en lecture seule."""
+"""Dashboard (section 10 du TODO) : vue texte simple + page HTML + API JSON en lecture seule."""
 from __future__ import annotations
+
+from html import escape
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.database import Database
+from app.killswitch import is_stopped
 from app.scoring import score_from_project_row
+from app.trackers.deadlines import upcoming_deadlines
 from app.trackers.rewards import rewards_summary
+
+_EMOJI_BY_CLASS = {
+    "PRIORITÉ CRITIQUE": "🔴",
+    "PRIORITÉ HAUTE": "🟠",
+    "À SURVEILLER": "🟡",
+    "FAIBLE": "⚪",
+    "IGNORER": "⚫",
+}
 
 
 def build_dashboard_text(db: Database) -> str:
@@ -28,13 +40,127 @@ def build_dashboard_text(db: Database) -> str:
         "│ PRIORITÉS                             │",
         "│                                      │",
     ]
-    emojis = {"PRIORITÉ CRITIQUE": "🔴", "PRIORITÉ HAUTE": "🟠", "À SURVEILLER": "🟡"}
     for p in projects:
         breakdown = score_from_project_row(p)
-        emoji = emojis.get(breakdown.classify().value, "⚪")
+        emoji = _EMOJI_BY_CLASS.get(breakdown.classify().value, "⚪")
         lines.append(f"│ {emoji} {p['name']:<17} {p['score']:>3}/100           │")
     lines.append("└──────────────────────────────────────┘")
     return "\n".join(lines)
+
+
+def _status_badge(status: str) -> str:
+    colors = {
+        "actif": "#1f9d55", "testnet": "#1f9d55", "campagne_claim": "#1f9d55",
+        "a_preparer": "#b7791f", "en_attente": "#b7791f",
+        "ferme": "#a0a0a0", "suspect": "#c53030",
+    }
+    color = colors.get(status, "#718096")
+    return f"<span class='badge' style='background:{color}'>{escape(status or '—')}</span>"
+
+
+def build_dashboard_html(db: Database) -> str:
+    """Page HTML du dashboard : tableau des projets, tâches, deadlines et rewards.
+
+    Auto-refresh toutes les 60s (meta refresh, pas de JS requis) pour rester
+    léger sur un Raspberry Pi 3.
+    """
+    projects = sorted(db.list_projects(), key=lambda p: p["score"], reverse=True)
+    summary = rewards_summary(db)
+    deadlines = upcoming_deadlines(db)
+    pending_tasks = db.list_tasks(status="pending")
+    stopped = is_stopped(db)
+
+    rows = []
+    for p in projects:
+        breakdown = score_from_project_row(p)
+        emoji = _EMOJI_BY_CLASS.get(breakdown.classify().value, "⚪")
+        official_url = escape(p.get("official_url") or "")
+        link = f"<a href='{official_url}' target='_blank' rel='noopener'>lien</a>" if official_url else "—"
+        rows.append(
+            "<tr>"
+            f"<td>{emoji} {p['score']}/100</td>"
+            f"<td>{escape(p['name'])}</td>"
+            f"<td>{escape(p.get('network') or '—')}</td>"
+            f"<td>{_status_badge(p.get('status'))}</td>"
+            f"<td>{'⚠️ oui' if p.get('requires_kyc') else 'non'}</td>"
+            f"<td>{'⚠️ oui' if p.get('requires_capital') else 'non'}</td>"
+            f"<td>{link}</td>"
+            "</tr>"
+        )
+
+    deadline_rows = []
+    for d in deadlines:
+        flag = "🔴 dépassée" if d["expired"] else "🟠 proche"
+        deadline_rows.append(
+            f"<tr><td>{flag}</td><td>{escape(d['scope'])}</td>"
+            f"<td>{escape(str(d['name']))}</td><td>{escape(str(d['deadline']))}</td></tr>"
+        )
+
+    killswitch_banner = (
+        "<div class='banner stop'>🛑 Killswitch actif : scans et notifications automatiques coupés.</div>"
+        if stopped else ""
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="60">
+<title>Crypto Reward Hunter</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; background:#0f1115; color:#e2e8f0; margin:0; padding:24px; }}
+  h1 {{ font-size:22px; margin-bottom:4px; }}
+  .subtitle {{ color:#94a3b8; margin-bottom:20px; font-size:13px; }}
+  .cards {{ display:flex; gap:16px; flex-wrap:wrap; margin-bottom:24px; }}
+  .card {{ background:#1a1d24; border-radius:10px; padding:14px 18px; min-width:160px; }}
+  .card .label {{ color:#94a3b8; font-size:12px; text-transform:uppercase; }}
+  .card .value {{ font-size:22px; font-weight:600; margin-top:4px; }}
+  table {{ width:100%; border-collapse:collapse; background:#1a1d24; border-radius:10px; overflow:hidden; }}
+  th, td {{ padding:8px 12px; text-align:left; font-size:13px; border-bottom:1px solid #2d323d; }}
+  th {{ color:#94a3b8; font-weight:600; text-transform:uppercase; font-size:11px; }}
+  tr:last-child td {{ border-bottom:none; }}
+  .badge {{ padding:2px 8px; border-radius:999px; font-size:11px; color:#fff; }}
+  a {{ color:#60a5fa; }}
+  section {{ margin-bottom:28px; }}
+  .banner {{ padding:10px 16px; border-radius:8px; margin-bottom:16px; font-weight:600; }}
+  .banner.stop {{ background:#7f1d1d; color:#fecaca; }}
+  .empty {{ color:#64748b; font-size:13px; padding:12px; }}
+</style>
+</head>
+<body>
+<h1>🏹 Crypto Reward Hunter</h1>
+<div class="subtitle">Actualisation automatique toutes les 60s · 0€ de capital · lecture seule</div>
+{killswitch_banner}
+<div class="cards">
+  <div class="card"><div class="label">Capital investi</div><div class="value">0.00 €</div></div>
+  <div class="card"><div class="label">Rewards reçus</div><div class="value">{sum(summary['by_token'].values()):.2f}</div></div>
+  <div class="card"><div class="label">Rewards en attente</div><div class="value">{summary['nb_pending']}</div></div>
+  <div class="card"><div class="label">Gas dépensé</div><div class="value">{summary['total_gas_spent']:.4f}</div></div>
+  <div class="card"><div class="label">Tâches en attente</div><div class="value">{len(pending_tasks)}</div></div>
+</div>
+
+<section>
+  <h2>Projets suivis ({len(projects)})</h2>
+  <table>
+    <tr><th>Score</th><th>Projet</th><th>Réseau</th><th>Statut</th><th>KYC</th><th>Dépôt requis</th><th>Site</th></tr>
+    {''.join(rows) if rows else "<tr><td class='empty' colspan='7'>Aucun projet (lance `python main.py seed`).</td></tr>"}
+  </table>
+</section>
+
+<section>
+  <h2>Échéances à venir (48h)</h2>
+  <table>
+    <tr><th>Urgence</th><th>Type</th><th>Nom</th><th>Deadline</th></tr>
+    {''.join(deadline_rows) if deadline_rows else "<tr><td class='empty' colspan='4'>Aucune échéance proche.</td></tr>"}
+  </table>
+</section>
+
+<section>
+  <p class="subtitle">API JSON disponible : <a href="/api/projects">/api/projects</a> ·
+  <a href="/api/rewards">/api/rewards</a> · <a href="/api/status">/api/status</a></p>
+</section>
+</body>
+</html>"""
 
 
 def create_app(db: Database) -> FastAPI:
@@ -42,6 +168,10 @@ def create_app(db: Database) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
+        return build_dashboard_html(db)
+
+    @app.get("/text", response_class=HTMLResponse)
+    def dashboard_text() -> str:
         text = build_dashboard_text(db)
         return f"<html><body><pre style='font-size:16px'>{text}</pre></body></html>"
 
@@ -55,7 +185,6 @@ def create_app(db: Database) -> FastAPI:
 
     @app.get("/api/status")
     def api_status() -> JSONResponse:
-        from app.killswitch import is_stopped
         return JSONResponse({
             "stopped": is_stopped(db),
             "nb_projects": len(db.list_projects()),
