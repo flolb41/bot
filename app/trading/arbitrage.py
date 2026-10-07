@@ -167,6 +167,25 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
     min_net_profit_usd = float(trading_cfg.get("min_net_profit_usd", 0.50))
     min_net_profit_pct = float(trading_cfg.get("min_net_profit_pct", 0.0))
 
+    # Dimensionnement dynamique optionnel : au lieu d'une taille de trade fixe
+    # (`max_trade_size_usd`), utiliser une fraction du capital RÉEL disponible
+    # (solde USDC on-chain du wallet de trading) si `trade_size_capital_fraction`
+    # est configuré. N'affecte jamais le coût de gas (indépendant de la taille
+    # du trade — voir `fees.estimate_gas_cost_usd`, qui ne prend pas trade_size
+    # en paramètre) : seul le montant tradé change, pas le nombre/coût des
+    # transactions. Retombe sur `max_trade_size_usd` si le trading n'est pas
+    # live ou si la lecture du solde échoue (RPC injoignable, etc.).
+    trade_size_capital_fraction = float(trading_cfg.get("trade_size_capital_fraction", 0) or 0)
+    if trade_size_capital_fraction > 0:
+        try:
+            from app.trading.executor import get_usdc_trading_balance_usd
+            real_balance_usd = get_usdc_trading_balance_usd(config or {})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dimensionnement dynamique : échec lecture solde réel, repli sur max_trade_size_usd : %s", exc)
+            real_balance_usd = None
+        if real_balance_usd is not None and real_balance_usd > 0:
+            max_trade_size_usd = trade_size_capital_fraction * real_balance_usd
+
     groups = _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd)
     if not groups:
         logger.info("Arbitrage scan : aucune pool éligible trouvée (liquidité/DEX whitelist).")

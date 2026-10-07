@@ -99,6 +99,42 @@ def _ensure_allowance(db: Database, w3, *, token_address: str, owner: str, spend
     )
 
 
+def get_usdc_trading_balance_usd(config: dict) -> float | None:
+    """Retourne le solde USDC réel (en $, 1 USDC ≈ 1 $) du wallet de trading, ou
+    `None` si le trading live n'est pas actif ou si la lecture échoue (RPC
+    injoignable, keystore absent, etc.) — jamais d'exception levée, pour que
+    l'appelant (dimensionnement dynamique des trades) retombe proprement sur
+    la taille de trade statique configurée en cas de souci.
+
+    Ne nécessite PAS la clé privée elle-même (lecture seule) : le solde est
+    interrogé via l'adresse publique issue du signer déchiffré, comme pour
+    `recover_open_positions`."""
+    if not is_trading_live(config):
+        return None
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
+        if not w3.is_connected():
+            return None
+
+        from app.trading.guardrails import trading_keystore_path
+        from app.wallet.signer import load_signer
+        signer_account = load_signer(
+            keystore_path=trading_keystore_path(), passphrase=os.environ.get("WALLET_TRADING_PASSPHRASE")
+        )
+        wallet_address = signer_account.address
+        signer_account = None
+
+        usdc_address = next(iter(EXECUTABLE_QUOTE_TOKENS))  # seul token quote exécutable (USDC Base)
+        decimals = _get_decimals(w3, usdc_address)
+        contract = w3.eth.contract(address=Web3.to_checksum_address(usdc_address), abi=ERC20_ABI)
+        balance_units = int(contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call())
+        return balance_units / (10 ** decimals)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("get_usdc_trading_balance_usd: échec lecture solde réel : %s", exc)
+        return None
+
+
 def _find_uniswap_v3_fee_tier(w3, token_in: str, token_out: str) -> int:
     from web3 import Web3
     factory = w3.eth.contract(address=Web3.to_checksum_address(UNISWAP_V3_FACTORY_ADDRESS), abi=UNISWAP_V3_FACTORY_ABI)
