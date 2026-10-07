@@ -380,3 +380,143 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
         logger.exception("Erreur inattendue pendant execute_signal")
         result["error"] = f"Erreur inattendue : {exc}"
         return result
+
+
+# En dessous de ce seuil (valeur estimée en USD), on ne tente pas de revendre :
+# le gas coûterait plus cher que la poussière récupérée.
+_MIN_RECOVERY_VALUE_USD = 0.50
+
+
+def recover_open_positions(db: Database, config: dict) -> list[dict]:
+    """Termine les round-trips restés incomplets (voir `Database.list_open_positions`) :
+    typiquement une jambe d'achat confirmée on-chain mais dont la jambe de vente a été
+    annulée par prudence (écart refermé, anomalie de lecture de solde, etc.), laissant
+    un token non-USDC dans le wallet de trading. Revend ce solde dès qu'un prix
+    utilisable est disponible sur l'un des DEX exécutables — sans exiger l'écart
+    d'origine (il n'y a plus de 2e jambe « rentable » à comparer, juste une position
+    existante à clôturer proprement pour revenir en USDC).
+
+    Ne lève jamais d'exception : chaque position est traitée indépendamment, un échec
+    sur l'une n'empêche pas de traiter les suivantes."""
+    results: list[dict] = []
+    if not is_trading_live(config):
+        return results
+
+    open_positions = db.list_open_positions()
+    if not open_positions:
+        return results
+
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
+        if not w3.is_connected():
+            return results
+
+        from app.trading.guardrails import trading_keystore_path
+        from app.wallet.signer import load_signer
+        signer_account = load_signer(
+            keystore_path=trading_keystore_path(), passphrase=os.environ.get("WALLET_TRADING_PASSPHRASE")
+        )
+        wallet_address = signer_account.address
+        signer_account = None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("recover_open_positions: impossible d'initialiser le signer/RPC : %s", exc)
+        return results
+
+    for position in open_positions:
+        outcome = {"position_id": position["id"], "token_symbol": position["token_symbol"],
+                   "recovered": False, "tx_hash_sell": None, "error": None}
+        try:
+            token_address = position["token_address"]
+            quote_address = position["quote_address"]
+
+            token_contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
+            token_balance_units = int(
+                token_contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
+            )
+            if token_balance_units <= 0:
+                # Rien à récupérer (déjà revendu manuellement, ou poussière consommée) :
+                # on referme la ligne pour ne plus la retenter à chaque cycle.
+                db.mark_arbitrage_signal_executed(
+                    position["id"], tx_hash_buy=position["tx_hash_buy"], tx_hash_sell=None,
+                    execution_error="Position considérée close : solde on-chain nul au moment de la relance.",
+                )
+                continue
+
+            token_decimals = _get_decimals(w3, token_address)
+            quote_decimals = _get_decimals(w3, quote_address)
+
+            # Cherche le meilleur prix de vente disponible parmi les DEX exécutables
+            # (pas forcément le sell_dex d'origine : le marché a pu bouger depuis).
+            best_dex, best_price = None, 0.0
+            for dex in EXECUTABLE_DEXES:
+                price = _refresh_price_usd(position["chain"], token_address, quote_address, dex)
+                if price and price > best_price:
+                    best_dex, best_price = dex, price
+            if best_dex is None:
+                outcome["error"] = "Aucun prix de vente disponible sur les DEX exécutables — nouvelle tentative au prochain cycle."
+                results.append(outcome)
+                continue
+
+            estimated_value_usd = token_balance_units / (10 ** token_decimals) * best_price
+            if estimated_value_usd < _MIN_RECOVERY_VALUE_USD:
+                outcome["error"] = (
+                    f"Solde résiduel trop faible (~{estimated_value_usd:.2f}$) — laissé tel quel "
+                    "(le gas coûterait plus cher que la récupération)."
+                )
+                results.append(outcome)
+                continue
+
+            slip = slippage_pct() / 100.0
+            deadline = int(time.time()) + 180
+            min_quote_out_units = int(
+                token_balance_units / (10 ** token_decimals) * best_price * (1 - slip) * (10 ** quote_decimals)
+            )
+
+            approve_result = _ensure_allowance(
+                db, w3, token_address=token_address, owner=wallet_address,
+                spender=ROUTER_ADDRESSES[best_dex], amount=token_balance_units,
+            )
+            if approve_result["error"]:
+                outcome["error"] = f"Approve échoué : {approve_result['error']}"
+                results.append(outcome)
+                continue
+
+            contract_address, abi, fn_name, args = _build_swap_call(
+                best_dex, w3, token_in=token_address, token_out=quote_address,
+                amount_in=token_balance_units, min_amount_out=min_quote_out_units,
+                recipient=wallet_address, deadline=deadline,
+            )
+            sell_result = send_trading_transaction(
+                db, rpc_url=_resolve_rpc_url(), contract_address=contract_address, abi=abi,
+                function_name=fn_name, args=args, whitelist_target=contract_address,
+                action_label=f"récupération position {position['token_symbol']} sur {best_dex}",
+            )
+            outcome["tx_hash_sell"] = sell_result["tx_hash"]
+            if sell_result["error"]:
+                outcome["error"] = sell_result["error"]
+                results.append(outcome)
+                continue
+
+            db.mark_arbitrage_signal_executed(
+                position["id"], tx_hash_buy=position["tx_hash_buy"], tx_hash_sell=outcome["tx_hash_sell"],
+            )
+            db.add_notification(
+                title="✅ Position résiduelle clôturée",
+                message=(
+                    f"{position['token_symbol']} revendu sur {best_dex} (~{estimated_value_usd:.2f}$) — "
+                    f"tx {outcome['tx_hash_sell']}"
+                ),
+                level="info",
+            )
+            outcome["recovered"] = True
+            results.append(outcome)
+        except TradingRefused as exc:
+            outcome["error"] = f"Refusé par un garde-fou : {exc}"
+            results.append(outcome)
+        except Exception as exc:  # noqa: BLE001 - une position en échec ne doit pas bloquer les autres
+            logger.exception("Erreur inattendue en récupérant une position ouverte")
+            outcome["error"] = f"Erreur inattendue : {exc}"
+            results.append(outcome)
+
+    return results

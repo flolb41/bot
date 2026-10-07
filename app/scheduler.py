@@ -146,17 +146,38 @@ def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = No
     """Scanne les écarts de prix inter-DEX (bot de trading — voir
     app/trading/arbitrage.py). Les signaux rentables (would_execute=True) sont
     toujours notifiés. Si et SEULEMENT SI le trading live est activé (tous les
-    garde-fous de `app.trading.guardrails.is_trading_live` réunis), tente
-    d'exécuter réellement au maximum `_MAX_LIVE_EXECUTIONS_PER_CYCLE` round-trip(s)
-    par cycle via `app.trading.executor.execute_signal` — sinon reste purement
-    informatif, comme avant (aucune transaction envoyée)."""
+    garde-fous de `app.trading.guardrails.is_trading_live` réunis) :
+    1. Tente d'abord de clôturer d'éventuelles positions restées ouvertes d'un
+       cycle précédent (`app.trading.executor.recover_open_positions`) — priorité
+       à la fermeture de l'exposition existante avant d'en ouvrir une nouvelle.
+    2. Tente ensuite d'exécuter réellement au maximum `_MAX_LIVE_EXECUTIONS_PER_CYCLE`
+       nouveau(x) round-trip(s) via `app.trading.executor.execute_signal`.
+    Sinon reste purement informatif, comme avant (aucune transaction envoyée)."""
     if is_stopped(db):
         return []
-    signals = run_arbitrage_scan(db, config)
-    profitable = [s for s in signals if s["would_execute"]]
 
     from app.trading.guardrails import is_trading_live
     live = is_trading_live(config or {})
+
+    if live:
+        from app.trading.executor import recover_open_positions
+        recovery_results = recover_open_positions(db, config or {})
+        if telegram:
+            for r in recovery_results:
+                if r["recovered"]:
+                    telegram.send(
+                        f"✅ <b>Position résiduelle clôturée</b> ({r['token_symbol']}) — tx {r['tx_hash_sell']}",
+                        level="info",
+                    )
+                elif r["error"]:
+                    telegram.send(
+                        f"⚠️ <b>Récupération de position résiduelle en attente</b> "
+                        f"({r['token_symbol']}) : {r['error']}",
+                        level="warning",
+                    )
+
+    signals = run_arbitrage_scan(db, config)
+    profitable = [s for s in signals if s["would_execute"]]
 
     executed_count = 0
     if live:

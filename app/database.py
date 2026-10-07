@@ -451,6 +451,21 @@ class Database:
             (tx_hash_buy, tx_hash_sell, execution_error, signal_id),
         )
 
+    def list_open_positions(self) -> list[dict[str, Any]]:
+        """Round-trips dont la jambe d'achat a été confirmée on-chain (tx_hash_buy
+        renseigné) mais dont la jambe de vente n'a jamais abouti (tx_hash_sell
+        toujours NULL) — un token non-USDC est potentiellement resté dans le
+        wallet de trading. Une ligne par `token_address` (la plus récente),
+        pour que `app.trading.executor.recover_open_positions` sache quel
+        solde on-chain tenter de revendre."""
+        return self.fetch_all(
+            "SELECT * FROM arbitrage_signals WHERE tx_hash_buy IS NOT NULL AND tx_hash_sell IS NULL "
+            "AND id IN ("
+            "  SELECT MAX(id) FROM arbitrage_signals "
+            "  WHERE tx_hash_buy IS NOT NULL AND tx_hash_sell IS NULL GROUP BY token_address"
+            ") ORDER BY detected_at DESC"
+        )
+
     def today_executed_trades_count(self) -> int:
         """Nombre de round-trips d'arbitrage réellement exécutés depuis minuit UTC
         (garde-fou de plafond quotidien, voir app/trading/guardrails.py)."""
