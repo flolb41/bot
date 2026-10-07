@@ -135,11 +135,36 @@ def run_project_discovery(db: Database, telegram=None) -> list[dict]:
     return newly_found
 
 
-# Nombre maximum de round-trips réellement exécutés par cycle de scan (cap
-# conservateur volontairement bas, EN PLUS du cap journalier déjà imposé par
-# `app.trading.guardrails.max_tx_per_day` — jamais tout exécuter d'un coup
-# même si plusieurs signaux rentables apparaissent dans le même cycle).
-_MAX_LIVE_EXECUTIONS_PER_CYCLE = 1
+# Nombre maximum de tentatives d'exécution (round-trip complet uniquement — voir
+# `_PAIR_COOLDOWN_SECONDS`) par appel de job — pas une cible, un garde-fou pour
+# borner le temps total passé dans un seul appel si le marché enchaîne des
+# signaux rentables et gagnants (voir la boucle de re-scan immédiat ci-dessous).
+# Le débit réel vers DEX Screener reste de toute façon plafonné par le throttle
+# 1 appel/1.1s (voir app/trading/dex_sources.py), qu'on boucle ou non.
+_MAX_ATTEMPTS_PER_CYCLE = 10
+
+# Durée (secondes) pendant laquelle une paire (token/quote) dont la dernière
+# tentative s'est soldée par un abandon/échec est exclue des candidats
+# exécutables — évite de retenter en boucle un écart structurellement
+# illusoire (ex: spread qui se referme systématiquement avant la 2e jambe,
+# observé en conditions réelles) à chaque scan ou à chaque itération du re-scan
+# immédiat. Persisté en base (`system_state`) pour survivre à un redémarrage.
+_PAIR_COOLDOWN_SECONDS = 600
+
+
+def _pair_cooldown_key(signal: dict) -> str:
+    return f"arbitrage_cooldown:{signal['chain']}:{signal['token_address']}:{signal['quote_address']}"
+
+
+def _is_pair_in_cooldown(db: Database, signal: dict) -> bool:
+    import time
+    until = db.get_state(_pair_cooldown_key(signal))
+    return bool(until) and time.time() < float(until)
+
+
+def _set_pair_cooldown(db: Database, signal: dict) -> None:
+    import time
+    db.set_state(_pair_cooldown_key(signal), str(time.time() + _PAIR_COOLDOWN_SECONDS))
 
 
 def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = None) -> list[dict]:
@@ -150,64 +175,119 @@ def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = No
     1. Tente d'abord de clôturer d'éventuelles positions restées ouvertes d'un
        cycle précédent (`app.trading.executor.recover_open_positions`) — priorité
        à la fermeture de l'exposition existante avant d'en ouvrir une nouvelle.
-    2. Tente ensuite d'exécuter réellement au maximum `_MAX_LIVE_EXECUTIONS_PER_CYCLE`
-       nouveau(x) round-trip(s) via `app.trading.executor.execute_signal`.
-    Sinon reste purement informatif, comme avant (aucune transaction envoyée)."""
+    2. Exécute la signal rentable la PLUS rentable (net_profit_usd le plus élevé,
+       pas simplement la première détectée) parmi celles dont la paire n'est pas
+       en cooldown, via `app.trading.executor.execute_signal`.
+    3. Si ce round-trip aboutit PLEINEMENT (achat + vente réels), relance
+       immédiatement un nouveau cycle complet (recovery + scan + exécution) SANS
+       attendre le prochain tick du scheduler — jusqu'à ce qu'il n'y ait plus
+       d'opportunité rentable ou que `_MAX_ATTEMPTS_PER_CYCLE` soit atteint.
+       Si le round-trip est abandonné ou échoue, la paire concernée est mise en
+       cooldown (`_PAIR_COOLDOWN_SECONDS`) et la boucle s'arrête pour laisser le
+       prochain tick normal du scheduler reprendre la main (pas de ré-essai
+       immédiat sur un échec, pour éviter de marteler un écart illusoire).
+    Sinon (trading non-live) reste purement informatif, un seul passage, comme avant
+    (aucune transaction envoyée)."""
     if is_stopped(db):
         return []
 
     from app.trading.guardrails import is_trading_live
     live = is_trading_live(config or {})
 
-    if live:
-        from app.trading.executor import recover_open_positions
-        recovery_results = recover_open_positions(db, config or {})
-        if telegram:
-            for r in recovery_results:
-                if r["recovered"]:
-                    telegram.send(
-                        f"✅ <b>Position résiduelle clôturée</b> ({r['token_symbol']}) — tx {r['tx_hash_sell']}",
-                        level="info",
-                    )
-                elif r["error"]:
-                    telegram.send(
-                        f"⚠️ <b>Récupération de position résiduelle en attente</b> "
-                        f"({r['token_symbol']}) : {r['error']}",
-                        level="warning",
-                    )
+    all_signals: list[dict] = []
+    attempts = 0
 
-    signals = run_arbitrage_scan(db, config)
-    profitable = [s for s in signals if s["would_execute"]]
+    while True:
+        if is_stopped(db):
+            break
 
-    executed_count = 0
-    if live:
-        from app.trading.executor import execute_signal
-        for signal in profitable:
-            if executed_count >= _MAX_LIVE_EXECUTIONS_PER_CYCLE:
-                break
-            exec_result = execute_signal(db, config, signal)
-            if exec_result["executed"]:
-                executed_count += 1
-            elif telegram and exec_result["error"]:
-                telegram.send(
-                    f"⚠️ <b>Exécution d'arbitrage refusée/échouée</b> "
-                    f"({signal['token_symbol']}/{signal['quote_symbol']}) : {exec_result['error']}",
-                    level="warning",
-                )
+        if live:
+            from app.trading.executor import recover_open_positions
+            recovery_results = recover_open_positions(db, config or {})
+            if telegram:
+                for r in recovery_results:
+                    if r["recovered"]:
+                        telegram.send(
+                            f"✅ <b>Position résiduelle clôturée</b> ({r['token_symbol']}) — tx {r['tx_hash_sell']}",
+                            level="info",
+                        )
+                    elif r["error"]:
+                        telegram.send(
+                            f"⚠️ <b>Récupération de position résiduelle en attente</b> "
+                            f"({r['token_symbol']}) : {r['error']}",
+                            level="warning",
+                        )
 
-    if profitable and telegram:
-        tag = "LIVE" if live else "SIMULATION"
-        lines = [
-            f"• {s['token_symbol']}/{s['quote_symbol']} : achat {s['buy_dex']} → vente {s['sell_dex']} "
-            f"(spread {s['spread_pct']:.2f}%, net≈{s['net_profit_usd']:.2f}$)"
-            for s in profitable[:5]
-        ]
-        telegram.send(
-            f"📈 <b>{len(profitable)} opportunité(s) d'arbitrage rentable(s) détectée(s) [{tag}]</b>\n"
-            + "\n".join(lines),
-            level="info",
+        signals = run_arbitrage_scan(db, config)
+        all_signals.extend(signals)
+        # Toujours la plus rentable d'abord (net_profit_usd décroissant) — pas
+        # l'ordre de détection, qui dépend juste de l'ordre des seed tokens.
+        profitable = sorted(
+            (s for s in signals if s["would_execute"]),
+            key=lambda s: s["net_profit_usd"] or 0.0,
+            reverse=True,
         )
-    return signals
+
+        if profitable and telegram:
+            tag = "LIVE" if live else "SIMULATION"
+            lines = [
+                f"• {s['token_symbol']}/{s['quote_symbol']} : achat {s['buy_dex']} → vente {s['sell_dex']} "
+                f"(spread {s['spread_pct']:.2f}%, net≈{s['net_profit_usd']:.2f}$)"
+                for s in profitable[:5]
+            ]
+            telegram.send(
+                f"📈 <b>{len(profitable)} opportunité(s) d'arbitrage rentable(s) détectée(s) [{tag}]</b>\n"
+                + "\n".join(lines),
+                level="info",
+            )
+
+        from app.trading.executor import EXECUTABLE_QUOTE_TOKENS
+        executable_candidates = [
+            s for s in profitable
+            if not _is_pair_in_cooldown(db, s)
+            # execute_signal refuse systématiquement tout signal dont le quote
+            # n'est pas USDC (voir app.trading.executor.EXECUTABLE_QUOTE_TOKENS) ;
+            # les exclure ICI évite de "gaspiller" la tentative du cycle (et le
+            # cooldown qui s'ensuit) sur un signal qui ne pourra jamais
+            # s'exécuter, au détriment d'un vrai candidat USDC moins rentable
+            # mais réellement exécutable (bug observé en conditions réelles :
+            # les paires croisées WETH/cbETH affichent souvent le net_profit_usd
+            # le plus élevé mais ne sont jamais exécutables).
+            and s["quote_address"].lower() in EXECUTABLE_QUOTE_TOKENS
+        ]
+
+        if not live or not executable_candidates or attempts >= _MAX_ATTEMPTS_PER_CYCLE:
+            break
+
+        from app.trading.executor import execute_signal
+        best_signal = executable_candidates[0]
+        exec_result = execute_signal(db, config, best_signal)
+        attempts += 1
+        if exec_result["executed"]:
+            # Round-trip pleinement réussi : on boucle tout de suite (recovery
+            # + nouveau scan) sans attendre le prochain tick.
+            continue
+
+        _set_pair_cooldown(db, best_signal)
+        failure_message = (
+            f"Exécution d'arbitrage refusée/échouée ({best_signal['token_symbol']}/"
+            f"{best_signal['quote_symbol']}) : {exec_result['error']} — "
+            f"paire mise en pause {_PAIR_COOLDOWN_SECONDS // 60} min."
+        )
+        # Persisté en base même sans Telegram configuré : sans ça, la raison du
+        # refus n'était visible que dans les logs systemd (perdue dès que le
+        # cycle suivant tourne), rendant le diagnostic impossible après coup.
+        db.add_notification(
+            title="⚠️ Arbitrage refusé/échoué", message=failure_message, level="warning",
+        )
+        if telegram and exec_result["error"]:
+            telegram.send(f"⚠️ <b>{failure_message}</b>", level="warning")
+        # Abandon/échec : pas de re-scan immédiat, on laisse le prochain tick
+        # normal du scheduler reprendre la main (la paire fautive est de toute
+        # façon en cooldown pendant ce temps).
+        break
+
+    return all_signals
 
 
 def build_scheduler(
