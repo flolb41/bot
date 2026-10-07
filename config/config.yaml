@@ -1,130 +1,35 @@
-# Configuration du bot de trading
-# Les valeurs ${VAR} sont substituées depuis les variables d'environnement (.env)
-
-exchange:
-  name: binance # nom ccxt de l'exchange (binance, kraken, bybit, ...)
-  api_key: ${EXCHANGE_API_KEY}
-  api_secret: ${EXCHANGE_API_SECRET}
-  sandbox: true # true = testnet/sandbox de l'exchange (si supporté)
-
-trading:
-  mode: paper # "paper" (simulation) ou "live" (ordres réels)
-  symbols:
-    - "BTC/USDT"
-    - "ETH/USDT"
-    - "SOL/USDT"
-    - "BNB/USDT"
-    - "DOGE/USDT" # demandé ; attention : perdant sur 180j pour les 2 stratégies (-0,9 % / -0,2 %), à surveiller
-  timeframe: "1h" # bougies utilisées pour l'analyse (1h validé par backtest 90j ; 15m perdant à cause des frais)
-  poll_interval_seconds: 60 # fréquence de vérification du marché
-  starting_balance: 1000.0 # solde virtuel de départ en mode paper
-  max_capital: 0 # mode live : plafonne le capital utilisé par le bot (0 = tout le solde disponible)
-  quote_currency: "USDT"
-  allocation_pct: 10 # % du solde disponible investi par trade
-  fee_pct: 0.1 # frais simulés par trade en mode paper (%)
-  max_slippage_pct: 0.5 # live : ordres limite IOC bornés à ±x % du dernier prix (0 = ordres market)
-
-# Stratégies actives EN SIMULTANÉ. Chacune a ses propres positions (clé symbole+stratégie),
-# son risque, son timeframe et ses symboles ; le capital est partagé.
-# Champs optionnels par stratégie : enabled, timeframe, symbols, allocation_pct, risk (surcharges de `risk:`).
-strategies:
-  - name: ema_rsi # suivi de tendance (180j 1h 6 paires : +0,29 % avec trend_ema 200 vs +0,05 % sans)
-    params:
-      ema_fast: 9
-      ema_slow: 21
-      rsi_period: 14
-      rsi_overbought: 70
-      rsi_oversold: 30
-      trend_ema: 200 # n'achète qu'au-dessus de l'EMA 200 : divise les trades et le drawdown par 2
-    allocation_pct: 15 # 25 % double le drawdown (4 %) pour un gain marginal ; 319 trades/180j : payer les frais en BNB triple son rendement
-  - name: bollinger_rsi # retour à la moyenne (180j 1h 6 paires : +0,25 % avec trend_ema 200, win 80 %, DD 0,17 %)
-    params:
-      bb_period: 20
-      bb_std: 2.0
-      rsi_period: 14
-      rsi_oversold_max: 35
-      rsi_overbought: 70
-      exit_at: middle
-      trend_ema: 200 # sans filtre la stratégie est perdante sur 180j (-0,20 %)
-    allocation_pct: 25 # supporte bien 25 % : 180j 7 paires +0,46 %, DD 1,0 %, win 76 %
-    risk:
-      trailing_stop_pct: 0 # le trailing coupe le rebond avant la moyenne : désactivé pour cette stratégie
-      stop_loss_pct: 3.0
-
-# Compatibilité : utilisé seulement si `strategies:` est absent (backtest simple, anciennes configs)
-strategy:
-  name: ema_rsi
-  params:
-    ema_fast: 9
-    ema_slow: 21
-    rsi_period: 14
-    rsi_overbought: 70
-    rsi_oversold: 30
-    trend_ema: 200
-
-risk:
-  max_open_positions: 4 # toutes stratégies confondues (5 paires × 2 stratégies = 10 slots possibles)
-  stop_loss_pct: 2.0
-  take_profit_pct: 4.0
-  trailing_stop_pct: 1.5 # 0 pour désactiver le trailing stop
-  max_daily_loss_pct: 5.0 # arrête l'ouverture de nouveaux trades passé ce seuil
-  # Stops en multiples d'ATR(14) au lieu de % fixes (0 = désactivé). Testé sur 180j : aucun gain, laissé à 0.
-  atr_stop_mult: 0
-  atr_tp_mult: 0
-  atr_trailing_mult: 0
-
-telegram:
-  enabled: false
-  bot_token: ${TELEGRAM_BOT_TOKEN}
-  chat_id: ${TELEGRAM_CHAT_ID}
-
-# Coffre de récompenses : Simple Earn (intérêts), conversion des poussières,
-# auto-compounding des profits. En mode paper, le coffre est simulé avec paper_apr_pct.
-rewards:
-  enabled: true
-  asset: USDC # actif placé dans Simple Earn (défaut : quote_currency). USDT indisponible en Earn pour les comptes UE
-  collect_interval_hours: 6 # fréquence de la collecte périodique
-  profit_skim_pct: 30 # % des profits de trading envoyés au coffre
-  min_idle_to_subscribe: 50 # place le solde libre excédentaire dans Earn au-delà de ce montant
-  keep_free: 500 # solde toujours gardé disponible pour le trading
-  min_trading_balance: 50 # sous ce seuil, rachat automatique depuis le coffre
-  dust_enabled: true # conversion des poussières en BNB (mode live)
-  paper_apr_pct: 5.0 # APR simulé du coffre en mode paper
-
-# Wallets on-chain locaux (BSC), clés privées chiffrées (keystore V3).
-# - BOT   : wallet opérationnel, mot de passe WALLET_PASSWORD (le seul connu du bot)
-# - VAULT : coffre-fort, mot de passe VAULT_PASSWORD (jamais chargé par le bot en marche)
-# Le bot peut déposer sur le VAULT mais jamais en retirer.
-wallet:
-  keystore_path: "data/keystore.json" # wallet BOT
-  vault_keystore_path: "data/keystore_vault.json" # wallet VAULT
-  network: "BSC" # code réseau côté exchange pour les retraits
-  rpc_url: "https://bsc-dataseed.binance.org"
-  chain_id: 56
-  usdt_contract: "0x55d398326f99059fF775485246999027B3197955" # USDT BEP-20
-  usdt_decimals: 18
-  auto_sweep:
-    enabled: false # true = le bot déplace seul l'excédent USDT du BOT vers le VAULT
-    threshold: 200 # déclenche quand le wallet BOT dépasse ce montant USDT
-    keep_on_bot: 50 # USDT conservés sur le wallet BOT après transfert
-
-# Cotation PancakeSwap V2 en lecture seule (RPC public, aucune clé, aucun gas).
-# Sert à mesurer l'écart de prix CEX/DEX, pas à trader.
-dex:
-  enabled: true
-  router: "0x10ED43C718714eb63d5aA57B78B54704E256024E"
-  notional: 100 # montant USDT simulé pour la cotation (intègre le slippage réel)
-  alert_spread_pct: 1.0 # log + Telegram si |écart| dépasse ce %
-  tokens: {} # surcharges/ajouts : SYMBOLE: "0xadresse" (BTC, ETH, BNB, USDT, BUSD prédéfinis)
-
-database:
-  path: "data/trading_bot.db"
-
-# Dashboard web (lecture seule). Protégé par mot de passe si WEB_PASSWORD est défini dans .env.
-web:
-  host: "0.0.0.0" # 0.0.0.0 = accessible depuis le réseau local, 127.0.0.1 = Pi uniquement
-  port: 8080
+# Configuration du Crypto Reward Hunter.
+# Les secrets (token Telegram, etc.) viennent du fichier .env (jamais ici en clair).
 
 logging:
   level: INFO
-  file: "logs/bot.log"
+  file: logs/app.log
+
+database:
+  path: data/reward_hunter.db
+
+telegram:
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+  chat_id: "${TELEGRAM_CHAT_ID}"
+
+scheduler:
+  scan_interval_minutes: 30   # fréquence de scan des pages officielles (Phase 1)
+  deadline_check_hour: 8      # heure UTC de vérification des échéances
+  digest_hour: 9              # heure UTC d'envoi du digest quotidien "opportunité du jour"
+
+dashboard:
+  enabled: true
+  host: 0.0.0.0
+  port: 8000
+
+# Plafond de coût accepté pour qu'une campagne reste considérée "0 € de capital".
+risk:
+  max_acceptable_cost_eur: 0.0
+  max_gas_per_tx_native: 0.01       # limite indicative pour une future phase 4 (non utilisée en phase 1-3)
+  max_amount_per_tx_eur: 0.0        # aucune transaction automatique n'est signée en phase 1-3
+
+# Répartition indicative des rewards reçus (section 11 du TODO) — appliquée manuellement.
+rewards_allocation:
+  keep_percent: 50
+  stablecoin_percent: 25
+  trading_reserve_percent: 25

@@ -1,0 +1,19 @@
+[Unit]
+Description=Crypto Reward Hunter - veille airdrops/testnets/quetes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=florian
+WorkingDirectory=/home/florian/bot
+ExecStart=/home/florian/bot/.venv/bin/python /home/florian/bot/main.py run
+Restart=on-failure
+RestartSec=10
+# Durcissement minimal (lecture seule hors data/logs, pas de nouveaux privilèges).
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/home/florian/bot/data /home/florian/bot/logs
+
+[Install]
+WantedBy=multi-user.target
