@@ -71,10 +71,11 @@ wallets:
     purpose: "Wallet opérationnel pour l'auto-signature (Phase 4) — solde minimal, rewards balayés régulièrement vers le wallet personnel."
 
 # Bot de trading : arbitrage inter-DEX sur Base (demande "microtrades + seuil de
-# rentabilité"). PHASE 1 = SIMULATION UNIQUE : `enabled: false` tant que les
-# résultats réels n'ont pas été revus et qu'une Phase 2 (exécution live) n'a
-# pas été explicitement validée séparément par l'utilisateur. Rien dans cette
-# section n'autorise une transaction réelle : voir app/trading/arbitrage.py.
+# rentabilité"). PHASE 2 = EXÉCUTION LIVE ACTIVÉE (décision explicite de
+# l'utilisateur le 2026-10-07, confirmée après rappel des risques). `enabled: true`
+# ne suffit PAS à lui seul : voir app/trading/guardrails.py::is_trading_live —
+# il faut EN PLUS TRADING_ENABLED=true et TRADING_LIVE_CONFIRMED=<phrase exacte>
+# dans le .env du Pi (jamais ici), et un wallet de trading importé + approvisionné.
 #
 # Capital de test ciblé par l'utilisateur : 5 $ (wallet MetaMask principal,
 # décision explicite malgré le risque signalé). `max_trade_size_usd` et les
@@ -83,7 +84,7 @@ wallets:
 # les frais DEX (~0,6 % aller-retour) + la marge de slippage qui dominent le
 # seuil de rentabilité réel.
 trading:
-  enabled: false
+  enabled: true
   chain: base
   dex_whitelist: [uniswap, aerodrome, sushiswap, pancakeswap]
   # Tokens de départ pour la recherche de paires inter-DEX (adresses Base
