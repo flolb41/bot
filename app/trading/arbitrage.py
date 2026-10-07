@@ -165,6 +165,7 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
     liquidity_safety_fraction = float(trading_cfg.get("liquidity_safety_fraction", 0.02))
     min_spread_pct_to_log = float(trading_cfg.get("min_spread_pct_to_log", 0.10))
     min_net_profit_usd = float(trading_cfg.get("min_net_profit_usd", 0.50))
+    min_net_profit_pct = float(trading_cfg.get("min_net_profit_pct", 0.0))
 
     groups = _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd)
     if not groups:
@@ -201,7 +202,7 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
             )
             would_execute = (
                 profit["net_profit_usd"] is not None
-                and profit["net_profit_usd"] >= min_net_profit_usd
+                and profit["net_profit_usd"] >= max(min_net_profit_usd, trade_size_usd * min_net_profit_pct / 100)
             )
 
             # Symboles indicatifs (le même token peut apparaître avec des libellés

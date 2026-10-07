@@ -75,12 +75,20 @@ wallets:
 # résultats réels n'ont pas été revus et qu'une Phase 2 (exécution live) n'a
 # pas été explicitement validée séparément par l'utilisateur. Rien dans cette
 # section n'autorise une transaction réelle : voir app/trading/arbitrage.py.
+#
+# Capital de test ciblé par l'utilisateur : 5 $ (wallet MetaMask principal,
+# décision explicite malgré le risque signalé). `max_trade_size_usd` et les
+# seuils de rentabilité ci-dessous sont calibrés pour ce montant : à ce stade
+# les frais de gas Base (quelques millièmes de $) sont négligeables, ce sont
+# les frais DEX (~0,6 % aller-retour) + la marge de slippage qui dominent le
+# seuil de rentabilité réel.
 trading:
   enabled: false
   chain: base
   dex_whitelist: [uniswap, aerodrome, sushiswap, pancakeswap]
   # Tokens de départ pour la recherche de paires inter-DEX (adresses Base
-  # vérifiées manuellement — ne jamais ajouter une adresse non vérifiée ici).
+  # vérifiées via DEUX sources indépendantes — DEX Screener + CoinGecko — avant
+  # ajout ici : ne jamais ajouter une adresse non recoupée de cette façon).
   seed_tokens:
     - symbol: WETH
       address: "0x4200000000000000000000000000000000000006"
@@ -88,9 +96,22 @@ trading:
     - symbol: USDC
       address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
       coingecko_id: usd-coin
+    - symbol: AERO
+      address: "0x940181a94A35A4569E4529A3CDfB74e38FD98631"
+      coingecko_id: aerodrome-finance
+    - symbol: cbETH
+      address: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"
+      coingecko_id: coinbase-wrapped-staked-eth
+    - symbol: cbBTC
+      address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
+      coingecko_id: coinbase-wrapped-btc
   min_liquidity_usd: 10000        # ignore les pools trop fines (risque de prix manipulé/non réaliste)
-  max_trade_size_usd: 200         # plafond dur, même en Phase 2 future
+  max_trade_size_usd: 3           # calibré pour un capital de test de 5 $ (garde une marge pour le gas)
   liquidity_safety_fraction: 0.02 # taille de trade ≤ 2% de la plus petite liquidité des deux pools
   min_spread_pct_to_log: 0.10     # écart minimum pour journaliser un signal (réduit le bruit)
-  min_net_profit_usd: 0.50        # profit net minimum (après frais+slippage+gas) pour marquer "would_execute"
+  # Seuil de rentabilité à 5 $ de capital : un seuil fixe en $ n'a plus de sens
+  # (0,50 $ est inatteignable sur un trade de 3 $). "would_execute" exige à la
+  # fois un plancher absolu minimal ET un profit net relatif à la taille du trade.
+  min_net_profit_usd: 0.01
+  min_net_profit_pct: 0.5
 
