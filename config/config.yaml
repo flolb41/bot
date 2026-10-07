@@ -23,7 +23,7 @@ scheduler:
   # (voir app/trading/dex_sources.py) : même à 1 min, on reste ~5 req/min,
   # très en dessous de la limite documentée de 60 req/min. CoinGecko est mis
   # en cache 10 min indépendamment de cette fréquence (pas d'appel supplémentaire).
-  arbitrage_scan_interval_minutes: 1
+  arbitrage_scan_interval_minutes: 3
 
 dashboard:
   enabled: true

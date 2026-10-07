@@ -79,7 +79,8 @@ def _get_decimals(w3, token_address: str) -> int:
     return _DECIMALS_CACHE[key]
 
 
-def _ensure_allowance(db: Database, w3, *, token_address: str, owner: str, spender: str, amount: int) -> dict:
+def _ensure_allowance(db: Database, w3, *, token_address: str, owner: str, spender: str, amount: int,
+                       count_against_daily_limit: bool = True) -> dict:
     """Vérifie l'allowance ERC20 courante ; envoie un `approve` SEULEMENT si
     insuffisante (évite une transaction superflue à chaque round-trip)."""
     from web3 import Web3
@@ -96,6 +97,7 @@ def _ensure_allowance(db: Database, w3, *, token_address: str, owner: str, spend
         args=(Web3.to_checksum_address(spender), amount),
         whitelist_target=spender,
         action_label=f"approve {token_address} -> {spender}",
+        count_against_daily_limit=count_against_daily_limit,
     )
 
 
@@ -512,6 +514,7 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
             approve_result = _ensure_allowance(
                 db, w3, token_address=token_address, owner=wallet_address,
                 spender=ROUTER_ADDRESSES[best_dex], amount=token_balance_units,
+                count_against_daily_limit=False,
             )
             if approve_result["error"]:
                 outcome["error"] = f"Approve échoué : {approve_result['error']}"
@@ -527,6 +530,7 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
                 db, rpc_url=_resolve_rpc_url(), contract_address=contract_address, abi=abi,
                 function_name=fn_name, args=args, whitelist_target=contract_address,
                 action_label=f"récupération position {position['token_symbol']} sur {best_dex}",
+                count_against_daily_limit=False,
             )
             outcome["tx_hash_sell"] = sell_result["tx_hash"]
             if sell_result["error"]:

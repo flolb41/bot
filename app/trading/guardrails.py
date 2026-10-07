@@ -120,6 +120,7 @@ def send_trading_transaction(
     args: tuple,
     whitelist_target: str,
     action_label: str,
+    count_against_daily_limit: bool = True,
 ) -> dict:
     """Simule puis (si tout est vert) signe et diffuse UNE transaction de trading
     (approve OU swap — l'orchestration multi-étapes est gérée par
@@ -133,6 +134,15 @@ def send_trading_transaction(
     n'est jamais lui-même dans la whitelist de routers) tout en garantissant
     qu'aucune transaction, de quelque nature, ne peut jamais bénéficier à une
     adresse hors de la whitelist fixe de `app/trading/routers.py`.
+
+    `count_against_daily_limit=False` exempte CETTE transaction du plafond
+    `TRADING_MAX_TX_PER_DAY` (tous les autres garde-fous — killswitch, gas
+    price, whitelist — restent appliqués sans exception). Réservé aux
+    transactions de CLÔTURE d'une position déjà ouverte (voir
+    `app.trading.executor.recover_open_positions`) : le plafond quotidien vise
+    à limiter la prise de nouveau risque, pas à bloquer le retour à USDC d'une
+    exposition déjà existante — sans cette exemption, un wallet peut rester
+    bloqué en token volatile jusqu'au lendemain une fois le quota atteint.
 
     Retourne toujours un dict `{"sent": bool, "tx_hash": str|None, "error": str|None}`.
     """
@@ -157,7 +167,7 @@ def send_trading_transaction(
     )
     wallet_address = signer_account.address
 
-    if db.today_executed_trades_count() >= max_tx_per_day():
+    if count_against_daily_limit and db.today_executed_trades_count() >= max_tx_per_day():
         raise TradingRefused(f"Limite quotidienne de trades atteinte (TRADING_MAX_TX_PER_DAY={max_tx_per_day()}).")
 
     gas_price_wei = w3.eth.gas_price
