@@ -489,3 +489,15 @@ class Database:
         return row if row else {
             "total": 0, "would_execute_count": 0, "cumulative_net_profit_usd": 0.0, "last_scan_at": None,
         }
+
+    def live_trading_stats(self) -> dict[str, Any]:
+        """Agrégat des round-trips RÉELS (mode='live', tx_hash_buy renseigné) :
+        combien complétés (tx_hash_sell renseigné) vs encore ouverts (position
+        résiduelle en attente de clôture, voir `list_open_positions`)."""
+        row = self.fetch_one(
+            "SELECT COUNT(*) AS total_live, "
+            "SUM(CASE WHEN tx_hash_sell IS NOT NULL THEN 1 ELSE 0 END) AS completed, "
+            "SUM(CASE WHEN tx_hash_sell IS NULL THEN 1 ELSE 0 END) AS open_count "
+            "FROM arbitrage_signals WHERE mode = 'live' AND tx_hash_buy IS NOT NULL"
+        )
+        return row if row else {"total_live": 0, "completed": 0, "open_count": 0}

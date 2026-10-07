@@ -272,6 +272,30 @@ def build_dashboard_html(db: Database) -> str:
 
     arb_stats = db.arbitrage_stats_summary()
     arb_signals = db.list_arbitrage_signals(limit=20)
+
+    try:
+        from app.config import load_config
+        from app.trading.guardrails import is_trading_live
+        trading_live = is_trading_live(load_config())
+    except Exception:  # noqa: BLE001 - le dashboard ne doit jamais planter pour cette info
+        trading_live = False
+
+    if trading_live:
+        live_stats = db.live_trading_stats()
+        mode_label = "LIVE"
+        mode_title = "📈 Bot de trading — arbitrage inter-DEX (LIVE 🔴 argent réel)"
+        mode_subtitle = (
+            "Mode <b>LIVE</b> : les transactions rentables sont réellement envoyées avec le wallet de "
+            f"trading. {arb_stats.get('total', 0)} signal(aux) détecté(s), "
+            f"{live_stats.get('total_live', 0) or 0} round-trip(s) réel(s) tenté(s) "
+            f"({live_stats.get('completed', 0) or 0} clôturé(s), "
+            f"{live_stats.get('open_count', 0) or 0} position(s) en attente de clôture)."
+        )
+    else:
+        mode_label = "SIMULATION"
+        mode_title = "📈 Bot de trading — arbitrage inter-DEX (SIMULATION)"
+        mode_subtitle = None  # calculé plus bas selon la présence de signaux
+
     if arb_signals:
         arb_rows = []
         for s in arb_signals:
@@ -280,32 +304,46 @@ def build_dashboard_html(db: Database) -> str:
                 "<span class='badge' style='background:#15803d'>rentable</span>" if s["would_execute"]
                 else "<span class='badge' style='background:#475569'>non rentable</span>"
             )
+            exec_tag = ""
+            if s.get("mode") == "live" and s.get("tx_hash_buy"):
+                exec_tag = (
+                    " <span class='badge' style='background:#b91c1c'>exécuté réel</span>" if not s.get("tx_hash_sell")
+                    else " <span class='badge' style='background:#166534'>round-trip réel complet</span>"
+                )
             arb_rows.append(
                 f"<tr><td>{escape(s['token_symbol'])}/{escape(s['quote_symbol'])}</td>"
                 f"<td>{escape(s['buy_dex'])} → {escape(s['sell_dex'])}</td>"
                 f"<td>{s['spread_pct']:.2f}%</td><td>{s['trade_size_usd']:.2f} $</td>"
-                f"<td>{net}</td><td>{tag}</td></tr>"
+                f"<td>{net}</td><td>{tag}{exec_tag}</td></tr>"
             )
         cumulative = arb_stats.get("cumulative_net_profit_usd") or 0.0
+        if mode_subtitle is None:
+            mode_subtitle = (
+                "Mode <b>SIMULATION</b> : aucune transaction réelle n'est envoyée. "
+                f"{arb_stats.get('total', 0)} signal(aux) détecté(s), "
+                f"{arb_stats.get('would_execute_count', 0) or 0} jugé(s) rentable(s) après frais+slippage+gas. "
+                f"P&amp;L hypothétique cumulé : {cumulative:.2f} $ (si exécuté à chaque signal rentable)."
+            )
         arbitrage_section = (
             "<section>"
-            "<h2>📈 Bot de trading — arbitrage inter-DEX (SIMULATION)</h2>"
-            "<p class='subtitle'>Mode <b>SIMULATION</b> : aucune transaction réelle n'est envoyée. "
-            f"{arb_stats.get('total', 0)} signal(aux) détecté(s), "
-            f"{arb_stats.get('would_execute_count', 0) or 0} jugé(s) rentable(s) après frais+slippage+gas. "
-            f"P&amp;L hypothétique cumulé : {cumulative:.2f} $ (si exécuté à chaque signal rentable).</p>"
+            f"<h2>{mode_title}</h2>"
+            f"<p class='subtitle'>{mode_subtitle}</p>"
             "<table><tr><th>Paire</th><th>Achat → Vente</th><th>Spread</th><th>Taille</th>"
             "<th>Profit net est.</th><th></th></tr>"
             + "".join(arb_rows) + "</table>"
             "</section>"
         )
     else:
+        if mode_subtitle is None:
+            mode_subtitle = (
+                "Aucun signal détecté pour l'instant (scan en cours toutes les quelques "
+                "minutes). Mode SIMULATION : aucune transaction réelle ne sera jamais envoyée sans validation "
+                "manuelle explicite d'une phase live séparée."
+            )
         arbitrage_section = (
             "<section>"
-            "<h2>📈 Bot de trading — arbitrage inter-DEX (SIMULATION)</h2>"
-            "<p class='subtitle'>Aucun signal détecté pour l'instant (scan en cours toutes les quelques "
-            "minutes). Mode SIMULATION : aucune transaction réelle ne sera jamais envoyée sans validation "
-            "manuelle explicite d'une phase live séparée.</p>"
+            f"<h2>{mode_title}</h2>"
+            f"<p class='subtitle'>{mode_subtitle}</p>"
             "</section>"
         )
 
@@ -356,7 +394,9 @@ def build_dashboard_html(db: Database) -> str:
 <div class="topbar">
   <div>
     <h1>🏹 Crypto Reward Hunter</h1>
-    <div class="subtitle">Actualisation automatique toutes les 60s · 0€ de capital · lecture seule</div>
+    <div class="subtitle">Actualisation automatique toutes les 60s · {
+        '🔴 trading réel actif (wallet dédié)' if trading_live else '0€ de capital · lecture seule'
+    }</div>
   </div>
   <div style="position:relative">
     <button class="bell{' unread' if unread_notifications else ''}" id="notif-bell" onclick="toggleNotifPanel()">
