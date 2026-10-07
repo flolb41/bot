@@ -20,6 +20,8 @@ DEX_FEE_PCT = {
     "aerodrome": 0.30,
     "sushiswap": 0.30,
     "pancakeswap": 0.25,
+    "baseswap": 0.30,     # fork UniswapV2 classique, fee standard 0.3%
+    "alien-base": 0.30,   # fork UniswapV2 classique, fee standard 0.3%
 }
 _DEFAULT_DEX_FEE_PCT = 0.30
 

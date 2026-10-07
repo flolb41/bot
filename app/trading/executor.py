@@ -23,8 +23,8 @@ tout reste en mode simulation (voir `app/trading/arbitrage.py`).
 ─────────────────────────────────────────────────────────────────────────────
 PÉRIMÈTRE VOLONTAIREMENT RESTREINT (choix de sécurité explicites)
 ─────────────────────────────────────────────────────────────────────────────
-- DEX exécutables : uniquement uniswap, aerodrome, sushiswap, pancakeswap
-  (voir `app.trading.routers.EXECUTABLE_DEXES`). PancakeSwap utilise ici
+- DEX exécutables : uniquement uniswap, aerodrome, sushiswap, pancakeswap,
+  baseswap, alien-base (voir `app.trading.routers.EXECUTABLE_DEXES`). PancakeSwap utilise ici
   uniquement son Router v2 classique (`swapExactTokensForTokens`, vérifié sur
   deux sources indépendantes — voir `app/trading/routers.py`) ; son "Smart
   Router"/Universal Router (encodage multi-route) n'est jamais utilisé.
@@ -176,8 +176,9 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
             amount_in, min_amount_out, routes, recipient_cs, deadline,
         )
 
-    # sushiswap / pancakeswap : ABI UniswapV2Router02 standard, chemin direct token_in->token_out.
-    if dex in ("sushiswap", "pancakeswap"):
+    # sushiswap / pancakeswap / baseswap / alien-base : ABI UniswapV2Router02
+    # standard, chemin direct token_in->token_out (tous forks V2 classiques).
+    if dex in ("sushiswap", "pancakeswap", "baseswap", "alien-base"):
         path = [token_in_cs, token_out_cs]
         return router_address, UNISWAP_V2_ROUTER_ABI, "swapExactTokensForTokens", (
             amount_in, min_amount_out, path, recipient_cs, deadline,

@@ -149,7 +149,20 @@ _MAX_ATTEMPTS_PER_CYCLE = 10
 # illusoire (ex: spread qui se referme systématiquement avant la 2e jambe,
 # observé en conditions réelles) à chaque scan ou à chaque itération du re-scan
 # immédiat. Persisté en base (`system_state`) pour survivre à un redémarrage.
+#
+# Deux durées distinctes selon que du capital a RÉELLEMENT été engagé ou non :
+# - un échec de SIMULATION (web3 `.call()` qui revert, ex: "Too little
+#   received") se produit AVANT tout envoi de transaction — aucun gas, aucun
+#   capital déplacé. Un cooldown de 10 min y est disproportionné : observé en
+#   conditions réelles, ça bloquait de vraies opportunités WETH/USDC
+#   rentables pendant 3+ cycles de scan (3 min chacun) pour une "erreur" qui
+#   n'a rien coûté. Cooldown court pour laisser le scan suivant retenter vite.
+# - un échec APRÈS un achat réellement envoyé on-chain (ex: écart refermé
+#   avant la 2e jambe, position laissée ouverte) a un vrai coût (gas +
+#   éventuel slippage de récupération) : on garde le cooldown long pour éviter
+#   de marteler un écart structurellement illusoire.
 _PAIR_COOLDOWN_SECONDS = 600
+_PAIR_COOLDOWN_SECONDS_NO_CAPITAL_RISK = 90
 
 
 def _pair_cooldown_key(signal: dict) -> str:
@@ -162,9 +175,9 @@ def _is_pair_in_cooldown(db: Database, signal: dict) -> bool:
     return bool(until) and time.time() < float(until)
 
 
-def _set_pair_cooldown(db: Database, signal: dict) -> None:
+def _set_pair_cooldown(db: Database, signal: dict, seconds: int = _PAIR_COOLDOWN_SECONDS) -> None:
     import time
-    db.set_state(_pair_cooldown_key(signal), str(time.time() + _PAIR_COOLDOWN_SECONDS))
+    db.set_state(_pair_cooldown_key(signal), str(time.time() + seconds))
 
 
 def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = None) -> list[dict]:
@@ -268,11 +281,17 @@ def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = No
             # + nouveau scan) sans attendre le prochain tick.
             continue
 
-        _set_pair_cooldown(db, best_signal)
+        # Du capital n'a réellement été engagé que si l'achat a été diffusé
+        # on-chain (tx_hash_buy renseigné) ; un refus de simulation (avant tout
+        # envoi) ne coûte rien et mérite un cooldown bien plus court.
+        capital_at_risk = bool(exec_result.get("tx_hash_buy"))
+        cooldown_seconds = _PAIR_COOLDOWN_SECONDS if capital_at_risk else _PAIR_COOLDOWN_SECONDS_NO_CAPITAL_RISK
+        _set_pair_cooldown(db, best_signal, cooldown_seconds)
+        cooldown_label = f"{cooldown_seconds // 60} min" if cooldown_seconds >= 60 else f"{cooldown_seconds}s"
         failure_message = (
             f"Exécution d'arbitrage refusée/échouée ({best_signal['token_symbol']}/"
             f"{best_signal['quote_symbol']}) : {exec_result['error']} — "
-            f"paire mise en pause {_PAIR_COOLDOWN_SECONDS // 60} min."
+            f"paire mise en pause {cooldown_label}."
         )
         # Persisté en base même sans Telegram configuré : sans ça, la raison du
         # refus n'était visible que dans les logs systemd (perdue dès que le

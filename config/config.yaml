@@ -91,7 +91,7 @@ wallets:
 trading:
   enabled: true
   chain: base
-  dex_whitelist: [uniswap, aerodrome, sushiswap, pancakeswap]
+  dex_whitelist: [uniswap, aerodrome, sushiswap, pancakeswap, baseswap, alien-base]
   # Tokens de départ pour la recherche de paires inter-DEX (adresses Base
   # vérifiées via DEUX sources indépendantes — DEX Screener + CoinGecko — avant
   # ajout ici : ne jamais ajouter une adresse non recoupée de cette façon).

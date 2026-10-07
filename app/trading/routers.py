@@ -29,13 +29,21 @@ CHAIN_ID = 8453  # Base mainnet
 # DEX dont l'exécution réelle est implémentée. Les autres DEX whitelistés pour
 # la DÉTECTION (voir config.yaml trading.dex_whitelist) peuvent rester dans la
 # comparaison de prix sans jamais être utilisés comme buy_dex/sell_dex réel.
-EXECUTABLE_DEXES = frozenset({"uniswap", "aerodrome", "sushiswap", "pancakeswap"})
+#
+# baseswap / alien-base : adresses de router vérifiées via DEUX sources
+# indépendantes (étiquette "Verified" BaseScan + recoupement doc/GitHub
+# officiel du projet, cf. historique de session) le 2026-10-07. Tous deux sont
+# des forks classiques Uniswap V2 (`swapExactTokensForTokens`), même ABI que
+# sushiswap/pancakeswap ci-dessous (voir `_build_swap_call` dans executor.py).
+EXECUTABLE_DEXES = frozenset({"uniswap", "aerodrome", "sushiswap", "pancakeswap", "baseswap", "alien-base"})
 
 ROUTER_ADDRESSES: dict[str, str] = {
     "uniswap": "0x2626664c2603336E57B271c5C0b26F421741e481",     # SwapRouter02
     "aerodrome": "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43",    # Router.sol
     "sushiswap": "0x6BDED42c6DA8FBf0d2bA55B2fa120C5e0c8D7891",    # UniswapV2Router02-style
     "pancakeswap": "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb",  # PancakeRouter.sol v2 (UniswapV2Router02-style)
+    "baseswap": "0x327Df1E6de05895d2ab08513aaDD9313Fe505d86",     # BaseSwap Router (UniswapV2Router02-style)
+    "alien-base": "0x8c1A3cF8f83074169FE5D7aD50B978e1cD6b37c7",   # AlienBase Router (UniswapV2Router02-style)
 }
 
 UNISWAP_V3_FACTORY_ADDRESS = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"

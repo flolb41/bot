@@ -29,7 +29,7 @@ _DEFAULT_SEED_TOKENS = [
     {"symbol": "WETH", "address": "0x4200000000000000000000000000000000000006", "coingecko_id": "ethereum"},
     {"symbol": "USDC", "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "coingecko_id": "usd-coin"},
 ]
-_DEFAULT_DEX_WHITELIST = ["uniswap", "aerodrome", "sushiswap", "pancakeswap"]
+_DEFAULT_DEX_WHITELIST = ["uniswap", "aerodrome", "sushiswap", "pancakeswap", "baseswap", "alien-base"]
 
 
 def _normalize_pair(raw: dict, chain_id: str) -> dict | None:
