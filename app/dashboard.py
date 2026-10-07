@@ -214,31 +214,54 @@ def build_dashboard_html(db: Database) -> str:
         )
 
     discovered = db.list_discovered_projects(status="pending_review", limit=30)
-    if discovered:
-        disc_rows = []
-        for d in discovered:
+    auto_approved = db.list_discovered_projects(status="auto_approved", limit=30)
+
+    def _render_discovery_table(rows: list[dict]) -> str:
+        out = []
+        for d in rows:
             hint = _risk_hint_for_display(d["title"], d.get("summary") or "")
             hint_html = f"<br><span style='color:#fbbf24;font-size:11px'>{escape(hint)}</span>" if hint else ""
-            disc_rows.append(
+            out.append(
                 f"<tr><td>{escape(d['source'])}</td>"
                 f"<td><a href='{escape(d['url'])}' target='_blank' rel='noopener'>{escape(d['title'])}</a>{hint_html}</td>"
                 f"<td>{escape(str(d.get('published_at') or '—'))}</td></tr>"
             )
+        return "".join(out)
+
+    approved_block = ""
+    if auto_approved:
+        approved_block = (
+            "<h3 style='margin-top:18px'>✅ Ajoutés automatiquement en surveillance passive</h3>"
+            "<table><tr><th>Source</th><th>Titre</th><th>Publié le</th></tr>"
+            + _render_discovery_table(auto_approved) + "</table>"
+            "<p class='subtitle'>Garde-fous objectifs passés (source pré-filtrée type airdrops.io + "
+            "aucun mot-clé à risque + lien actif) : désormais surveillés comme les projets suivis "
+            "manuellement (changement de contenu détecté), mais <b>non vérifiés manuellement en "
+            "détail</b> — aucune automatisation financière (claim/auto-signature) n'est débloquée "
+            "par cette promotion.</p>"
+        )
+
+    if discovered or auto_approved:
+        pending_block = (
+            "<h3 style='margin-top:18px'>⏳ En attente de validation manuelle</h3>"
+            "<table><tr><th>Source</th><th>Titre</th><th>Publié le</th></tr>"
+            + _render_discovery_table(discovered) + "</table>"
+            if discovered else "<p class='subtitle'>Aucun candidat en attente pour l'instant.</p>"
+        )
         discovery_section = (
             "<section>"
-            "<h2>🔭 Projets découverts — à valider manuellement (lecture seule)</h2>"
-            "<table><tr><th>Source</th><th>Titre</th><th>Publié le</th></tr>"
-            + "".join(disc_rows) + "</table>"
+            "<h2>🔭 Découverte de nouveaux projets (lecture seule)</h2>"
             "<p class='subtitle'>Détection automatique via des flux publics (airdrops.io, r/airdrops). "
-            "Aucun de ces candidats n'est suivi activement ni whitelisté : chacun doit être vérifié "
-            "manuellement (légitimité, arnaque potentielle) avant tout ajout au suivi.</p>"
+            "Seule la surveillance passive peut être automatique ; aucun claim/whitelist n'est jamais "
+            "activé sans revue manuelle d'un contrat.</p>"
+            + approved_block + pending_block +
             "</section>"
         )
     else:
         discovery_section = (
             "<section>"
-            "<h2>🔭 Projets découverts — à valider manuellement (lecture seule)</h2>"
-            "<p class='subtitle'>Aucun candidat en attente pour l'instant.</p>"
+            "<h2>🔭 Découverte de nouveaux projets (lecture seule)</h2>"
+            "<p class='subtitle'>Aucun candidat détecté pour l'instant.</p>"
             "</section>"
         )
 

@@ -326,15 +326,19 @@ class Database:
         return self.fetch_one("SELECT 1 FROM discovered_projects WHERE url = ?", (url,)) is not None
 
     def add_discovered_project(self, source: str, title: str, url: str,
-                                summary: str = "", published_at: str | None = None) -> int | None:
+                                summary: str = "", published_at: str | None = None,
+                                status: str = "pending_review") -> int | None:
         """Insère un candidat détecté. Ne fait rien s'il existe déjà (URL unique).
-        Ne touche jamais `projects` : reste 'pending_review' jusqu'à validation humaine."""
+        `status='auto_approved'` signifie qu'il a passé les garde-fous objectifs
+        de app.discovery.scanner (source fiable + pas de mot-clé à risque + lien
+        actif) — jamais une garantie de légitimité totale, et jamais une
+        autorisation d'automatisation financière (claim/autosign)."""
         if self.discovered_project_exists(url):
             return None
         return self.execute(
-            "INSERT INTO discovered_projects (source, title, url, summary, published_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (source, title, url, summary, published_at),
+            "INSERT INTO discovered_projects (source, title, url, summary, published_at, status) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (source, title, url, summary, published_at, status),
         )
 
     def list_discovered_projects(self, status: str | None = "pending_review",

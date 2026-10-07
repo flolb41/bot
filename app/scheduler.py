@@ -12,6 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.database import Database
+from app.discovery.auto_projects import auto_approved_projects
 from app.discovery.scanner import run_discovery as _run_discovery_scan
 from app.killswitch import is_stopped
 from app.projects import all_projects
@@ -63,7 +64,10 @@ def run_scan_once(db: Database, telegram=None) -> list[dict]:
         return []
 
     changes: list[dict] = []
-    for project in all_projects():
+    # Les projets auto-approuvés par la découverte (surveillance passive
+    # uniquement, voir app/discovery/auto_projects.py) sont scannés exactement
+    # comme les 11 projets curés, via le même BaseProject.scan() générique.
+    for project in all_projects() + auto_approved_projects(db):
         result = project.scan()
         changed = db.update_project_scan_result(project.id, result.content_hash)
         row = db.get_project(project.id) or project.to_project_row()
