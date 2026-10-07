@@ -92,7 +92,15 @@ def cmd_run(args: argparse.Namespace) -> None:
         logger.info("Dashboard démarré sur le port %s.", dashboard_cfg.get("port", 8000))
 
     try:
-        telegram.run_forever()
+        if telegram.enabled:
+            telegram.run_forever()
+        else:
+            # Pas de token Telegram configuré : on garde le process vivant quand
+            # même (scheduler + dashboard tournent dans des threads en arrière-
+            # plan) plutôt que de sortir immédiatement.
+            logger.info("Telegram désactivé (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID "
+                        "manquants) - scheduler et dashboard restent actifs.")
+            threading.Event().wait()
     except KeyboardInterrupt:
         pass
     finally:
