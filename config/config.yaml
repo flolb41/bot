@@ -18,6 +18,7 @@ scheduler:
   digest_hour: 9              # heure UTC d'envoi du digest quotidien "opportunité du jour"
   opportunity_scan_interval_minutes: 120  # fréquence du scan de micro-récompenses (section 16 étendue)
   discovery_scan_interval_minutes: 1440   # fréquence de découverte de nouveaux projets (1x/jour, sources publiques limitées en débit)
+  arbitrage_scan_interval_minutes: 5      # fréquence du scan d'arbitrage inter-DEX (bot de trading, phase simulation)
 
 dashboard:
   enabled: true
@@ -68,3 +69,28 @@ wallets:
     address: "${WALLET_AUTOSIGNER_ADDRESS}"
     network: "${WALLET_AUTOSIGNER_NETWORK}"
     purpose: "Wallet opérationnel pour l'auto-signature (Phase 4) — solde minimal, rewards balayés régulièrement vers le wallet personnel."
+
+# Bot de trading : arbitrage inter-DEX sur Base (demande "microtrades + seuil de
+# rentabilité"). PHASE 1 = SIMULATION UNIQUE : `enabled: false` tant que les
+# résultats réels n'ont pas été revus et qu'une Phase 2 (exécution live) n'a
+# pas été explicitement validée séparément par l'utilisateur. Rien dans cette
+# section n'autorise une transaction réelle : voir app/trading/arbitrage.py.
+trading:
+  enabled: false
+  chain: base
+  dex_whitelist: [uniswap, aerodrome, sushiswap, pancakeswap]
+  # Tokens de départ pour la recherche de paires inter-DEX (adresses Base
+  # vérifiées manuellement — ne jamais ajouter une adresse non vérifiée ici).
+  seed_tokens:
+    - symbol: WETH
+      address: "0x4200000000000000000000000000000000000006"
+      coingecko_id: ethereum
+    - symbol: USDC
+      address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+      coingecko_id: usd-coin
+  min_liquidity_usd: 10000        # ignore les pools trop fines (risque de prix manipulé/non réaliste)
+  max_trade_size_usd: 200         # plafond dur, même en Phase 2 future
+  liquidity_safety_fraction: 0.02 # taille de trade ≤ 2% de la plus petite liquidité des deux pools
+  min_spread_pct_to_log: 0.10     # écart minimum pour journaliser un signal (réduit le bruit)
+  min_net_profit_usd: 0.50        # profit net minimum (après frais+slippage+gas) pour marquer "would_execute"
+

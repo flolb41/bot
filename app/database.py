@@ -128,6 +128,40 @@ CREATE INDEX IF NOT EXISTS idx_rewards_project ON rewards(project_id);
 CREATE INDEX IF NOT EXISTS idx_points_history_project ON points_history(project_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_discovered_status ON discovered_projects(status);
+
+-- Signaux d'arbitrage inter-DEX détectés (bot de trading, phase simulation).
+-- `mode` reste 'simulation' tant que `trading.enabled` est false en config :
+-- aucune transaction réelle n'est jamais envoyée pour ces lignes-là, seul le
+-- profit net est ESTIMÉ pour valider la stratégie avant d'y risquer du capital.
+CREATE TABLE IF NOT EXISTS arbitrage_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    detected_at REAL DEFAULT (strftime('%s','now')),
+    chain TEXT NOT NULL,
+    token_symbol TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    quote_symbol TEXT NOT NULL,
+    quote_address TEXT NOT NULL,
+    buy_dex TEXT NOT NULL,
+    buy_price_usd REAL NOT NULL,
+    buy_liquidity_usd REAL,
+    sell_dex TEXT NOT NULL,
+    sell_price_usd REAL NOT NULL,
+    sell_liquidity_usd REAL,
+    spread_pct REAL NOT NULL,
+    trade_size_usd REAL NOT NULL,
+    gross_profit_usd REAL NOT NULL,
+    fees_usd REAL NOT NULL,
+    slippage_buffer_usd REAL NOT NULL,
+    gas_cost_usd REAL,
+    net_profit_usd REAL,
+    would_execute INTEGER DEFAULT 0,
+    mode TEXT DEFAULT 'simulation',
+    executed INTEGER DEFAULT 0,
+    tx_hash TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_arbitrage_detected ON arbitrage_signals(detected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_arbitrage_would_execute ON arbitrage_signals(would_execute);
 """
 
 
@@ -356,3 +390,46 @@ class Database:
             "UPDATE discovered_projects SET status = ? WHERE id = ?",
             (status, discovered_id),
         )
+
+    # --- bot de trading : signaux d'arbitrage inter-DEX (phase simulation) ---
+    def add_arbitrage_signal(self, signal: dict[str, Any]) -> int:
+        return self.execute(
+            "INSERT INTO arbitrage_signals ("
+            "chain, token_symbol, token_address, quote_symbol, quote_address, "
+            "buy_dex, buy_price_usd, buy_liquidity_usd, sell_dex, sell_price_usd, sell_liquidity_usd, "
+            "spread_pct, trade_size_usd, gross_profit_usd, fees_usd, slippage_buffer_usd, "
+            "gas_cost_usd, net_profit_usd, would_execute, mode, executed, tx_hash"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                signal["chain"], signal["token_symbol"], signal["token_address"],
+                signal["quote_symbol"], signal["quote_address"],
+                signal["buy_dex"], signal["buy_price_usd"], signal.get("buy_liquidity_usd"),
+                signal["sell_dex"], signal["sell_price_usd"], signal.get("sell_liquidity_usd"),
+                signal["spread_pct"], signal["trade_size_usd"], signal["gross_profit_usd"],
+                signal["fees_usd"], signal["slippage_buffer_usd"], signal.get("gas_cost_usd"),
+                signal.get("net_profit_usd"), int(bool(signal.get("would_execute"))),
+                signal.get("mode", "simulation"), int(bool(signal.get("executed"))),
+                signal.get("tx_hash"),
+            ),
+        )
+
+    def list_arbitrage_signals(self, limit: int = 50, only_would_execute: bool = False) -> list[dict[str, Any]]:
+        query = "SELECT * FROM arbitrage_signals"
+        if only_would_execute:
+            query += " WHERE would_execute = 1"
+        query += " ORDER BY detected_at DESC LIMIT ?"
+        return self.fetch_all(query, (limit,))
+
+    def arbitrage_stats_summary(self) -> dict[str, Any]:
+        """Agrégat utile pour le dashboard : nombre de signaux, nombre de signaux
+        jugés rentables (would_execute), P&L cumulé hypothétique (simulation)."""
+        row = self.fetch_one(
+            "SELECT COUNT(*) AS total, "
+            "SUM(would_execute) AS would_execute_count, "
+            "SUM(CASE WHEN would_execute = 1 THEN net_profit_usd ELSE 0 END) AS cumulative_net_profit_usd, "
+            "MAX(detected_at) AS last_scan_at "
+            "FROM arbitrage_signals"
+        )
+        return row if row else {
+            "total": 0, "would_execute_count": 0, "cumulative_net_profit_usd": 0.0, "last_scan_at": None,
+        }

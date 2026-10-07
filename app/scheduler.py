@@ -19,6 +19,7 @@ from app.projects import all_projects
 from app.scoring import score_from_project_row
 from app.trackers.deadlines import upcoming_deadlines
 from app.trackers.opportunities import scan_opportunities
+from app.trading.arbitrage import run_arbitrage_scan
 
 logger = logging.getLogger("app.scheduler")
 
@@ -134,6 +135,30 @@ def run_project_discovery(db: Database, telegram=None) -> list[dict]:
     return newly_found
 
 
+def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = None) -> list[dict]:
+    """Scanne les écarts de prix inter-DEX (bot de trading, phase simulation —
+    voir app/trading/arbitrage.py). Ne notifie que les signaux jugés rentables
+    après coûts (would_execute=True), purement informatif : aucune transaction
+    n'est jamais envoyée tant que la phase live n'a pas été développée et
+    validée séparément."""
+    if is_stopped(db):
+        return []
+    signals = run_arbitrage_scan(db, config)
+    profitable = [s for s in signals if s["would_execute"]]
+    if profitable and telegram:
+        lines = [
+            f"• {s['token_symbol']}/{s['quote_symbol']} : achat {s['buy_dex']} → vente {s['sell_dex']} "
+            f"(spread {s['spread_pct']:.2f}%, net≈{s['net_profit_usd']:.2f}$)"
+            for s in profitable[:5]
+        ]
+        telegram.send(
+            f"📈 <b>{len(profitable)} opportunité(s) d'arbitrage rentable(s) détectée(s) [SIMULATION]</b>\n"
+            + "\n".join(lines),
+            level="info",
+        )
+    return signals
+
+
 def build_scheduler(
     db: Database,
     telegram=None,
@@ -142,6 +167,8 @@ def build_scheduler(
     digest_hour: int = 9,
     opportunity_scan_interval_minutes: int = 120,
     discovery_scan_interval_minutes: int = 1440,
+    arbitrage_scan_interval_minutes: int = 5,
+    config: dict | None = None,
 ) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="UTC")
 
@@ -164,5 +191,9 @@ def build_scheduler(
     scheduler.add_job(
         run_project_discovery, IntervalTrigger(minutes=discovery_scan_interval_minutes),
         args=[db, telegram], id="project_discovery", replace_existing=True,
+    )
+    scheduler.add_job(
+        run_arbitrage_scan_job, IntervalTrigger(minutes=arbitrage_scan_interval_minutes),
+        args=[db, telegram, config], id="arbitrage_scan", replace_existing=True,
     )
     return scheduler

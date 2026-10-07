@@ -270,6 +270,45 @@ def build_dashboard_html(db: Database) -> str:
         if stopped else ""
     )
 
+    arb_stats = db.arbitrage_stats_summary()
+    arb_signals = db.list_arbitrage_signals(limit=20)
+    if arb_signals:
+        arb_rows = []
+        for s in arb_signals:
+            net = f"{s['net_profit_usd']:.3f} $" if s["net_profit_usd"] is not None else "N/A"
+            tag = (
+                "<span class='badge' style='background:#15803d'>rentable</span>" if s["would_execute"]
+                else "<span class='badge' style='background:#475569'>non rentable</span>"
+            )
+            arb_rows.append(
+                f"<tr><td>{escape(s['token_symbol'])}/{escape(s['quote_symbol'])}</td>"
+                f"<td>{escape(s['buy_dex'])} → {escape(s['sell_dex'])}</td>"
+                f"<td>{s['spread_pct']:.2f}%</td><td>{s['trade_size_usd']:.2f} $</td>"
+                f"<td>{net}</td><td>{tag}</td></tr>"
+            )
+        cumulative = arb_stats.get("cumulative_net_profit_usd") or 0.0
+        arbitrage_section = (
+            "<section>"
+            "<h2>📈 Bot de trading — arbitrage inter-DEX (SIMULATION)</h2>"
+            "<p class='subtitle'>Mode <b>SIMULATION</b> : aucune transaction réelle n'est envoyée. "
+            f"{arb_stats.get('total', 0)} signal(aux) détecté(s), "
+            f"{arb_stats.get('would_execute_count', 0) or 0} jugé(s) rentable(s) après frais+slippage+gas. "
+            f"P&amp;L hypothétique cumulé : {cumulative:.2f} $ (si exécuté à chaque signal rentable).</p>"
+            "<table><tr><th>Paire</th><th>Achat → Vente</th><th>Spread</th><th>Taille</th>"
+            "<th>Profit net est.</th><th></th></tr>"
+            + "".join(arb_rows) + "</table>"
+            "</section>"
+        )
+    else:
+        arbitrage_section = (
+            "<section>"
+            "<h2>📈 Bot de trading — arbitrage inter-DEX (SIMULATION)</h2>"
+            "<p class='subtitle'>Aucun signal détecté pour l'instant (scan en cours toutes les quelques "
+            "minutes). Mode SIMULATION : aucune transaction réelle ne sera jamais envoyée sans validation "
+            "manuelle explicite d'une phase live séparée.</p>"
+            "</section>"
+        )
+
     return f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -386,11 +425,14 @@ def build_dashboard_html(db: Database) -> str:
 
 {discovery_section}
 
+{arbitrage_section}
+
 <section>
   <p class="subtitle">API JSON disponible : <a href="/api/projects">/api/projects</a> ·
   <a href="/api/rewards">/api/rewards</a> · <a href="/api/wallets">/api/wallets</a> ·
   <a href="/api/status">/api/status</a> · <a href="/api/notifications">/api/notifications</a> ·
-  <a href="/api/opportunities">/api/opportunities</a> · <a href="/api/discovered">/api/discovered</a></p>
+  <a href="/api/opportunities">/api/opportunities</a> · <a href="/api/discovered">/api/discovered</a> ·
+  <a href="/api/arbitrage">/api/arbitrage</a></p>
 </section>
 <script>
   // Panneau de notifications web (alternative à Telegram) : poll léger toutes les 15s,
@@ -496,6 +538,13 @@ def create_app(db: Database) -> FastAPI:
     @app.get("/api/discovered")
     def api_discovered() -> JSONResponse:
         return JSONResponse(db.list_discovered_projects(status=None, limit=200))
+
+    @app.get("/api/arbitrage")
+    def api_arbitrage() -> JSONResponse:
+        return JSONResponse({
+            "stats": db.arbitrage_stats_summary(),
+            "signals": db.list_arbitrage_signals(limit=100),
+        })
 
     @app.get("/api/status")
     def api_status() -> JSONResponse:

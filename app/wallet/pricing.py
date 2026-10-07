@@ -39,11 +39,25 @@ def native_coingecko_id(network: str) -> str | None:
 
 def get_price_eur(coingecko_id: str | None) -> float | None:
     """Prix EUR d'un token via CoinGecko (cache 10 min). `None` si inconnu/échec."""
+    return _get_price(coingecko_id, "eur")
+
+
+def get_price_usd(coingecko_id: str | None) -> float | None:
+    """Prix USD d'un token via CoinGecko (cache 10 min). `None` si inconnu/échec.
+
+    Utilisé par le bot d'arbitrage (app/trading/), dont les prix de marché
+    (DexScreener) sont exprimés en USD.
+    """
+    return _get_price(coingecko_id, "usd")
+
+
+def _get_price(coingecko_id: str | None, vs_currency: str) -> float | None:
     if not coingecko_id:
         return None
 
+    cache_key = f"{coingecko_id}:{vs_currency}"
     now = time.time()
-    cached = _CACHE.get(coingecko_id)
+    cached = _CACHE.get(cache_key)
     if cached and now - cached[0] < _CACHE_TTL_SECONDS:
         return cached[1]
 
@@ -51,15 +65,15 @@ def get_price_eur(coingecko_id: str | None) -> float | None:
     try:
         resp = httpx.get(
             _COINGECKO_URL,
-            params={"ids": coingecko_id, "vs_currencies": "eur"},
+            params={"ids": coingecko_id, "vs_currencies": vs_currency},
             timeout=10.0,
         )
         resp.raise_for_status()
         data = resp.json()
-        price = (data.get(coingecko_id) or {}).get("eur")
+        price = (data.get(coingecko_id) or {}).get(vs_currency)
     except httpx.HTTPError as exc:
-        logger.warning("Prix CoinGecko indisponible pour %s: %s", coingecko_id, exc)
+        logger.warning("Prix CoinGecko indisponible pour %s (%s): %s", coingecko_id, vs_currency, exc)
         price = None
 
-    _CACHE[coingecko_id] = (now, price)
+    _CACHE[cache_key] = (now, price)
     return price

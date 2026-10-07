@@ -11,6 +11,7 @@ Usage:
     python main.py create-autosigner-wallet  # génère le wallet dédié à l'auto-signature (RPi3 uniquement)
     python main.py scan-opportunities   # scanne manuellement les micro-récompenses auto-réclamables
     python main.py discover-projects    # cherche manuellement de nouveaux projets (sources publiques)
+    python main.py scan-arbitrage       # scanne manuellement les écarts de prix inter-DEX (SIMULATION)
 """
 from __future__ import annotations
 
@@ -77,6 +78,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         digest_hour=scheduler_cfg.get("digest_hour", 9),
         opportunity_scan_interval_minutes=scheduler_cfg.get("opportunity_scan_interval_minutes", 120),
         discovery_scan_interval_minutes=scheduler_cfg.get("discovery_scan_interval_minutes", 1440),
+        arbitrage_scan_interval_minutes=scheduler_cfg.get("arbitrage_scan_interval_minutes", 5),
+        config=config,
     )
     scheduler.start()
     logger.info("Scheduler démarré.")
@@ -179,6 +182,25 @@ def cmd_scan_opportunities(args: argparse.Namespace) -> None:
               + (f" — {r['error']}" if r["error"] else ""))
 
 
+def cmd_scan_arbitrage(args: argparse.Namespace) -> None:
+    """Lance manuellement un scan d'arbitrage inter-DEX (debug/test, mode SIMULATION
+    uniquement — aucune transaction n'est jamais envoyée par cette commande)."""
+    from app.trading.arbitrage import run_arbitrage_scan
+
+    config, db, _ = _build_components(args.config)
+    signals = run_arbitrage_scan(db, config)
+    if not signals:
+        print("Aucun écart de prix significatif détecté sur les paires/DEX configurés "
+              "(ou liquidité/API indisponible).")
+        return
+    for s in signals:
+        tag = "✅ rentable (simulation)" if s["would_execute"] else "⚪ non rentable après frais/gas"
+        net = f"{s['net_profit_usd']:.3f}$" if s["net_profit_usd"] is not None else "N/A (gas indisponible)"
+        print(f"- {s['token_symbol']}/{s['quote_symbol']} : achat {s['buy_dex']} ({s['buy_price_usd']:.6f}$) "
+              f"→ vente {s['sell_dex']} ({s['sell_price_usd']:.6f}$) — spread {s['spread_pct']:.2f}% — "
+              f"taille≈{s['trade_size_usd']:.2f}$ — net≈{net} — {tag}")
+
+
 def cmd_create_autosigner_wallet(args: argparse.Namespace) -> None:
     """Génère le wallet dédié à l'auto-signature (Phase 4). À exécuter UNIQUEMENT
     sur la machine qui fera tourner le bot (le RPi3) : la clé privée est générée
@@ -237,6 +259,11 @@ def build_parser() -> argparse.ArgumentParser:
         "discover-projects",
         help="Lance manuellement une découverte de nouveaux projets via les sources publiques (debug/test).",
     ).set_defaults(func=cmd_discover_projects)
+
+    sub.add_parser(
+        "scan-arbitrage",
+        help="Lance manuellement un scan d'arbitrage inter-DEX (debug/test, SIMULATION uniquement).",
+    ).set_defaults(func=cmd_scan_arbitrage)
     return parser
 
 
