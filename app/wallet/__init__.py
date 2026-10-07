@@ -1,4 +1,5 @@
-"""Module wallet : balances, approvals, transactions — toujours en lecture seule.
+"""Module wallet : gestion du wallet de trading (signature) et des prix (pricing).
 
-Aucune seed phrase ni private key n'est jamais manipulée par ce module.
+Aucune seed phrase ni private key en clair n'est jamais écrite sur disque ou
+committée : seul un keystore chiffré (Ethereum V3) est utilisé.
 """

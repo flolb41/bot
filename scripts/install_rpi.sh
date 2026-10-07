@@ -23,16 +23,14 @@ mkdir -p data logs
 
 if [ ! -f .env ]; then
     cp .env.example .env
-    echo ">> Fichier .env créé, pense à y renseigner ton token Telegram et tes adresses de wallet."
+    echo ">> Fichier .env créé, pense à y renseigner ton token Telegram et ton wallet de trading."
 fi
-
-echo ">> Initialisation de la base de données (projets suivis)..."
-.venv/bin/python main.py seed
 
 echo ">> Installation terminée."
 echo "1. Édite config/config.yaml et .env selon tes besoins (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)."
-echo "2. Teste en local       : .venv/bin/python main.py scan"
-echo "3. Lance le système     : .venv/bin/python main.py run"
-echo "4. Pour un service au démarrage, voir scripts/crypto-reward-hunter.service"
-echo "5. Pour la sauvegarde SQLite automatique, voir scripts/backup.sh"
-echo "6. Pour le watchdog, voir scripts/watchdog.sh"
+echo "2. Importe ton wallet de trading : .venv/bin/python main.py import-trading-wallet"
+echo "3. Teste en local       : .venv/bin/python main.py scan-arbitrage"
+echo "4. Lance le système     : .venv/bin/python main.py run"
+echo "5. Pour un service au démarrage, voir scripts/crypto-reward-hunter.service"
+echo "6. Pour la sauvegarde SQLite automatique, voir scripts/backup.sh"
+echo "7. Pour le watchdog, voir scripts/watchdog.sh"

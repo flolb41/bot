@@ -1,4 +1,4 @@
-# Configuration du Crypto Reward Hunter.
+# Configuration du bot d'arbitrage inter-DEX (Crypto Reward Hunter).
 # Les secrets (token Telegram, etc.) viennent du fichier .env (jamais ici en clair).
 
 logging:
@@ -13,11 +13,6 @@ telegram:
   chat_id: "${TELEGRAM_CHAT_ID}"
 
 scheduler:
-  scan_interval_minutes: 30   # fréquence de scan des pages officielles (Phase 1)
-  deadline_check_hour: 8      # heure UTC de vérification des échéances
-  digest_hour: 9              # heure UTC d'envoi du digest quotidien "opportunité du jour"
-  opportunity_scan_interval_minutes: 120  # fréquence du scan de micro-récompenses (section 16 étendue)
-  discovery_scan_interval_minutes: 1440   # fréquence de découverte de nouveaux projets (1x/jour, sources publiques limitées en débit)
   # Fréquence du scan d'arbitrage inter-DEX (bot de trading, LIVE). 5 appels
   # DEX Screener par scan (1 par token seed), throttlés à 1,1s d'intervalle
   # (voir app/trading/dex_sources.py) : même à 1 min, on reste ~5 req/min,
@@ -29,51 +24,6 @@ dashboard:
   enabled: true
   host: 0.0.0.0
   port: 8000
-
-# Plafond de coût accepté pour qu'une campagne reste considérée "0 € de capital".
-risk:
-  max_acceptable_cost_eur: 0.0
-  max_gas_per_tx_native: 0.01       # limite indicative (reprise par AUTOSIGN_MAX_GAS_PRICE_GWEI)
-  max_amount_per_tx_eur: 0.0        # aucune transaction automatique n'est signée en phase 1-3
-
-# Auto-signature (Phase 4 du TODO — "interactions"). Garde-fous obligatoires avant
-# toute automatisation : whitelist de contrats, limites de gas/montant, simulation
-# préalable, arrêt automatique en cas d'anomalie (voir app/wallet/autosign.py).
-# TOUT vient du .env — par défaut AUTOSIGN_ENABLED=false : aucune transaction n'est
-# envoyée tant que tu ne l'actives pas explicitement après des tests en dry-run.
-autosign:
-  enabled: "${AUTOSIGN_ENABLED}"
-  wallet_address: "${WALLET_AUTOSIGNER_ADDRESS}"
-  wallet_network: "${WALLET_AUTOSIGNER_NETWORK}"
-  contract_whitelist: "${AUTOSIGN_CONTRACT_WHITELIST}"   # adresses séparées par des virgules
-  max_value_native: "${AUTOSIGN_MAX_VALUE_NATIVE}"
-  max_gas_price_gwei: "${AUTOSIGN_MAX_GAS_PRICE_GWEI}"
-  max_tx_per_day: "${AUTOSIGN_MAX_TX_PER_DAY}"
-  min_profit_margin_eur: "${AUTOSIGN_MIN_PROFIT_MARGIN_EUR}"  # marge exigée en plus des frais (section 16 étendue)
-
-# Répartition indicative des rewards reçus (section 11 du TODO) — appliquée manuellement.
-rewards_allocation:
-  keep_percent: 50
-  stablecoin_percent: 25
-  trading_reserve_percent: 25
-
-# Wallets suivis en LECTURE SEULE (balances only, section 4 du TODO).
-# Les adresses viennent exclusivement du .env : tant que WALLET_*_EVM_ADDRESS
-# est vide, le wallet correspondant n'est pas enregistré. Aucune seed phrase
-# ni private key ne doit JAMAIS apparaître ici ni dans le .env.
-wallets:
-  - name: farming
-    address: "${WALLET_FARM_EVM_ADDRESS}"
-    network: "${WALLET_FARM_EVM_NETWORK}"
-    purpose: "Wallet dédié au farming d'airdrops/testnets — jamais le wallet personnel."
-  - name: rewards
-    address: "${WALLET_REWARDS_EVM_ADDRESS}"
-    network: "${WALLET_REWARDS_EVM_NETWORK}"
-    purpose: "Wallet de réception des rewards convertis (section 11 du TODO)."
-  - name: autosigner
-    address: "${WALLET_AUTOSIGNER_ADDRESS}"
-    network: "${WALLET_AUTOSIGNER_NETWORK}"
-    purpose: "Wallet opérationnel pour l'auto-signature (Phase 4) — solde minimal, rewards balayés régulièrement vers le wallet personnel."
 
 # Bot de trading : arbitrage inter-DEX sur Base (demande "microtrades + seuil de
 # rentabilité"). PHASE 2 = EXÉCUTION LIVE ACTIVÉE (décision explicite de

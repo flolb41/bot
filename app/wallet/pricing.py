@@ -1,17 +1,12 @@
-"""Estimation de valeur EUR — utilisée pour juger de la rentabilité d'un claim.
+"""Estimation de prix USD — utilisée par le bot d'arbitrage (app/trading/)
+pour comparer les prix DEX Screener (USD) à une référence de marché indépendante.
 
 Utilise l'API publique CoinGecko (gratuite, sans clé). Principe de prudence :
-si un token n'est pas coté (très fréquent pour un token de testnet/pré-TGE),
-on retourne `None` plutôt qu'une valeur devinée — mieux vaut ne PAS réclamer
-une récompense dont on ne peut pas vérifier la valeur que de risquer de payer
-plus de gas que ce que ça rapporte (ou pire, d'interagir avec un contrat
-frauduleux qui "offre" un faux token sans valeur).
+si un token n'est pas coté, on retourne `None` plutôt qu'une valeur devinée.
 """
 from __future__ import annotations
 
 import logging
-import os
-import re
 import time
 
 import httpx
@@ -21,25 +16,6 @@ logger = logging.getLogger("app.wallet.pricing")
 _CACHE: dict[str, tuple[float, float | None]] = {}
 _CACHE_TTL_SECONDS = 600  # 10 min : évite de marteler l'API publique CoinGecko
 _COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
-
-
-def _sanitize_env_suffix(network: str) -> str:
-    return re.sub(r"[^A-Z0-9]+", "_", network.upper()).strip("_")
-
-
-def native_coingecko_id(network: str) -> str | None:
-    """ID CoinGecko du token natif (gas) d'un réseau, via PRICE_NATIVE_<NETWORK>.
-
-    Non configuré => prix inconnu => aucun calcul de rentabilité possible sur
-    ce réseau (comportement volontairement conservateur).
-    """
-    raw = os.environ.get(f"PRICE_NATIVE_{_sanitize_env_suffix(network)}", "")
-    return raw.strip() or None
-
-
-def get_price_eur(coingecko_id: str | None) -> float | None:
-    """Prix EUR d'un token via CoinGecko (cache 10 min). `None` si inconnu/échec."""
-    return _get_price(coingecko_id, "eur")
 
 
 def get_price_usd(coingecko_id: str | None) -> float | None:
