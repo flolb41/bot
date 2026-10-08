@@ -65,3 +65,58 @@ def test_arbitrage_stats_summary(db: Database):
     summary = db.arbitrage_stats_summary()
     assert summary["total"] == 2
     assert summary["would_execute_count"] == 1
+
+
+def test_pair_execution_history_filters_by_pair_and_orders_recent_first(db: Database):
+    id1 = db.add_arbitrage_signal(_sample_signal(buy_dex="uniswap", sell_dex="aerodrome"))
+    id2 = db.add_arbitrage_signal(_sample_signal(buy_dex="uniswap", sell_dex="aerodrome"))
+    # Paire différente -> ne doit jamais apparaître dans l'historique ci-dessous.
+    db.add_arbitrage_signal(_sample_signal(buy_dex="sushiswap", sell_dex="baseswap"))
+
+    db.mark_arbitrage_signal_executed(id1, tx_hash_buy="0x1", tx_hash_sell="0x2")
+    db.mark_arbitrage_signal_executed(id2, tx_hash_buy="0x3", execution_error="revert")
+
+    history = db.pair_execution_history(token_symbol="WETH", buy_dex="uniswap", sell_dex="aerodrome", limit=20)
+    assert len(history) == 2
+    # Le plus récent (id2, en échec) doit être en premier.
+    assert history[0]["execution_error"] == "revert"
+    assert history[1]["tx_hash_sell"] == "0x2"
+
+
+def test_pair_execution_history_empty_without_executed_attempts(db: Database):
+    db.add_arbitrage_signal(_sample_signal(buy_dex="uniswap", sell_dex="aerodrome"))
+    history = db.pair_execution_history(token_symbol="WETH", buy_dex="uniswap", sell_dex="aerodrome", limit=20)
+    assert history == []
+
+
+def _sample_triangular_signal(**overrides) -> dict:
+    signal = {
+        "chain": "base", "dex": "aerodrome",
+        "token_a_symbol": "USDC", "token_a_address": "0xusdc",
+        "token_b_symbol": "WETH", "token_b_address": "0xweth",
+        "token_c_symbol": "AERO", "token_c_address": "0xaero",
+        "cycle_multiplier": 1.01, "spread_pct": 1.0, "min_liquidity_usd": 100000,
+        "trade_size_usd": 3.0, "gross_profit_usd": 0.03, "fees_usd": 0.01,
+        "slippage_buffer_usd": 0.005, "gas_cost_usd": 0.002, "net_profit_usd": 0.013,
+        "would_execute": 1, "mode": "simulation", "executed": 0, "tx_hash": None,
+    }
+    signal.update(overrides)
+    return signal
+
+
+def test_triangular_execution_history_filters_by_cycle_and_orders_recent_first(db: Database):
+    id1 = db.add_triangular_signal(_sample_triangular_signal())
+    id2 = db.add_triangular_signal(_sample_triangular_signal())
+    # Cycle différent (autre DEX) -> ne doit jamais apparaître ci-dessous.
+    db.add_triangular_signal(_sample_triangular_signal(dex="sushiswap"))
+
+    db.mark_triangular_signal_executed(id1, tx_hash="0x1")
+    db.mark_triangular_signal_executed(id2, execution_error="revert")
+
+    history = db.triangular_execution_history(
+        dex="aerodrome", token_a_symbol="USDC", token_b_symbol="WETH", token_c_symbol="AERO", limit=20
+    )
+    assert len(history) == 2
+    assert history[0]["execution_error"] == "revert"
+    assert history[1]["tx_hash"] == "0x1"
+

@@ -24,6 +24,7 @@ from app.database import Database
 from app.trading import fees
 from app.trading.arbitrage import _DEFAULT_DEX_WHITELIST, _DEFAULT_SEED_TOKENS, _collect_pairs
 from app.trading.flashloan import estimate_triangular_signal_flashloan_preview
+from app.trading.pair_health import triangular_health
 from app.wallet.pricing import get_price_usd
 
 logger = logging.getLogger(__name__)
@@ -176,10 +177,17 @@ def run_triangular_scan(db: Database, config: dict | None = None) -> list[dict]:
 
                     net_profit_usd = None
                     would_execute = False
+                    health = triangular_health(
+                        db, config or {}, dex=dex, token_a_symbol=token_a_symbol,
+                        token_b_symbol=token_b_symbol, token_c_symbol=token_c_symbol,
+                    )
+                    if health["disabled"]:
+                        logger.info("Triangular scan : %s", health["disabled_reason"])
                     if gas_cost_usd is not None:
                         net_profit_usd = gross_profit_usd - fees_usd - slippage_buffer_usd - gas_cost_usd
-                        would_execute = net_profit_usd >= max(
-                            min_net_profit_usd, trade_size_usd * min_net_profit_pct / 100
+                        adaptive_min_net_profit_usd = min_net_profit_usd * health["threshold_multiplier"]
+                        would_execute = not health["disabled"] and net_profit_usd >= max(
+                            adaptive_min_net_profit_usd, trade_size_usd * min_net_profit_pct / 100
                         )
 
                     signal = {
@@ -216,5 +224,123 @@ def run_triangular_scan(db: Database, config: dict | None = None) -> list[dict]:
         logger.info(
             "Triangular scan terminé : %d cycle(s) détecté(s), %d rentable(s) après coûts.",
             len(signals), sum(1 for s in signals if s["would_execute"]),
+        )
+    return signals
+
+
+def run_cross_dex_triangular_scan(db: Database, config: dict | None = None) -> list[dict]:
+    """Détecte des cycles triangulaires dont les 3 jambes prennent chacune le
+    MEILLEUR taux disponible tous DEX confondus, sans exiger qu'elles soient
+    toutes cotées sur le même DEX (contrairement à `run_triangular_scan`, qui
+    se limite à un seul DEX à la fois car c'est le seul cas exécutable de
+    façon atomique en une transaction — voir `TRIANGULAR_CAPABLE_DEXES`).
+
+    Repère donc des opportunités invisibles pour `run_triangular_scan` (ex :
+    A→B mieux coté sur Aerodrome, B→C sur Uniswap V3, C→A sur Baseswap), mais
+    PUREMENT INFORMATIONNEL : aucune exécution atomique en une seule
+    transaction n'est possible sans redévelopper/redéployer
+    `FlashArbitrage.sol` pour router chaque jambe vers un DEX différent (jugé
+    hors scope de ce lot d'améliorations). Les cycles détectés sont
+    journalisés en base (table `cross_dex_triangular_signals`, voir
+    `Database.list_cross_dex_triangular_signals`) pour inspection manuelle —
+    jamais exécutés ni proposés à l'exécution automatique."""
+    trading_cfg = (config or {}).get("trading", {}) or {}
+    chain_id = trading_cfg.get("chain", "base")
+    dex_whitelist = set(trading_cfg.get("dex_whitelist") or _DEFAULT_DEX_WHITELIST)
+    seed_tokens = trading_cfg.get("seed_tokens") or _DEFAULT_SEED_TOKENS
+    min_liquidity_usd = float(trading_cfg.get("min_liquidity_usd", 10_000))
+    # Seuil volontairement plus élevé que `min_spread_pct_to_log` (arbitrage
+    # classique) : ces cycles ne sont pas exécutables, un seuil bas ne ferait
+    # que noyer la base de données sans valeur actionnable immédiate.
+    min_spread_pct_to_log = float(trading_cfg.get("cross_dex_min_spread_pct_to_log", 0.50))
+
+    if not dex_whitelist:
+        return []
+
+    groups = _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd)
+    if not groups:
+        return []
+
+    # Toutes les pools par paire de tokens, TOUS DEX confondus (contrairement
+    # à `by_dex` dans `run_triangular_scan`, qui segmente strictement par DEX) :
+    # {frozenset({addr_a, addr_b}): [pair, ...]}
+    pools_by_token_pair: dict[frozenset, list[dict]] = {}
+    for pairs in groups.values():
+        for pair in pairs:
+            pools_by_token_pair.setdefault(
+                frozenset({pair["base_address"], pair["quote_address"]}), []
+            ).append(pair)
+
+    def _best_leg(from_addr: str, to_addr: str) -> tuple[float, dict] | None:
+        """Meilleur taux ET pool d'origine pour cette jambe, tous DEX confondus."""
+        best: tuple[float, dict] | None = None
+        for pair in pools_by_token_pair.get(frozenset({from_addr, to_addr})) or []:
+            rate = _pool_rate(pair, from_addr, to_addr)
+            if rate is None or rate <= 0:
+                continue
+            if best is None or rate > best[0]:
+                best = (rate, pair)
+        return best
+
+    seed_entries = [(t["symbol"], t["address"].lower()) for t in seed_tokens]
+    signals: list[dict] = []
+
+    for token_a_symbol, token_a_addr in seed_entries:
+        for token_b_symbol, token_b_addr in seed_entries:
+            if token_b_addr == token_a_addr:
+                continue
+            for token_c_symbol, token_c_addr in seed_entries:
+                if token_c_addr in (token_a_addr, token_b_addr):
+                    continue
+                # Un cycle A→B→C→A est le MÊME cycle physique que B→C→A→B ou
+                # C→A→B→C (simple rotation du point de départ) : ne garder que
+                # la rotation où token_a est l'adresse la plus petite évite de
+                # journaliser 3x le même cycle (les 2 sens de parcours restent
+                # bien distincts, eux, puisque la boucle garde token_b/token_c
+                # dans les deux ordres possibles).
+                if token_a_addr > token_b_addr or token_a_addr > token_c_addr:
+                    continue
+
+                leg_ab = _best_leg(token_a_addr, token_b_addr)
+                leg_bc = _best_leg(token_b_addr, token_c_addr)
+                leg_ca = _best_leg(token_c_addr, token_a_addr)
+                if leg_ab is None or leg_bc is None or leg_ca is None:
+                    continue
+
+                rate_ab, pair_ab = leg_ab
+                rate_bc, pair_bc = leg_bc
+                rate_ca, pair_ca = leg_ca
+
+                # Les 3 jambes sur le même DEX : déjà couvert (et potentiellement
+                # exécutable) par `run_triangular_scan`, pas la peine de dupliquer.
+                if pair_ab["dex_id"] == pair_bc["dex_id"] == pair_ca["dex_id"]:
+                    continue
+
+                cycle_multiplier = rate_ab * rate_bc * rate_ca
+                spread_pct = (cycle_multiplier - 1) * 100
+                if spread_pct < min_spread_pct_to_log:
+                    continue
+
+                min_liquidity = min(
+                    pair_ab["liquidity_usd"], pair_bc["liquidity_usd"], pair_ca["liquidity_usd"]
+                )
+
+                signal = {
+                    "chain": chain_id,
+                    "token_a_symbol": token_a_symbol, "token_a_address": token_a_addr,
+                    "token_b_symbol": token_b_symbol, "token_b_address": token_b_addr,
+                    "token_c_symbol": token_c_symbol, "token_c_address": token_c_addr,
+                    "dex_ab": pair_ab["dex_id"], "dex_bc": pair_bc["dex_id"], "dex_ca": pair_ca["dex_id"],
+                    "cycle_multiplier": cycle_multiplier,
+                    "spread_pct": spread_pct,
+                    "min_liquidity_usd": min_liquidity,
+                }
+                signal["id"] = db.add_cross_dex_triangular_signal(signal)
+                signals.append(signal)
+
+    if signals:
+        logger.info(
+            "Cross-DEX triangular scan (informationnel, non exécutable) : %d cycle(s) détecté(s).",
+            len(signals),
         )
     return signals

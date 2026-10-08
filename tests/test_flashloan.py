@@ -68,6 +68,26 @@ def test_amm_price_impact_pct_grows_with_notional_vs_liquidity():
     assert flashloan._amm_price_impact_pct(1000, 0) == 100.0
 
 
+def test_optimal_flashloan_notional_usd_finds_concave_maximum():
+    # Fonction concave simple : profit = 10*n - n^2 (maximum exact en n=5,
+    # profit=25), bien à l'intérieur de la borne haute (100) -> la recherche
+    # ternaire doit converger dessus sans buter sur la borne.
+    optimal = flashloan._optimal_flashloan_notional_usd(100.0, lambda n: 10 * n - n ** 2)
+    assert round(optimal, 2) == 5.0
+
+
+def test_optimal_flashloan_notional_usd_clamped_by_upper_bound():
+    # Fonction strictement croissante sur l'intervalle -> l'optimum est à la
+    # borne haute elle-même (jamais au-delà, même si profit_fn continuerait
+    # de croître : c'est le plafond de liquidité/config qui doit gagner).
+    optimal = flashloan._optimal_flashloan_notional_usd(50.0, lambda n: n)
+    assert round(optimal, 2) == 50.0
+
+
+def test_optimal_flashloan_notional_usd_zero_upper_bound():
+    assert flashloan._optimal_flashloan_notional_usd(0.0, lambda n: n) == 0.0
+
+
 def test_pair_signal_flashloan_preview_returns_none_when_not_eligible():
     # Flashloan désactivé -> pas d'aperçu affiché sur le dashboard.
     config = {"trading": {"flashloan_enabled": False}}
@@ -86,26 +106,27 @@ def test_pair_signal_flashloan_preview_computes_notional_and_profit(monkeypatch)
               "buy_liquidity_usd": 100_000, "sell_liquidity_usd": 100_000, "spread_pct": 1.0}
     preview = flashloan.estimate_pair_signal_flashloan_preview(config, signal)
     assert preview is not None
-    # Notionnel borné par 2% de la liquidité min (2000$) ET par flashloan_notional_usd (1000$) -> 1000$.
-    assert preview["notional_usd"] == 1000.0
-    # gross=10$ (1% de 1000) - fees (0.3%*2=6$) - slippage AMM (impact ~1,96%
-    # par jambe sur un pool de 100k$, soit ~3,92% au total, >> tampon fixe
-    # 0,20% -> slippage≈39,22$) - premium(0.5) - gas(0.2) = -35,92$ environ.
-    assert round(preview["net_profit_usd"], 2) == -35.92
+    # Plafond = min(flashloan_notional_usd=1000$, 2% de la liquidité min=2000$) = 1000$,
+    # mais la recherche ternaire (voir `_optimal_flashloan_notional_usd`) trouve un
+    # notionnel bien plus faible (~50$) : au-delà, le slippage AMM convexe dévore le
+    # profit linéaire plus vite qu'il ne se construit, sur un spread de seulement 1%.
+    assert round(preview["notional_usd"], 2) == 50.05
+    assert round(preview["net_profit_usd"], 2) == -0.12
 
 
 def test_pair_signal_flashloan_preview_bounded_by_liquidity(monkeypatch):
-    # Liquidité très faible -> notionnel calculé via liquidity_safety_fraction
-    # doit primer sur flashloan_notional_usd (pas de dimensionnement irréaliste
-    # par rapport à la liquidité réelle du pool).
+    # Liquidité très faible -> le plafond de notionnel calculé via
+    # liquidity_safety_fraction doit primer sur flashloan_notional_usd, et la
+    # recherche ternaire reste bornée par ce plafond réduit (0,5$, bien en
+    # dessous du plafond max de 20$ = 2% de 1000$ de liquidité).
     monkeypatch.setattr(flashloan, "_estimate_premium_and_gas_cost_usd", lambda notional, gas_units: (0.01, 0.01))
     config = {"trading": {"flashloan_enabled": True, "flashloan_notional_usd": 1000, "liquidity_safety_fraction": 0.02}}
     signal = {"buy_dex": "aerodrome", "sell_dex": "sushiswap", "quote_address": USDC,
               "buy_liquidity_usd": 1_000, "sell_liquidity_usd": 1_000, "spread_pct": 1.0}
-    # 2% de 1000$ = 20$ de notionnel max -> bien en dessous de flashloan_notional_usd.
     preview = flashloan.estimate_pair_signal_flashloan_preview(config, signal)
     assert preview is not None
-    assert preview["notional_usd"] == 20.0
+    assert round(preview["notional_usd"], 2) == 0.5
+    assert preview["notional_usd"] <= 20.0
 
 
 def test_pair_signal_flashloan_preview_penalizes_thin_liquidity_pool(monkeypatch):
@@ -123,8 +144,9 @@ def test_pair_signal_flashloan_preview_penalizes_thin_liquidity_pool(monkeypatch
     deep_preview = flashloan.estimate_pair_signal_flashloan_preview(config, deep_pool_signal)
     thin_preview = flashloan.estimate_pair_signal_flashloan_preview(config, thin_pool_signal)
     assert deep_preview["net_profit_usd"] > thin_preview["net_profit_usd"]
-    # Même notionnel (1000$, bien en dessous des deux liquidités) mais un
-    # écart de profit net de plusieurs dollars uniquement dû à la liquidité.
+    # La recherche ternaire choisit un notionnel optimal DIFFÉRENT pour chaque
+    # pool (plus prudent sur le pool fin), mais l'écart de profit net reste
+    # significatif, uniquement dû à la liquidité disponible.
     assert deep_preview["net_profit_usd"] - thin_preview["net_profit_usd"] > 1.0
 
 
@@ -134,8 +156,9 @@ def test_triangular_signal_flashloan_preview_computes_notional_and_profit(monkey
     signal = {"dex": "aerodrome", "token_a_address": WETH, "min_liquidity_usd": 100_000, "spread_pct": 2.0}
     preview = flashloan.estimate_triangular_signal_flashloan_preview(config, signal)
     assert preview is not None
-    assert preview["notional_usd"] == 1000.0
-    # gross=20$ (2% de 1000) - fees (3*0.3%=9$) - slippage AMM (impact ~1,96%
-    # par jambe sur un pool de 100k$, x3 jambes ≈ 5,88% -> slippage≈58,82$)
-    # - premium(0.5) - gas(0.2) = -48,52$ environ.
-    assert round(preview["net_profit_usd"], 2) == -48.52
+    # Plafond = min(1000$, 2% de 100k$=2000$) = 1000$, mais la recherche
+    # ternaire trouve un notionnel optimal bien plus faible (~87,73$) : avec
+    # 3 jambes sur le même pool, le slippage AMM s'accumule 3x plus vite que
+    # sur un aller-retour classique, rendant les gros notionnels non rentables.
+    assert round(preview["notional_usd"], 2) == 87.73
+    assert round(preview["net_profit_usd"], 2) == 0.26

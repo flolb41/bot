@@ -41,7 +41,22 @@ dashboard:
 trading:
   enabled: true
   chain: base
-  dex_whitelist: [uniswap, aerodrome, sushiswap, pancakeswap, baseswap, alien-base, swapbased]
+  # balancer/curve/maverick ajoutés le 2026-10-08 en DÉTECTION SEULE (jamais
+  # ajoutés à `app.trading.routers.EXECUTABLE_DEXES` : toute tentative
+  # d'exécution dessus est refusée proprement par `executor.py`/`flashloan.py`,
+  # voir leur vérification `dex not in EXECUTABLE_DEXES` — zéro risque de
+  # fonds, juste des signaux "non rentable/non exécutable" supplémentaires à
+  # titre informatif). Vérifié via DexScreener le 2026-10-08 : "balancer" a
+  # une présence réelle mais très faible sur Base pour nos seed tokens
+  # actuels (quelques centaines à ~1200 $ de liquidité, sous notre plancher
+  # `min_liquidity_usd: 10000` — n'ajoute donc aucun signal exploitable pour
+  # l'instant, gardé pour le cas où sa liquidité grossirait). "curve" et
+  # "maverick" n'ont aucune pool détectée sur Base pour nos seed tokens
+  # actuels (aucun dexId "curve"/"maverick" dans les réponses DexScreener
+  # observées) : gardés quand même dans la liste (aucun coût, juste une
+  # chaîne qui ne matchera jamais tant qu'aucune pool n'existe) plutôt que
+  # d'exiger un redéploiement le jour où ça change.
+  dex_whitelist: [uniswap, aerodrome, sushiswap, pancakeswap, baseswap, alien-base, swapbased, balancer, curve, maverick]
   # Tokens de départ pour la recherche de paires inter-DEX (adresses Base
   # vérifiées via DEUX sources indépendantes — DEX Screener + CoinGecko — avant
   # ajout ici : ne jamais ajouter une adresse non recoupée de cette façon).
@@ -69,6 +84,19 @@ trading:
     - symbol: BRETT
       address: "0x532f27101965dd16442e59d40670faf5ebb142e4"
       coingecko_id: based-brett
+    # DAI et USDT (bridgé) ajoutés le 2026-10-08 : stablecoins très liquides
+    # sur Base, complémentaires à USDC/USDbC pour la détection d'écarts
+    # inter-stablecoins (Curve/Balancer en sont justement friands) et pour
+    # ouvrir de nouveaux cycles triangulaires. Adresses vérifiées via DEUX
+    # sources indépendantes : étiquette BaseScan ("Dai Stablecoin"/"Tether
+    # USD" vérifiées) + métadonnées on-chain DexScreener concordantes
+    # (name/symbol identiques, pools réelles avec USDC confirmées).
+    - symbol: DAI
+      address: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"
+      coingecko_id: dai
+    - symbol: USDT
+      address: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"
+      coingecko_id: tether
     # cbBTC retiré le 2026-10-08 : sur 505 signaux observés en 24h, 1 seul
     # jugé rentable (spread moyen 0,41 %, systématiquement mangé par les
     # frais DEX ~0,6 % aller-retour) — consomme un appel DexScreener par scan
@@ -87,11 +115,32 @@ trading:
   trade_size_capital_fraction: 0.8
   liquidity_safety_fraction: 0.02 # taille de trade ≤ 2% de la plus petite liquidité des deux pools
   min_spread_pct_to_log: 0.10     # écart minimum pour journaliser un signal (réduit le bruit)
+  # Scan triangulaire INFORMATIONNEL inter-DEX (voir
+  # app.trading.triangular.run_cross_dex_triangular_scan) : cycles dont les 3
+  # jambes peuvent être sur des DEX différents. JAMAIS exécutable
+  # automatiquement (aucune transaction atomique ne peut router 3 jambes vers
+  # 3 DEX différents sans redéployer FlashArbitrage.sol) — consultable via
+  # /api/cross-dex-triangular. Seuil volontairement plus élevé que
+  # min_spread_pct_to_log pour ne pas noyer la base avec du bruit non actionnable.
+  cross_dex_min_spread_pct_to_log: 0.50
   # Seuil de rentabilité à 5 $ de capital : un seuil fixe en $ n'a plus de sens
   # (0,50 $ est inatteignable sur un trade de 3 $). "would_execute" exige à la
   # fois un plancher absolu minimal ET un profit net relatif à la taille du trade.
   min_net_profit_usd: 0.01
   min_net_profit_pct: 0.5
+
+  # Historique d'exécution par paire (succès/échecs RÉELS, pas la simulation) :
+  # relève le seuil de profit exigé pour une paire qui échoue souvent
+  # récemment, et l'exclut temporairement après une série d'échecs
+  # consécutifs — voir app/trading/pair_health.py pour le détail du calcul.
+  # Mettre à false pour revenir au comportement précédent (seuil fixe,
+  # aucune désactivation automatique).
+  pair_health_enabled: true
+  adaptive_profit_lookback: 20          # nombre de tentatives passées considérées par paire
+  adaptive_profit_min_samples: 5        # pas d'ajustement tant qu'il n'y a pas au moins ce nombre de tentatives
+  adaptive_profit_penalty_factor: 2.0   # seuil x2 maximum pour une paire en échec systématique (0% de réussite)
+  auto_disable_consecutive_failures: 3  # nombre d'échecs d'affilée avant mise en pause de la paire
+  auto_disable_cooldown_minutes: 120    # durée de la pause avant de retenter la paire
 
   # Exécution financée par flashloan Aave V3 (contrat FlashArbitrage déjà
   # déployé sur Base mainnet, voir contracts/README.md pour l'adresse et le
@@ -108,9 +157,14 @@ trading:
   # alien-base/swapbased sont éligibles (voir
   # app/trading/flashloan.py::FLASHLOAN_CAPABLE_DEXES).
   flashloan_enabled: true
-  # Montant notionnel emprunté par flashloan, en $ (indépendant du solde réel
-  # du wallet). Toujours borné par `liquidity_safety_fraction` ci-dessus (2%
-  # de la plus petite liquidité de pool parmi les jambes du cycle).
+  # Plafond du montant notionnel empruntable par flashloan, en $ (indépendant
+  # du solde réel du wallet). Le notionnel RÉELLEMENT utilisé est désormais
+  # OPTIMISÉ (recherche ternaire sur la fonction de profit, concave en
+  # notionnel — voir app/trading/flashloan.py::_optimal_flashloan_notional_usd)
+  # dans l'intervalle [0, ce plafond], lui-même toujours borné par
+  # `liquidity_safety_fraction` ci-dessus (2% de la plus petite liquidité de
+  # pool parmi les jambes du cycle) : cette valeur reste un plafond de risque
+  # configurable, pas le montant systématiquement emprunté.
   flashloan_notional_usd: 1000
   # Profit net minimum exigé (frais DEX + prime flashloan Aave ~0,05% +
   # tampon de slippage + gas déjà déduits) pour tenter un flashloan —

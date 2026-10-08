@@ -293,6 +293,24 @@ def create_app(db: Database) -> FastAPI:
             "signals": db.list_arbitrage_signals(limit=100),
         })
 
+    @app.get("/api/triangular")
+    def api_triangular() -> JSONResponse:
+        return JSONResponse({
+            "signals": db.list_triangular_signals(limit=100),
+        })
+
+    @app.get("/api/cross-dex-triangular")
+    def api_cross_dex_triangular() -> JSONResponse:
+        """Cycles triangulaires inter-DEX détectés — voir
+        `app.trading.triangular.run_cross_dex_triangular_scan`. Purement
+        informationnel : ces cycles ne sont jamais exécutables automatiquement
+        (chaque jambe peut être sur un DEX différent, aucune transaction
+        atomique ne peut les router toutes en une fois sans redéployer
+        `FlashArbitrage.sol`). Exposé ici pour inspection manuelle uniquement."""
+        return JSONResponse({
+            "signals": db.list_cross_dex_triangular_signals(limit=100),
+        })
+
     @app.get("/api/status")
     def api_status() -> JSONResponse:
         return JSONResponse({

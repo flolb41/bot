@@ -138,19 +138,18 @@ def estimate_pair_signal_flashloan_preview(config: dict, signal: dict) -> dict |
         return None
     safety_fraction = flashloan_liquidity_safety_fraction(config)
     min_liquidity_usd = min(signal.get("buy_liquidity_usd") or 0.0, signal.get("sell_liquidity_usd") or 0.0)
-    notional_usd = min(flashloan_notional_usd(config), safety_fraction * min_liquidity_usd)
-    if notional_usd <= 0:
+    upper_bound_usd = min(flashloan_notional_usd(config), safety_fraction * min_liquidity_usd)
+    if upper_bound_usd <= 0:
         return None
-    gross_profit_usd = notional_usd * (signal.get("spread_pct") or 0.0) / 100
-    fees_usd = notional_usd * (dex_fee_pct(signal["buy_dex"]) + dex_fee_pct(signal["sell_dex"])) / 100
-    amm_impact_pct = _amm_price_impact_pct(notional_usd, signal.get("buy_liquidity_usd")) + _amm_price_impact_pct(
-        notional_usd, signal.get("sell_liquidity_usd")
+    profit_fn = lambda n: _pair_profit_before_gas_usd(  # noqa: E731
+        n, spread_pct=signal.get("spread_pct") or 0.0, buy_dex=signal["buy_dex"], sell_dex=signal["sell_dex"],
+        buy_liquidity_usd=signal.get("buy_liquidity_usd"), sell_liquidity_usd=signal.get("sell_liquidity_usd"),
     )
-    slippage_buffer_usd = notional_usd * max(DEFAULT_SLIPPAGE_BUFFER_PCT, amm_impact_pct) / 100
-    premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_PAIR)
+    notional_usd = _optimal_flashloan_notional_usd(upper_bound_usd, profit_fn)
+    _, gas_cost_usd = _estimate_premium_and_gas_cost_usd(notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_PAIR)
     if gas_cost_usd is None:
         return None
-    net_profit_usd = gross_profit_usd - fees_usd - slippage_buffer_usd - premium_usd - gas_cost_usd
+    net_profit_usd = profit_fn(notional_usd) - gas_cost_usd
     return {"notional_usd": notional_usd, "net_profit_usd": net_profit_usd}
 
 
@@ -162,22 +161,17 @@ def estimate_triangular_signal_flashloan_preview(config: dict, signal: dict) -> 
         return None
     safety_fraction = flashloan_liquidity_safety_fraction(config)
     min_liquidity_usd = signal.get("min_liquidity_usd") or 0.0
-    notional_usd = min(flashloan_notional_usd(config), safety_fraction * min_liquidity_usd)
-    if notional_usd <= 0:
+    upper_bound_usd = min(flashloan_notional_usd(config), safety_fraction * min_liquidity_usd)
+    if upper_bound_usd <= 0:
         return None
-    fee_pct_total = 3 * dex_fee_pct(signal["dex"])
-    gross_profit_usd = notional_usd * (signal.get("spread_pct") or 0.0) / 100
-    fees_usd = notional_usd * fee_pct_total / 100
-    # 3 jambes sur le même DEX : seule la liquidité minimale du cycle est
-    # connue (voir `run_triangular_scan`), appliquée par prudence aux 3 jambes.
-    amm_impact_pct = 3 * _amm_price_impact_pct(notional_usd, min_liquidity_usd)
-    slippage_buffer_usd = notional_usd * max(DEFAULT_SLIPPAGE_BUFFER_PCT, amm_impact_pct) / 100
-    premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(
-        notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_TRIANGULAR
+    profit_fn = lambda n: _triangular_profit_before_gas_usd(  # noqa: E731
+        n, spread_pct=signal.get("spread_pct") or 0.0, dex=signal["dex"], min_liquidity_usd=min_liquidity_usd,
     )
+    notional_usd = _optimal_flashloan_notional_usd(upper_bound_usd, profit_fn)
+    _, gas_cost_usd = _estimate_premium_and_gas_cost_usd(notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_TRIANGULAR)
     if gas_cost_usd is None:
         return None
-    net_profit_usd = gross_profit_usd - fees_usd - slippage_buffer_usd - premium_usd - gas_cost_usd
+    net_profit_usd = profit_fn(notional_usd) - gas_cost_usd
     return {"notional_usd": notional_usd, "net_profit_usd": net_profit_usd}
 
 
@@ -232,6 +226,66 @@ def _estimate_premium_and_gas_cost_usd(notional_usd: float, gas_units: int) -> t
     return premium_usd, gas_cost_usd
 
 
+def _pair_profit_before_gas_usd(
+    notional_usd: float, *, spread_pct: float, buy_dex: str, sell_dex: str,
+    buy_liquidity_usd: float | None, sell_liquidity_usd: float | None,
+) -> float:
+    """Profit net (hors gas, qui ne dépend pas du notionnel) d'un signal 'pair'
+    financé par flashloan à `notional_usd` — fonction CONCAVE de `notional_usd`
+    (le gain brut et les frais DEX/prime Aave sont linéaires, le slippage AMM
+    est convexe), utilisée à la fois pour calculer le profit affiché ET pour
+    trouver le notionnel optimal via `_optimal_flashloan_notional_usd`."""
+    gross_profit_usd = notional_usd * spread_pct / 100
+    fees_usd = notional_usd * (dex_fee_pct(buy_dex) + dex_fee_pct(sell_dex)) / 100
+    amm_impact_pct = _amm_price_impact_pct(notional_usd, buy_liquidity_usd) + _amm_price_impact_pct(
+        notional_usd, sell_liquidity_usd
+    )
+    slippage_buffer_usd = notional_usd * max(DEFAULT_SLIPPAGE_BUFFER_PCT, amm_impact_pct) / 100
+    premium_usd = notional_usd * AAVE_V3_FLASHLOAN_PREMIUM_PCT / 100
+    return gross_profit_usd - fees_usd - slippage_buffer_usd - premium_usd
+
+
+def _triangular_profit_before_gas_usd(
+    notional_usd: float, *, spread_pct: float, dex: str, min_liquidity_usd: float | None,
+) -> float:
+    """Équivalent triangulaire de `_pair_profit_before_gas_usd` — même principe,
+    3 jambes sur le même DEX, slippage AMM appliqué par prudence aux 3 jambes
+    avec la liquidité minimale du cycle (seule connue, voir `run_triangular_scan`)."""
+    fee_pct_total = 3 * dex_fee_pct(dex)
+    gross_profit_usd = notional_usd * spread_pct / 100
+    fees_usd = notional_usd * fee_pct_total / 100
+    amm_impact_pct = 3 * _amm_price_impact_pct(notional_usd, min_liquidity_usd)
+    slippage_buffer_usd = notional_usd * max(DEFAULT_SLIPPAGE_BUFFER_PCT, amm_impact_pct) / 100
+    premium_usd = notional_usd * AAVE_V3_FLASHLOAN_PREMIUM_PCT / 100
+    return gross_profit_usd - fees_usd - slippage_buffer_usd - premium_usd
+
+
+def _optimal_flashloan_notional_usd(upper_bound_usd: float, profit_before_gas_fn) -> float:
+    """Trouve, par recherche ternaire, le notionnel dans `[0, upper_bound_usd]`
+    qui MAXIMISE `profit_before_gas_fn(notional_usd)`.
+
+    Remplace l'ancien dimensionnement figé (toujours `min(flashloan_notional_usd,
+    plafond de liquidité)`, qui gaspillait du profit sur les opportunités où ce
+    montant fixe était trop PRUDENT, et en perdait trop sur celles où il était
+    trop AGRESSIF vis-à-vis de la liquidité réelle du pool). `profit_before_gas_fn`
+    est CONCAVE en `notional_usd` ici (gain brut/frais/prime linéaires, slippage
+    AMM `x*y=k` convexe — voir `_pair_profit_before_gas_usd`/
+    `_triangular_profit_before_gas_usd`), ce qui garantit la convergence de la
+    recherche ternaire vers le maximum global en quelques dizaines d'itérations,
+    sans dérivée à calculer analytiquement."""
+    if upper_bound_usd <= 0:
+        return 0.0
+    lo, hi = 0.0, upper_bound_usd
+    for _ in range(50):
+        m1 = lo + (hi - lo) / 3
+        m2 = hi - (hi - lo) / 3
+        if profit_before_gas_fn(m1) < profit_before_gas_fn(m2):
+            lo = m1
+        else:
+            hi = m2
+    return (lo + hi) / 2
+
+
 def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) -> dict:
     """Exécute un signal 'pair' (`app.trading.arbitrage`) en UNE SEULE
     transaction financée par flashloan Aave V3, au lieu du round-trip
@@ -276,13 +330,13 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
             result["error"] = f"Prix USD de {signal['quote_symbol']} indisponible — refus par prudence."
             return result
 
-        # Dimensionnement : notionnel emprunté, INDÉPENDANT du solde réel du
-        # wallet, borné par la liquidité des deux pools (même garde-fou que
-        # la détection classique, voir `liquidity_safety_fraction`).
+        # Dimensionnement : plafond du notionnel emprunté, INDÉPENDANT du solde
+        # réel du wallet, borné par la liquidité des deux pools (même
+        # garde-fou que la détection classique, voir `liquidity_safety_fraction`).
         safety_fraction = flashloan_liquidity_safety_fraction(config)
         min_liquidity_usd = min(signal["buy_liquidity_usd"], signal["sell_liquidity_usd"])
-        notional_usd = min(flashloan_notional_usd(config), safety_fraction * min_liquidity_usd)
-        if notional_usd <= 0:
+        upper_bound_usd = min(flashloan_notional_usd(config), safety_fraction * min_liquidity_usd)
+        if upper_bound_usd <= 0:
             result["error"] = "Liquidité de pool insuffisante pour un notionnel flashloan positif — refus."
             return result
 
@@ -295,17 +349,19 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
             return result
         fresh_spread_pct = (fresh_sell_price - fresh_buy_price) / fresh_buy_price * 100 if fresh_buy_price else 0.0
 
-        gross_profit_usd = notional_usd * fresh_spread_pct / 100
-        fees_usd = notional_usd * (dex_fee_pct(signal["buy_dex"]) + dex_fee_pct(signal["sell_dex"])) / 100
-        amm_impact_pct = _amm_price_impact_pct(notional_usd, signal["buy_liquidity_usd"]) + _amm_price_impact_pct(
-            notional_usd, signal["sell_liquidity_usd"]
+        # Notionnel optimisé (recherche ternaire) sur le spread FRAÎCHEMENT
+        # revalidé, pas sur celui du scan — maximise le profit réel attendu
+        # au lieu d'un montant figé en config (voir `_optimal_flashloan_notional_usd`).
+        profit_fn = lambda n: _pair_profit_before_gas_usd(  # noqa: E731
+            n, spread_pct=fresh_spread_pct, buy_dex=signal["buy_dex"], sell_dex=signal["sell_dex"],
+            buy_liquidity_usd=signal["buy_liquidity_usd"], sell_liquidity_usd=signal["sell_liquidity_usd"],
         )
-        slippage_buffer_usd = notional_usd * max(DEFAULT_SLIPPAGE_BUFFER_PCT, amm_impact_pct) / 100
+        notional_usd = _optimal_flashloan_notional_usd(upper_bound_usd, profit_fn)
         premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_PAIR)
         if gas_cost_usd is None:
             result["error"] = "Coût de gas Base indisponible — refus par prudence."
             return result
-        net_profit_usd = gross_profit_usd - fees_usd - slippage_buffer_usd - premium_usd - gas_cost_usd
+        net_profit_usd = profit_fn(notional_usd) - gas_cost_usd
         min_required_usd = flashloan_min_net_profit_usd(config)
         if net_profit_usd < min_required_usd:
             result["error"] = (
@@ -409,8 +465,8 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
             return result
 
         safety_fraction = flashloan_liquidity_safety_fraction(config)
-        notional_usd = min(flashloan_notional_usd(config), safety_fraction * signal["min_liquidity_usd"])
-        if notional_usd <= 0:
+        upper_bound_usd = min(flashloan_notional_usd(config), safety_fraction * signal["min_liquidity_usd"])
+        if upper_bound_usd <= 0:
             result["error"] = "Liquidité de pool insuffisante pour un notionnel flashloan positif — refus."
             return result
 
@@ -419,18 +475,19 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
         # sur un même DEX : pas de "prix frais" simple à revérifier ici sans
         # reconstruire tout le scan triangulaire. Le floor on-chain `minProfit`
         # protège contre un écart refermé entre détection et exécution.
-        fee_pct_total = 3 * dex_fee_pct(signal["dex"])
-        gross_profit_usd = notional_usd * signal["spread_pct"] / 100
-        fees_usd = notional_usd * fee_pct_total / 100
-        amm_impact_pct = 3 * _amm_price_impact_pct(notional_usd, signal["min_liquidity_usd"])
-        slippage_buffer_usd = notional_usd * max(DEFAULT_SLIPPAGE_BUFFER_PCT, amm_impact_pct) / 100
+        # Notionnel optimisé par recherche ternaire (voir
+        # `_optimal_flashloan_notional_usd`) au lieu d'un montant figé en config.
+        profit_fn = lambda n: _triangular_profit_before_gas_usd(  # noqa: E731
+            n, spread_pct=signal["spread_pct"], dex=signal["dex"], min_liquidity_usd=signal["min_liquidity_usd"],
+        )
+        notional_usd = _optimal_flashloan_notional_usd(upper_bound_usd, profit_fn)
         premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(
             notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_TRIANGULAR
         )
         if gas_cost_usd is None:
             result["error"] = "Coût de gas Base indisponible — refus par prudence."
             return result
-        net_profit_usd = gross_profit_usd - fees_usd - slippage_buffer_usd - premium_usd - gas_cost_usd
+        net_profit_usd = profit_fn(notional_usd) - gas_cost_usd
         min_required_usd = flashloan_min_net_profit_usd(config)
         if net_profit_usd < min_required_usd:
             result["error"] = (

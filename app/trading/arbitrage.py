@@ -22,6 +22,7 @@ from itertools import combinations
 from app.database import Database
 from app.trading import dex_sources, fees
 from app.trading.flashloan import estimate_pair_signal_flashloan_preview
+from app.trading.pair_health import pair_health
 from app.wallet.pricing import get_price_usd
 
 logger = logging.getLogger(__name__)
@@ -254,10 +255,6 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
                 slippage_buffer_pct=fees.DEFAULT_SLIPPAGE_BUFFER_PCT,
                 gas_cost_usd=gas_cost_usd,
             )
-            would_execute = (
-                profit["net_profit_usd"] is not None
-                and profit["net_profit_usd"] >= max(min_net_profit_usd, trade_size_usd * min_net_profit_pct / 100)
-            )
 
             # Symboles indicatifs (le même token peut apparaître avec des libellés
             # légèrement différents selon la pool ; on prend le premier trouvé).
@@ -265,6 +262,24 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
                                  next((p["quote_symbol"] for p in pairs if p["quote_address"] == token_address), "?"))
             other_symbol = next((p["base_symbol"] for p in pairs if p["base_address"] == other_address),
                                  next((p["quote_symbol"] for p in pairs if p["quote_address"] == other_address), "?"))
+
+            # Historique d'exécution réelle de cette paire précise (buy_dex/sell_dex) :
+            # seuil de profit relevé si échecs récents fréquents, exclusion
+            # temporaire après une série d'échecs consécutifs — voir
+            # `app.trading.pair_health`.
+            health = pair_health(
+                db, config or {}, token_symbol=token_symbol,
+                buy_dex=spread["buy_dex"], sell_dex=spread["sell_dex"],
+            )
+            adaptive_min_net_profit_usd = min_net_profit_usd * health["threshold_multiplier"]
+            would_execute = (
+                not health["disabled"]
+                and profit["net_profit_usd"] is not None
+                and profit["net_profit_usd"]
+                >= max(adaptive_min_net_profit_usd, trade_size_usd * min_net_profit_pct / 100)
+            )
+            if health["disabled"]:
+                logger.info("Arbitrage scan : %s", health["disabled_reason"])
 
             signal = {
                 "chain": chain_id,

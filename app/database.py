@@ -103,6 +103,32 @@ CREATE TABLE IF NOT EXISTS triangular_signals (
 
 CREATE INDEX IF NOT EXISTS idx_triangular_detected ON triangular_signals(detected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_triangular_would_execute ON triangular_signals(would_execute);
+
+-- Cycles triangulaires détectés à CHEVAL sur plusieurs DEX (chaque jambe
+-- potentiellement sur un DEX différent, voir app.trading.triangular.
+-- run_cross_dex_triangular_scan) : purement INFORMATIONNEL, jamais exécuté
+-- automatiquement (`would_execute` toujours 0) car aucune exécution atomique
+-- en une seule transaction n'est possible sans redéployer FlashArbitrage.sol
+-- pour router vers 3 DEX distincts dans la même tx.
+CREATE TABLE IF NOT EXISTS cross_dex_triangular_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    detected_at REAL DEFAULT (strftime('%s','now')),
+    chain TEXT NOT NULL,
+    token_a_symbol TEXT NOT NULL,
+    token_a_address TEXT NOT NULL,
+    token_b_symbol TEXT NOT NULL,
+    token_b_address TEXT NOT NULL,
+    token_c_symbol TEXT NOT NULL,
+    token_c_address TEXT NOT NULL,
+    dex_ab TEXT NOT NULL,
+    dex_bc TEXT NOT NULL,
+    dex_ca TEXT NOT NULL,
+    cycle_multiplier REAL NOT NULL,
+    spread_pct REAL NOT NULL,
+    min_liquidity_usd REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cross_dex_triangular_detected ON cross_dex_triangular_signals(detected_at DESC);
 """
 
 
@@ -235,6 +261,19 @@ class Database:
         query += " ORDER BY detected_at DESC LIMIT ?"
         return self.fetch_all(query, (limit,))
 
+    def pair_execution_history(self, *, token_symbol: str, buy_dex: str, sell_dex: str,
+                                limit: int = 20) -> list[dict[str, Any]]:
+        """Historique récent (le plus récent en premier) des tentatives
+        d'exécution RÉELLES (`executed = 1`) pour une paire buy/sell donnée —
+        utilisé par `app.trading.pair_health` pour le seuil de profit adaptatif
+        et la désactivation automatique après échecs consécutifs."""
+        return self.fetch_all(
+            "SELECT detected_at, tx_hash_sell, execution_error FROM arbitrage_signals "
+            "WHERE executed = 1 AND token_symbol = ? AND buy_dex = ? AND sell_dex = ? "
+            "ORDER BY detected_at DESC, id DESC LIMIT ?",
+            (token_symbol, buy_dex, sell_dex, limit),
+        )
+
     def mark_arbitrage_signal_executed(self, signal_id: int, *, tx_hash_buy: str | None = None,
                                         tx_hash_sell: str | None = None,
                                         execution_error: str | None = None) -> None:
@@ -247,6 +286,7 @@ class Database:
             "execution_error = ?, mode = 'live' WHERE id = ?",
             (tx_hash_buy, tx_hash_sell, execution_error, signal_id),
         )
+
 
     def list_open_positions(self) -> list[dict[str, Any]]:
         """Round-trips dont la jambe d'achat a été confirmée on-chain (tx_hash_buy
@@ -335,6 +375,44 @@ class Database:
             query += " WHERE would_execute = 1"
         query += " ORDER BY detected_at DESC LIMIT ?"
         return self.fetch_all(query, (limit,))
+
+    def add_cross_dex_triangular_signal(self, signal: dict[str, Any]) -> int:
+        """Journalise un cycle triangulaire détecté à cheval sur plusieurs DEX —
+        voir `app.trading.triangular.run_cross_dex_triangular_scan`. Purement
+        informationnel (pas de colonnes would_execute/executed : jamais
+        exécuté automatiquement, voir docstring du schéma)."""
+        return self.execute(
+            "INSERT INTO cross_dex_triangular_signals ("
+            "chain, token_a_symbol, token_a_address, token_b_symbol, token_b_address, "
+            "token_c_symbol, token_c_address, dex_ab, dex_bc, dex_ca, "
+            "cycle_multiplier, spread_pct, min_liquidity_usd"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                signal["chain"],
+                signal["token_a_symbol"], signal["token_a_address"],
+                signal["token_b_symbol"], signal["token_b_address"],
+                signal["token_c_symbol"], signal["token_c_address"],
+                signal["dex_ab"], signal["dex_bc"], signal["dex_ca"],
+                signal["cycle_multiplier"], signal["spread_pct"], signal.get("min_liquidity_usd"),
+            ),
+        )
+
+    def list_cross_dex_triangular_signals(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self.fetch_all(
+            "SELECT * FROM cross_dex_triangular_signals ORDER BY detected_at DESC LIMIT ?",
+            (limit,),
+        )
+
+    def triangular_execution_history(self, *, dex: str, token_a_symbol: str, token_b_symbol: str,
+                                      token_c_symbol: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Équivalent triangulaire de `pair_execution_history`, voir
+        `app.trading.pair_health`."""
+        return self.fetch_all(
+            "SELECT detected_at, tx_hash, execution_error FROM triangular_signals "
+            "WHERE executed = 1 AND dex = ? AND token_a_symbol = ? AND token_b_symbol = ? AND token_c_symbol = ? "
+            "ORDER BY detected_at DESC, id DESC LIMIT ?",
+            (dex, token_a_symbol, token_b_symbol, token_c_symbol, limit),
+        )
 
     def mark_triangular_signal_executed(self, signal_id: int, *, tx_hash: str | None = None,
                                          execution_error: str | None = None) -> None:

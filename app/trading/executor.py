@@ -55,7 +55,10 @@ from app.trading.routers import (
     ERC20_ABI,
     EXECUTABLE_DEXES,
     ROUTER_ADDRESSES,
+    UNISWAP_V2_FACTORY_ABI,
+    UNISWAP_V2_PAIR_ABI,
     UNISWAP_V2_ROUTER_ABI,
+    UNISWAP_V2_ROUTER_FACTORY_ABI,
     UNISWAP_V3_FACTORY_ABI,
     UNISWAP_V3_FACTORY_ADDRESS,
     UNISWAP_V3_FEE_TIERS,
@@ -70,6 +73,11 @@ logger = logging.getLogger("app.trading.executor")
 USDC_ADDRESS = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 WETH_ADDRESS = "0x4200000000000000000000000000000000000006"
 EXECUTABLE_QUOTE_TOKENS = frozenset({USDC_ADDRESS, WETH_ADDRESS})
+
+# Forks UniswapV2 classiques (ABI `swapExactTokensForTokens` standard,
+# `factory()`/`getPair()` pour résoudre la pool unique) — voir `_build_swap_call`
+# et `_onchain_pool_price_usd` ci-dessous.
+UNISWAP_V2_FORK_DEXES = frozenset({"sushiswap", "pancakeswap", "baseswap", "alien-base", "swapbased"})
 
 # Pour convertir le solde réel de chaque quote token en $ (dimensionnement
 # dynamique des trades) : None = stablecoin (1 unité ≈ 1 $), sinon l'id
@@ -230,7 +238,7 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
 
     # sushiswap / pancakeswap / baseswap / alien-base / swapbased : ABI UniswapV2Router02
     # standard, chemin direct token_in->token_out (tous forks V2 classiques).
-    if dex in ("sushiswap", "pancakeswap", "baseswap", "alien-base", "swapbased"):
+    if dex in UNISWAP_V2_FORK_DEXES:
         path = [token_in_cs, token_out_cs]
         return router_address, UNISWAP_V2_ROUTER_ABI, "swapExactTokensForTokens", (
             amount_in, min_amount_out, path, recipient_cs, deadline,
@@ -422,17 +430,22 @@ def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) ->
     """Lit le prix de `token_address` (exprimé en `quote_address` puis converti
     en $) DIRECTEMENT depuis le pool on-chain réellement utilisé par
     `_build_swap_call` pour `dex` — lecture seule (aucune transaction), aucun
-    risque. Supporté uniquement pour "aerodrome" et "uniswap" : ce sont les
-    deux DEX pour lesquels DexScreener a démontré exposer plusieurs pools
-    distincts sous le même dex_id (stable/volatile pour Aerodrome, plusieurs
-    fee tiers pour Uniswap v3) — voir le fix `InsufficientOutputAmount`. Pour
-    les forks V2 classiques (une seule pool canonique par paire par factory),
-    la revérification DexScreener de `_refresh_price_usd` suffit déjà.
+    risque. Supporté pour "aerodrome", "uniswap" (V3) ET tous les forks V2
+    classiques (`UNISWAP_V2_FORK_DEXES`) depuis le 2026-10-08.
+
+    Pour aerodrome/uniswap, ce sont les deux DEX pour lesquels DexScreener a
+    démontré exposer plusieurs pools distincts sous le même dex_id
+    (stable/volatile pour Aerodrome, plusieurs fee tiers pour Uniswap v3) — voir
+    le fix `InsufficientOutputAmount`. Pour les forks V2 classiques, une seule
+    pool canonique existe par paire/factory (pas d'ambiguïté), mais la lire
+    directement reste plus FRAÎCHE qu'une revérification DexScreener (cache de
+    quelques secondes à quelques minutes côté DexScreener) — gain de précision
+    sur la revalidation de prix juste avant l'envoi d'une transaction.
 
     Retourne None si le DEX n'est pas supporté ici, ou si la lecture échoue
     pour n'importe quelle raison (RPC injoignable, pool inexistante...) — dans
     ce cas l'appelant retombe sur DexScreener plutôt que d'échouer."""
-    if dex not in ("aerodrome", "uniswap"):
+    if dex not in UNISWAP_V2_FORK_DEXES and dex not in ("aerodrome", "uniswap"):
         return None
     try:
         from web3 import Web3
@@ -461,6 +474,27 @@ def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) ->
             token_is_token0 = token0.lower() == token_cs.lower()
             if token_is_token0:
                 # prix de token0 (notre token) exprimé en token1 (quote), ajusté décimales
+                price_in_quote = (reserve1 / (10 ** decimals_quote)) / (reserve0 / (10 ** decimals_token))
+            else:
+                price_in_quote = (reserve0 / (10 ** decimals_quote)) / (reserve1 / (10 ** decimals_token))
+        elif dex in UNISWAP_V2_FORK_DEXES:
+            router = w3.eth.contract(
+                address=Web3.to_checksum_address(ROUTER_ADDRESSES[dex]), abi=UNISWAP_V2_ROUTER_FACTORY_ABI
+            )
+            factory_address = router.functions.factory().call()
+            factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=UNISWAP_V2_FACTORY_ABI)
+            pool_address = factory.functions.getPair(token_cs, quote_cs).call()
+            if int(pool_address, 16) == 0:
+                return None
+            pool = w3.eth.contract(address=Web3.to_checksum_address(pool_address), abi=UNISWAP_V2_PAIR_ABI)
+            token0 = pool.functions.token0().call()
+            reserve0, reserve1, _ = pool.functions.getReserves().call()
+            if reserve0 == 0 or reserve1 == 0:
+                return None
+            decimals_token = _get_decimals(w3, token_address)
+            decimals_quote = _get_decimals(w3, quote_address)
+            token_is_token0 = token0.lower() == token_cs.lower()
+            if token_is_token0:
                 price_in_quote = (reserve1 / (10 ** decimals_quote)) / (reserve0 / (10 ** decimals_token))
             else:
                 price_in_quote = (reserve0 / (10 ** decimals_quote)) / (reserve1 / (10 ** decimals_token))

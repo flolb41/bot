@@ -189,3 +189,32 @@ UNISWAP_V3_POOL_ABI = [
         {"name": "unlocked", "type": "bool"},
      ], "stateMutability": "view", "type": "function"},
 ]
+
+# ABIs minimales (lecture seule) pour les forks UniswapV2 classiques
+# (sushiswap/pancakeswap/baseswap/alien-base/swapbased) : chaque routeur V2
+# expose `factory()`, et la factory expose `getPair(tokenA, tokenB)` ->
+# adresse de LA pool canonique unique pour cette paire sur ce DEX (contrairement
+# à Aerodrome/Uniswap V3, un fork V2 classique n'a qu'UNE seule pool possible
+# par paire, d'où l'ancienne restriction de `_onchain_pool_price_usd` à
+# aerodrome/uniswap — mais lire cette pool unique directement reste plus frais
+# qu'une revérification DexScreener, d'où cette extension).
+UNISWAP_V2_ROUTER_FACTORY_ABI = [
+    {"inputs": [], "name": "factory", "outputs": [{"name": "", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
+]
+
+UNISWAP_V2_FACTORY_ABI = [
+    {"inputs": [{"name": "tokenA", "type": "address"}, {"name": "tokenB", "type": "address"}],
+     "name": "getPair", "outputs": [{"name": "pair", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
+]
+
+UNISWAP_V2_PAIR_ABI = [
+    {"inputs": [], "name": "token0", "outputs": [{"name": "", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "getReserves", "outputs": [
+        {"name": "_reserve0", "type": "uint112"},
+        {"name": "_reserve1", "type": "uint112"},
+        {"name": "_blockTimestampLast", "type": "uint32"},
+     ], "stateMutability": "view", "type": "function"},
+]

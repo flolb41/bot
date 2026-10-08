@@ -13,7 +13,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from app.database import Database
 from app.killswitch import is_stopped
 from app.trading.arbitrage import run_arbitrage_scan
-from app.trading.triangular import run_triangular_scan
+from app.trading.triangular import run_cross_dex_triangular_scan, run_triangular_scan
 
 logger = logging.getLogger("app.scheduler")
 
@@ -143,6 +143,17 @@ def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = No
         for s in triangular_signals:
             s["kind"] = "triangular"
         signals = pair_signals + triangular_signals
+
+        # Scan cross-DEX informationnel (voir
+        # `app.trading.triangular.run_cross_dex_triangular_scan`) : jamais
+        # exécutable, jamais inclus dans `signals`/`profitable` ci-dessous —
+        # journalisé en base uniquement pour inspection manuelle. Isolé dans
+        # son propre try/except pour qu'une erreur ici ne puisse jamais
+        # empêcher le scan/l'exécution réels de tourner.
+        try:
+            run_cross_dex_triangular_scan(db, config)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Cross-DEX triangular scan (informationnel) en échec : %s", exc)
         all_signals.extend(signals)
         # Toujours le plus rentable d'abord (net_profit_usd décroissant), tous
         # types confondus — pas l'ordre de détection, qui dépend juste de
