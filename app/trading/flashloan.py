@@ -46,11 +46,13 @@ from app.trading.executor import (
     _get_decimals,
     _quote_token_usd_price,
     _refresh_price_usd,
+    _resolve_aerodrome_route,
+    _resolve_pancakeswap_route,
     _resolve_rpc_url,
 )
 from app.trading.fees import DEFAULT_SLIPPAGE_BUFFER_PCT, dex_fee_pct, estimate_gas_cost_usd
 from app.trading.guardrails import TradingRefused, is_trading_live, send_trading_transaction
-from app.trading.routers import AERODROME_ROUTER_ABI, EXECUTABLE_DEXES, FLASH_ARBITRAGE_ADDRESS, ROUTER_ADDRESSES
+from app.trading.routers import EXECUTABLE_DEXES, FLASH_ARBITRAGE_ADDRESS, ROUTER_ADDRESSES
 
 logger = logging.getLogger("app.trading.flashloan")
 
@@ -184,12 +186,20 @@ def _build_leg(dex: str, w3, *, token_in: str, token_out: str) -> tuple:
     """Construit une jambe `(kind, router, tokenIn, tokenOut, aerodromeStable,
     aerodromeFactory, fee)` — ordre EXACT de la struct `FlashArbitrage.Leg`
     (voir contracts/FlashArbitrage.sol). `kind=0` pour un fork UniswapV2
-    classique, `kind=1` pour Aerodrome (nécessite sa `defaultFactory`
-    on-chain, même lecture que `executor._build_triangular_swap_call`),
-    `kind=2` pour Uniswap V3 single-hop (SwapRouter02 `exactInputSingle` —
-    nécessite le fee tier de la pool concernée, résolu on-chain via
-    `executor._find_uniswap_v3_fee_tier`, même logique que l'exécution
-    classique `_build_swap_call`)."""
+    classique, `kind=1` pour Aerodrome classique (nécessite sa
+    `defaultFactory` on-chain), `kind=2` pour Uniswap V3 OU PancakeSwap V3
+    single-hop (`exactInputSingle`, ABI identique — nécessite le fee tier de
+    la pool concernée), `kind=3` pour Aerodrome Slipstream single-hop
+    (`exactInputSingle` avec `tickSpacing` au lieu de `fee`, voir
+    `contracts/FlashArbitrage.sol::ISlipstreamSwapRouter` — le champ `fee`
+    (uint24) de la struct Leg est réutilisé pour stocker le tickSpacing,
+    toujours positif et petit, aucun changement de struct nécessaire).
+
+    Pour "aerodrome"/"pancakeswap", le kind/router/fee sont déterminés par
+    `executor._resolve_aerodrome_route`/`_resolve_pancakeswap_route` — LES
+    MÊMES fonctions que celles utilisées par `executor._build_swap_call` et
+    `_onchain_pool_price_usd`, pour rester cohérent sur la pool réellement
+    routée (classique vs concentrated-liquidity)."""
     from web3 import Web3
 
     if dex not in FLASHLOAN_CAPABLE_DEXES or dex not in EXECUTABLE_DEXES:
@@ -198,9 +208,21 @@ def _build_leg(dex: str, w3, *, token_in: str, token_out: str) -> tuple:
     token_in_cs = Web3.to_checksum_address(token_in)
     token_out_cs = Web3.to_checksum_address(token_out)
     if dex == "aerodrome":
-        router = w3.eth.contract(address=router_cs, abi=AERODROME_ROUTER_ABI)
-        default_factory = router.functions.defaultFactory().call()
-        return (1, router_cs, token_in_cs, token_out_cs, False, default_factory, 0)
+        route = _resolve_aerodrome_route(w3, token_in, token_out)
+        if route is None:
+            raise TradingRefused(f"Aucune pool Aerodrome (classique ou Slipstream) trouvée pour {token_in}/{token_out}.")
+        if route["is_slipstream"]:
+            router_v3 = Web3.to_checksum_address(route["router"])
+            return (3, router_v3, token_in_cs, token_out_cs, False, _ZERO_ADDRESS, route["tick_spacing"])
+        return (1, router_cs, token_in_cs, token_out_cs, False, route["default_factory"], 0)
+    if dex == "pancakeswap":
+        route = _resolve_pancakeswap_route(w3, token_in, token_out)
+        if route is None:
+            raise TradingRefused(f"Aucune pool PancakeSwap (v2 ou v3) trouvée pour {token_in}/{token_out}.")
+        if route["is_v3"]:
+            router_v3 = Web3.to_checksum_address(route["router"])
+            return (2, router_v3, token_in_cs, token_out_cs, False, _ZERO_ADDRESS, route["fee"])
+        return (0, router_cs, token_in_cs, token_out_cs, False, _ZERO_ADDRESS, 0)
     if dex == "uniswap":
         fee_tier = _find_uniswap_v3_fee_tier(w3, token_in, token_out)
         return (2, router_cs, token_in_cs, token_out_cs, False, _ZERO_ADDRESS, fee_tier)

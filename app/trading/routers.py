@@ -28,6 +28,17 @@ concordantes :
 Ne JAMAIS ajouter une adresse ici sans la vérifier via au moins deux sources
 indépendantes (cf. pratique établie dans app/trading/arbitrage.py pour les
 seed_tokens) : une adresse de router erronée ferait perdre les fonds envoyés.
+
+PancakeSwap V3 (SwapRouter, ABI `IV3SwapRouter`, pas de `deadline`) et
+Aerodrome Slipstream (CL, 3 factories concurrentes) ajoutés le 2026-10-08 :
+adresses vérifiées via developer.pancakeswap.finance/contracts/v3/addresses
+(table officielle) + BaseScan (étiquette "PancakeSwap V3: Swap Router",
+1,7M+ tx) pour PancakeSwap, et github.com/aerodrome-finance/slipstream
+(README, table "Deployments") pour Aerodrome Slipstream — PAS exposés comme de
+nouveaux dex_id/EXECUTABLE_DEXES : `executor._onchain_pool_price_usd` et
+`_build_swap_call`/`flashloan._build_leg` choisissent dynamiquement, pour
+"aerodrome"/"pancakeswap", entre le pool classique et le(s) pool(s)
+V3/Slipstream selon la plus grande réserve on-chain (voir leurs docstrings).
 """
 from __future__ import annotations
 
@@ -59,6 +70,33 @@ ROUTER_ADDRESSES: dict[str, str] = {
 UNISWAP_V3_FACTORY_ADDRESS = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
 UNISWAP_V3_FEE_TIERS = (500, 3000, 10000, 100)  # ordre d'essai : les plus courants d'abord
 
+# PancakeSwap V3 (concentrated liquidity, même ABI que Uniswap V3 SwapRouter02
+# sans `deadline` -- interface officielle `IV3SwapRouter`, confirmée via
+# developer.pancakeswap.finance/contracts/v3/smartrouter/v3swaprouter +
+# raw.githubusercontent.com/Uniswap/swap-router-contracts (struct identique,
+# PancakeSwap documente explicitement une interface nommée pareil). Adresses
+# vérifiées sur developer.pancakeswap.finance/contracts/v3/addresses (table
+# officielle Base) ET recoupées sur BaseScan (étiquette "PancakeSwap V3: Swap
+# Router", 1,7M+ tx — PAS le "Smart Router" multi-protocole
+# 0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86, jamais utilisé ici, même principe
+# que le choix du Router v2 classique pour PancakeSwap v2 ci-dessus).
+PANCAKESWAP_V3_ROUTER_ADDRESS = "0x1b81D678ffb9C0263b24A97847620C99d213eB14"
+PANCAKESWAP_V3_FACTORY_ADDRESS = "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"
+PANCAKESWAP_V3_FEE_TIERS = (500, 2500, 100, 10000)  # confirmé on-chain : les 4 tiers ont une pool WETH/USDC
+
+# Aerodrome Slipstream (concentrated liquidity, fork de Uniswap V3) --
+# fragmenté en TROIS factories/routers concurrents et simultanément actifs
+# (voir github.com/aerodrome-finance/slipstream README, table "Deployments") :
+# aucun ne remplace les précédents, les pools existantes restent utilisables
+# sur chacun. `_best_aerodrome_slipstream_pool` (executor.py) les interroge
+# TOUTES et choisit la pool avec la plus grande réserve on-chain.
+AERODROME_SLIPSTREAM_FACTORIES: tuple[tuple[str, str, str], ...] = (
+    # (nom, PoolFactory, SwapRouter)
+    ("initial", "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A", "0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"),
+    ("gauge_caps", "0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a", "0xcbBb8035cAc7D4B3Ca7aBb74cF7BdF900215Ce0D"),
+    ("gauges_v3", "0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef", "0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F"),
+)
+
 # Contrat `FlashArbitrage` (arbitrage financé par flashloan Aave V3, voir
 # contracts/FlashArbitrage.sol et contracts/README.md) déployé RÉELLEMENT sur
 # Base mainnet. C'est la SEULE adresse, en dehors des routers DEX ci-dessus,
@@ -71,9 +109,14 @@ UNISWAP_V3_FEE_TIERS = (500, 3000, 10000, 100)  # ordre d'essai : les plus coura
 # v1 (2026-10-08, tx 0x9d91d458c69dd2e946c6d44c92ebb5fc7a3d4e04e2b57c435362e068aa1f7642) :
 #   0x73beAacEE6CD3Dc0cb4816Dd48cbdCEE45dcc1e8 — legs kind=0 (V2 fork) / kind=1
 #   (Aerodrome) uniquement, PLUS UTILISÉ.
-# v2 (déploiement courant, tx db08dc75f7ab042fd66cee7251e424899e1dbc275cf3a203da4e5c857be39964) :
-#   ajoute kind=2 (Uniswap V3 SwapRouter02, single-hop exactInputSingle).
-FLASH_ARBITRAGE_ADDRESS = "0x6991D2e6cDB057c50978a6111E31fd8f3c524727"
+# v2 (2026-10-08, tx db08dc75f7ab042fd66cee7251e424899e1dbc275cf3a203da4e5c857be39964) :
+#   0x6991D2e6cDB057c50978a6111E31fd8f3c524727 — ajoute kind=2 (Uniswap V3
+#   SwapRouter02, single-hop exactInputSingle), PLUS UTILISÉ.
+# v3 (déploiement courant, tx edb04cb5168b3c552158efe56255c6909cca15593e854adc1835996bb98af86d) :
+#   ajoute kind=3 (Aerodrome Slipstream, single-hop exactInputSingle avec
+#   tickSpacing) ; kind=2 est aussi réutilisé pour PancakeSwap V3 (même ABI
+#   SwapRouter02, aucun changement Solidity nécessaire pour ce DEX).
+FLASH_ARBITRAGE_ADDRESS = "0x8B1815a311B580AdD95d00B23B6A90bd7eE777aD"
 FLASHLOAN_CONTRACT_ADDRESSES = frozenset({FLASH_ARBITRAGE_ADDRESS})
 
 ERC20_ABI = [
@@ -222,4 +265,73 @@ UNISWAP_V2_PAIR_ABI = [
         {"name": "_reserve1", "type": "uint112"},
         {"name": "_blockTimestampLast", "type": "uint32"},
      ], "stateMutability": "view", "type": "function"},
+]
+
+# Factory générique "Uniswap-V3-style" : même signature `getPool(tokenA,
+# tokenB, fee)` pour Uniswap V3 ET PancakeSwap V3 (fork quasi-identique) —
+# réutilisée par `executor._best_v3_style_pool` pour PancakeSwap V3 (Uniswap
+# V3 garde sa logique historique inchangée via `_find_uniswap_v3_fee_tier`,
+# voir son docstring).
+PANCAKESWAP_V3_FACTORY_ABI = UNISWAP_V3_FACTORY_ABI
+
+# Pool Uniswap-V3-style générique (même shape que UNISWAP_V3_POOL_ABI, utilisée
+# aussi pour PancakeSwap V3 — fork quasi-identique).
+PANCAKESWAP_V3_POOL_ABI = UNISWAP_V3_POOL_ABI
+
+PANCAKESWAP_V3_ROUTER_ABI = UNISWAP_V3_ROUTER_ABI
+
+# Aerodrome Slipstream (CL) : factory `getPool(tokenA, tokenB, tickSpacing)` +
+# `tickSpacings()` (liste des tick spacings activés, utilisée pour ne pas
+# deviner/fixer en dur une liste potentiellement incomplète), vérifiées via
+# github.com/aerodrome-finance/slipstream (ICLFactory.sol).
+AERODROME_SLIPSTREAM_FACTORY_ABI = [
+    {"inputs": [
+        {"name": "tokenA", "type": "address"}, {"name": "tokenB", "type": "address"},
+        {"name": "tickSpacing", "type": "int24"},
+     ], "name": "getPool", "outputs": [{"name": "pool", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "tickSpacings", "outputs": [{"name": "", "type": "int24[]"}],
+     "stateMutability": "view", "type": "function"},
+]
+
+# Pool Slipstream (CL) : `slot0()` a une shape différente de Uniswap V3 (pas de
+# `feeProtocol` final, mais ça ne change rien pour nous : seul `sqrtPriceX96`,
+# premier élément, est utilisé) — vérifiée via ICLPoolState.sol.
+AERODROME_SLIPSTREAM_POOL_ABI = [
+    {"inputs": [], "name": "token0", "outputs": [{"name": "", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "slot0", "outputs": [
+        {"name": "sqrtPriceX96", "type": "uint160"},
+        {"name": "tick", "type": "int24"},
+        {"name": "observationIndex", "type": "uint16"},
+        {"name": "observationCardinality", "type": "uint16"},
+        {"name": "observationCardinalityNext", "type": "uint16"},
+        {"name": "unlocked", "type": "bool"},
+     ], "stateMutability": "view", "type": "function"},
+]
+
+# Router Slipstream `ISwapRouter.ExactInputSingleParams` -- CONTRAIREMENT à
+# Uniswap V3 SwapRouter02/PancakeSwap V3 (pas de `deadline`), ce struct EN A
+# UN, et utilise `tickSpacing` (int24) au lieu de `fee` (uint24) -- vérifié via
+# github.com/aerodrome-finance/slipstream (periphery/interfaces/ISwapRouter.sol).
+# Voir kind=3 dans contracts/FlashArbitrage.sol (`ISlipstreamSwapRouter`).
+AERODROME_SLIPSTREAM_ROUTER_ABI = [
+    {
+        "inputs": [{
+            "components": [
+                {"name": "tokenIn", "type": "address"},
+                {"name": "tokenOut", "type": "address"},
+                {"name": "tickSpacing", "type": "int24"},
+                {"name": "recipient", "type": "address"},
+                {"name": "deadline", "type": "uint256"},
+                {"name": "amountIn", "type": "uint256"},
+                {"name": "amountOutMinimum", "type": "uint256"},
+                {"name": "sqrtPriceLimitX96", "type": "uint160"},
+            ],
+            "name": "params", "type": "tuple",
+        }],
+        "name": "exactInputSingle",
+        "outputs": [{"name": "amountOut", "type": "uint256"}],
+        "stateMutability": "payable", "type": "function",
+    },
 ]

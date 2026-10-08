@@ -52,8 +52,18 @@ from app.trading.guardrails import TradingRefused, is_trading_live, send_trading
 from app.trading.routers import (
     AERODROME_POOL_ABI,
     AERODROME_ROUTER_ABI,
+    AERODROME_SLIPSTREAM_FACTORIES,
+    AERODROME_SLIPSTREAM_FACTORY_ABI,
+    AERODROME_SLIPSTREAM_POOL_ABI,
+    AERODROME_SLIPSTREAM_ROUTER_ABI,
     ERC20_ABI,
     EXECUTABLE_DEXES,
+    PANCAKESWAP_V3_FACTORY_ABI,
+    PANCAKESWAP_V3_FACTORY_ADDRESS,
+    PANCAKESWAP_V3_FEE_TIERS,
+    PANCAKESWAP_V3_POOL_ABI,
+    PANCAKESWAP_V3_ROUTER_ABI,
+    PANCAKESWAP_V3_ROUTER_ADDRESS,
     ROUTER_ADDRESSES,
     UNISWAP_V2_FACTORY_ABI,
     UNISWAP_V2_PAIR_ABI,
@@ -211,6 +221,199 @@ def _find_uniswap_v3_fee_tier(w3, token_in: str, token_out: str) -> int:
     )
 
 
+def _quote_reserve_in_pool(w3, pool_address: str, quote_address: str) -> int | None:
+    """Solde de `quote_address` détenu par `pool_address` -- métrique de
+    liquidité comparable directement entre pools de TYPES différents (AMM
+    classique vs concentrated-liquidity) pour un même `quote_address` : pas
+    besoin de connaître le prix, juste une mesure RELATIVE pour choisir la
+    pool la plus profonde. Retourne None si la lecture échoue."""
+    from web3 import Web3
+    try:
+        token = w3.eth.contract(address=Web3.to_checksum_address(quote_address), abi=ERC20_ABI)
+        return int(token.functions.balanceOf(Web3.to_checksum_address(pool_address)).call())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _best_v3_style_pool(w3, factory_address: str, factory_abi: list[dict], fee_tiers: tuple[int, ...],
+                         token_address: str, quote_address: str) -> tuple[int, str] | None:
+    """Cherche, parmi `fee_tiers`, la pool Uniswap-V3-style (`getPool(tokenA,
+    tokenB, fee)`) avec la plus grande réserve de `quote_address` -- réutilisée
+    pour PancakeSwap V3 (voir `_best_pancakeswap_v3_pool`). Uniswap V3 garde sa
+    propre logique historique inchangée (`_find_uniswap_v3_fee_tier`, choisit
+    le premier fee tier existant plutôt que le plus liquide -- comportement
+    éprouvé en production, volontairement non modifié ici). Retourne
+    (fee_tier, pool_address) ou None si aucune pool n'existe."""
+    from web3 import Web3
+    factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=factory_abi)
+    token_cs = Web3.to_checksum_address(token_address)
+    quote_cs = Web3.to_checksum_address(quote_address)
+    best: tuple[int, str] | None = None
+    best_reserve = -1
+    for fee_tier in fee_tiers:
+        try:
+            pool_address = factory.functions.getPool(token_cs, quote_cs, fee_tier).call()
+        except Exception:  # noqa: BLE001
+            continue
+        if int(pool_address, 16) == 0:
+            continue
+        reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
+        if reserve is None or reserve <= best_reserve:
+            continue
+        best_reserve = reserve
+        best = (fee_tier, pool_address)
+    return best
+
+
+def _best_pancakeswap_v3_pool(w3, token_address: str, quote_address: str) -> tuple[int, str] | None:
+    """Meilleure pool PancakeSwap V3 (plus grande réserve de `quote_address`)
+    pour la paire donnée, toutes fee tiers confondues. Retourne
+    (fee_tier, pool_address) ou None si aucune pool n'existe."""
+    return _best_v3_style_pool(
+        w3, PANCAKESWAP_V3_FACTORY_ADDRESS, PANCAKESWAP_V3_FACTORY_ABI, PANCAKESWAP_V3_FEE_TIERS,
+        token_address, quote_address,
+    )
+
+
+def _best_aerodrome_slipstream_pool(w3, token_address: str, quote_address: str) -> tuple[str, int, str] | None:
+    """Meilleure pool Aerodrome Slipstream (concentrated liquidity) pour la
+    paire donnée, à travers les TROIS générations de factories concurrentes et
+    simultanément actives (voir `routers.AERODROME_SLIPSTREAM_FACTORIES`) et
+    tous leurs tick spacings activés (`tickSpacings()`, lu dynamiquement --
+    PAS codé en dur, car potentiellement incomplet/évolutif). Choisie par plus
+    grande réserve on-chain de `quote_address`. Retourne
+    (router_address, tick_spacing, pool_address) ou None si aucune pool
+    n'existe sur aucune des 3 factories."""
+    from web3 import Web3
+    token_cs = Web3.to_checksum_address(token_address)
+    quote_cs = Web3.to_checksum_address(quote_address)
+    best: tuple[str, int, str] | None = None
+    best_reserve = -1
+    for _name, factory_address, router_address in AERODROME_SLIPSTREAM_FACTORIES:
+        try:
+            factory = w3.eth.contract(
+                address=Web3.to_checksum_address(factory_address), abi=AERODROME_SLIPSTREAM_FACTORY_ABI
+            )
+            tick_spacings = factory.functions.tickSpacings().call()
+        except Exception:  # noqa: BLE001
+            continue
+        for tick_spacing in tick_spacings:
+            try:
+                pool_address = factory.functions.getPool(token_cs, quote_cs, tick_spacing).call()
+            except Exception:  # noqa: BLE001
+                continue
+            if int(pool_address, 16) == 0:
+                continue
+            reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
+            if reserve is None or reserve <= best_reserve:
+                continue
+            best_reserve = reserve
+            best = (router_address, tick_spacing, pool_address)
+    return best
+
+
+def _resolve_aerodrome_route(w3, token_in: str, token_out: str) -> dict | None:
+    """Choisit, pour une jambe Aerodrome token_in<->token_out, entre le pool
+    classique (stable=False, `defaultFactory`) et la meilleure pool Slipstream
+    (`_best_aerodrome_slipstream_pool`, toutes factories/tick spacings
+    confondues) -- comparaison par plus grande réserve on-chain du quote token
+    (`EXECUTABLE_QUOTE_TOKENS` garantit que token_in OU token_out en est
+    toujours un). Utilisé À LA FOIS par `_build_swap_call`/`_build_leg`
+    (construction de l'appel réel) ET `_onchain_pool_price_usd` (revérification
+    de prix) — les deux doivent appeler EXACTEMENT cette fonction pour rester
+    cohérents sur la pool choisie. Retourne un dict (`is_slipstream`, `router`,
+    `pool`, + `default_factory` ou `tick_spacing` selon le cas), ou `None` si
+    aucune pool n'existe nulle part pour cette paire."""
+    from web3 import Web3
+    token_in_cs = Web3.to_checksum_address(token_in)
+    token_out_cs = Web3.to_checksum_address(token_out)
+    if token_in.lower() in EXECUTABLE_QUOTE_TOKENS:
+        quote_address, other_token = token_in, token_out
+    else:
+        quote_address, other_token = token_out, token_in
+
+    classic_pool = None
+    default_factory = None
+    classic_reserve = -1
+    try:
+        classic_router = w3.eth.contract(
+            address=Web3.to_checksum_address(ROUTER_ADDRESSES["aerodrome"]), abi=AERODROME_ROUTER_ABI
+        )
+        default_factory = classic_router.functions.defaultFactory().call()
+        pool_address = classic_router.functions.poolFor(token_in_cs, token_out_cs, False, default_factory).call()
+        if int(pool_address, 16) != 0:
+            reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
+            if reserve is not None:
+                classic_pool, classic_reserve = pool_address, reserve
+    except Exception:  # noqa: BLE001
+        pass
+
+    slipstream = _best_aerodrome_slipstream_pool(w3, other_token, quote_address)
+    slipstream_reserve = -1
+    if slipstream is not None:
+        reserve = _quote_reserve_in_pool(w3, slipstream[2], quote_address)
+        if reserve is not None:
+            slipstream_reserve = reserve
+        else:
+            slipstream = None
+
+    if slipstream is not None and slipstream_reserve > classic_reserve:
+        router_address, tick_spacing, pool_address = slipstream
+        return {"is_slipstream": True, "router": router_address, "tick_spacing": tick_spacing, "pool": pool_address}
+    if classic_pool is not None:
+        return {
+            "is_slipstream": False, "router": ROUTER_ADDRESSES["aerodrome"],
+            "default_factory": default_factory, "pool": classic_pool,
+        }
+    return None
+
+
+def _resolve_pancakeswap_route(w3, token_in: str, token_out: str) -> dict | None:
+    """Même principe que `_resolve_aerodrome_route`, pour PancakeSwap v2
+    (classique) vs PancakeSwap V3 (`_best_pancakeswap_v3_pool`). Retourne un
+    dict (`is_v3`, `router`, `pool`, + `fee` si v3), ou `None` si aucune pool
+    n'existe nulle part pour cette paire."""
+    from web3 import Web3
+    token_in_cs = Web3.to_checksum_address(token_in)
+    token_out_cs = Web3.to_checksum_address(token_out)
+    if token_in.lower() in EXECUTABLE_QUOTE_TOKENS:
+        quote_address, other_token = token_in, token_out
+    else:
+        quote_address, other_token = token_out, token_in
+
+    classic_pool = None
+    classic_reserve = -1
+    try:
+        classic_router = w3.eth.contract(
+            address=Web3.to_checksum_address(ROUTER_ADDRESSES["pancakeswap"]), abi=UNISWAP_V2_ROUTER_FACTORY_ABI
+        )
+        factory_address = classic_router.functions.factory().call()
+        factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=UNISWAP_V2_FACTORY_ABI)
+        pool_address = factory.functions.getPair(token_in_cs, token_out_cs).call()
+        if int(pool_address, 16) != 0:
+            reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
+            if reserve is not None:
+                classic_pool, classic_reserve = pool_address, reserve
+    except Exception:  # noqa: BLE001
+        pass
+
+    v3 = _best_pancakeswap_v3_pool(w3, other_token, quote_address)
+    v3_reserve = -1
+    if v3 is not None:
+        reserve = _quote_reserve_in_pool(w3, v3[1], quote_address)
+        if reserve is not None:
+            v3_reserve = reserve
+        else:
+            v3 = None
+
+    if v3 is not None and v3_reserve > classic_reserve:
+        fee_tier, pool_address = v3
+        return {"is_v3": True, "router": PANCAKESWAP_V3_ROUTER_ADDRESS, "fee": fee_tier, "pool": pool_address}
+    if classic_pool is not None:
+        return {"is_v3": False, "router": ROUTER_ADDRESSES["pancakeswap"], "pool": classic_pool}
+    return None
+
+
 def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: int,
                       min_amount_out: int, recipient: str, deadline: int) -> tuple[str, list[dict], str, tuple]:
     """Construit (contract_address, abi, function_name, args) pour le DEX demandé.
@@ -229,15 +432,36 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
         return router_address, UNISWAP_V3_ROUTER_ABI, "exactInputSingle", (params,)
 
     if dex == "aerodrome":
-        router = w3.eth.contract(address=Web3.to_checksum_address(router_address), abi=AERODROME_ROUTER_ABI)
-        default_factory = router.functions.defaultFactory().call()
-        routes = [(token_in_cs, token_out_cs, False, default_factory)]
-        return router_address, AERODROME_ROUTER_ABI, "swapExactTokensForTokens", (
+        route = _resolve_aerodrome_route(w3, token_in, token_out)
+        if route is None:
+            raise TradingRefused(f"Aucune pool Aerodrome (classique ou Slipstream) trouvée pour {token_in}/{token_out}.")
+        if route["is_slipstream"]:
+            params = (
+                token_in_cs, token_out_cs, route["tick_spacing"], recipient_cs, deadline,
+                amount_in, min_amount_out, 0,
+            )
+            return route["router"], AERODROME_SLIPSTREAM_ROUTER_ABI, "exactInputSingle", (params,)
+        routes = [(token_in_cs, token_out_cs, False, route["default_factory"])]
+        return route["router"], AERODROME_ROUTER_ABI, "swapExactTokensForTokens", (
             amount_in, min_amount_out, routes, recipient_cs, deadline,
         )
 
-    # sushiswap / pancakeswap / baseswap / alien-base / swapbased : ABI UniswapV2Router02
-    # standard, chemin direct token_in->token_out (tous forks V2 classiques).
+    if dex == "pancakeswap":
+        route = _resolve_pancakeswap_route(w3, token_in, token_out)
+        if route is None:
+            raise TradingRefused(f"Aucune pool PancakeSwap (v2 ou v3) trouvée pour {token_in}/{token_out}.")
+        if route["is_v3"]:
+            params = (token_in_cs, token_out_cs, route["fee"], recipient_cs, amount_in, min_amount_out, 0)
+            return route["router"], PANCAKESWAP_V3_ROUTER_ABI, "exactInputSingle", (params,)
+        path = [token_in_cs, token_out_cs]
+        return route["router"], UNISWAP_V2_ROUTER_ABI, "swapExactTokensForTokens", (
+            amount_in, min_amount_out, path, recipient_cs, deadline,
+        )
+
+    # sushiswap / baseswap / alien-base / swapbased : ABI UniswapV2Router02
+    # standard, chemin direct token_in->token_out (tous forks V2 classiques ;
+    # pancakeswap géré au-dessus, bien qu'également membre de
+    # UNISWAP_V2_FORK_DEXES pour les autres usages de cette constante).
     if dex in UNISWAP_V2_FORK_DEXES:
         path = [token_in_cs, token_out_cs]
         return router_address, UNISWAP_V2_ROUTER_ABI, "swapExactTokensForTokens", (
@@ -442,6 +666,16 @@ def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) ->
     quelques secondes à quelques minutes côté DexScreener) — gain de précision
     sur la revalidation de prix juste avant l'envoi d'une transaction.
 
+    Depuis le 2026-10-08 également : "aerodrome" et "pancakeswap" choisissent
+    dynamiquement entre leur pool classique (AMM) et leur(s) pool(s)
+    concentrated-liquidity (Aerodrome Slipstream / PancakeSwap V3) — même
+    ambiguïté DexScreener que ci-dessus, mais DexScreener n'expose ICI aucun
+    `labels` permettant de distinguer les deux versions (vérifié
+    empiriquement) ; `_resolve_aerodrome_route`/`_resolve_pancakeswap_route`
+    choisissent par plus grande réserve on-chain, et DOIVENT être les mêmes
+    fonctions appelées par `_build_swap_call`/`flashloan._build_leg` pour
+    rester cohérentes sur la pool réellement routée.
+
     Retourne None si le DEX n'est pas supporté ici, ou si la lecture échoue
     pour n'importe quelle raison (RPC injoignable, pool inexistante...) — dans
     ce cas l'appelant retombe sur DexScreener plutôt que d'échouer."""
@@ -457,26 +691,72 @@ def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) ->
         quote_cs = Web3.to_checksum_address(quote_address)
 
         if dex == "aerodrome":
-            router = w3.eth.contract(
-                address=Web3.to_checksum_address(ROUTER_ADDRESSES["aerodrome"]), abi=AERODROME_ROUTER_ABI
-            )
-            default_factory = router.functions.defaultFactory().call()
-            pool_address = router.functions.poolFor(token_cs, quote_cs, False, default_factory).call()
-            if int(pool_address, 16) == 0:
+            route = _resolve_aerodrome_route(w3, token_address, quote_address)
+            if route is None:
                 return None
-            pool = w3.eth.contract(address=Web3.to_checksum_address(pool_address), abi=AERODROME_POOL_ABI)
-            token0 = pool.functions.token0().call()
-            reserve0, reserve1, _ = pool.functions.getReserves().call()
-            if reserve0 == 0 or reserve1 == 0:
-                return None
-            decimals_token = _get_decimals(w3, token_address)
-            decimals_quote = _get_decimals(w3, quote_address)
-            token_is_token0 = token0.lower() == token_cs.lower()
-            if token_is_token0:
-                # prix de token0 (notre token) exprimé en token1 (quote), ajusté décimales
-                price_in_quote = (reserve1 / (10 ** decimals_quote)) / (reserve0 / (10 ** decimals_token))
+            if route["is_slipstream"]:
+                pool = w3.eth.contract(
+                    address=Web3.to_checksum_address(route["pool"]), abi=AERODROME_SLIPSTREAM_POOL_ABI
+                )
+                token0 = pool.functions.token0().call()
+                sqrt_price_x96 = pool.functions.slot0().call()[0]
+                if sqrt_price_x96 == 0:
+                    return None
+                token_is_token0 = token0.lower() == token_cs.lower()
+                decimals0 = _get_decimals(w3, token_address if token_is_token0 else quote_address)
+                decimals1 = _get_decimals(w3, quote_address if token_is_token0 else token_address)
+                raw_price_1_per_0 = (sqrt_price_x96 / (2 ** 96)) ** 2
+                human_price_1_per_0 = raw_price_1_per_0 * (10 ** (decimals0 - decimals1))
+                if human_price_1_per_0 <= 0:
+                    return None
+                price_in_quote = human_price_1_per_0 if token_is_token0 else (1.0 / human_price_1_per_0)
             else:
-                price_in_quote = (reserve0 / (10 ** decimals_quote)) / (reserve1 / (10 ** decimals_token))
+                pool = w3.eth.contract(address=Web3.to_checksum_address(route["pool"]), abi=AERODROME_POOL_ABI)
+                token0 = pool.functions.token0().call()
+                reserve0, reserve1, _ = pool.functions.getReserves().call()
+                if reserve0 == 0 or reserve1 == 0:
+                    return None
+                decimals_token = _get_decimals(w3, token_address)
+                decimals_quote = _get_decimals(w3, quote_address)
+                token_is_token0 = token0.lower() == token_cs.lower()
+                if token_is_token0:
+                    # prix de token0 (notre token) exprimé en token1 (quote), ajusté décimales
+                    price_in_quote = (reserve1 / (10 ** decimals_quote)) / (reserve0 / (10 ** decimals_token))
+                else:
+                    price_in_quote = (reserve0 / (10 ** decimals_quote)) / (reserve1 / (10 ** decimals_token))
+        elif dex == "pancakeswap":
+            route = _resolve_pancakeswap_route(w3, token_address, quote_address)
+            if route is None:
+                return None
+            if route["is_v3"]:
+                pool = w3.eth.contract(
+                    address=Web3.to_checksum_address(route["pool"]), abi=PANCAKESWAP_V3_POOL_ABI
+                )
+                token0 = pool.functions.token0().call()
+                sqrt_price_x96 = pool.functions.slot0().call()[0]
+                if sqrt_price_x96 == 0:
+                    return None
+                token_is_token0 = token0.lower() == token_cs.lower()
+                decimals0 = _get_decimals(w3, token_address if token_is_token0 else quote_address)
+                decimals1 = _get_decimals(w3, quote_address if token_is_token0 else token_address)
+                raw_price_1_per_0 = (sqrt_price_x96 / (2 ** 96)) ** 2
+                human_price_1_per_0 = raw_price_1_per_0 * (10 ** (decimals0 - decimals1))
+                if human_price_1_per_0 <= 0:
+                    return None
+                price_in_quote = human_price_1_per_0 if token_is_token0 else (1.0 / human_price_1_per_0)
+            else:
+                pool = w3.eth.contract(address=Web3.to_checksum_address(route["pool"]), abi=UNISWAP_V2_PAIR_ABI)
+                token0 = pool.functions.token0().call()
+                reserve0, reserve1, _ = pool.functions.getReserves().call()
+                if reserve0 == 0 or reserve1 == 0:
+                    return None
+                decimals_token = _get_decimals(w3, token_address)
+                decimals_quote = _get_decimals(w3, quote_address)
+                token_is_token0 = token0.lower() == token_cs.lower()
+                if token_is_token0:
+                    price_in_quote = (reserve1 / (10 ** decimals_quote)) / (reserve0 / (10 ** decimals_token))
+                else:
+                    price_in_quote = (reserve0 / (10 ** decimals_quote)) / (reserve1 / (10 ** decimals_token))
         elif dex in UNISWAP_V2_FORK_DEXES:
             router = w3.eth.contract(
                 address=Web3.to_checksum_address(ROUTER_ADDRESSES[dex]), abi=UNISWAP_V2_ROUTER_FACTORY_ABI

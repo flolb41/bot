@@ -83,11 +83,37 @@ interface IUniswapV3SwapRouter02 {
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 }
 
+/// @notice Router Aerodrome Slipstream (pools a liquidite concentree, style
+///         Uniswap V3, mais avec `tickSpacing` au lieu de `fee` et un champ
+///         `deadline` explicite dans la struct -- voir
+///         app/trading/routers.py::AERODROME_SLIPSTREAM_ROUTER_ABI, source
+///         officielle aerodrome-finance/slipstream ISwapRouter.sol). Un seul
+///         hop par jambe (exactInputSingle), comme pour Uniswap V3/PancakeSwap
+///         V3 ci-dessus.
+interface ISlipstreamSwapRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        int24 tickSpacing;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
 contract FlashArbitrage {
     /// @notice Jambe generique du cycle d'arbitrage. kind=0 -> router V2 classique,
     ///         kind=1 -> router Aerodrome (necessite stable + factory),
-    ///         kind=2 -> router Uniswap V3 SwapRouter02, un seul hop
-    ///         (necessite `fee`, le fee tier de la pool V3 concernee).
+    ///         kind=2 -> router Uniswap V3 (ou PancakeSwap V3 -- meme ABI
+    ///         SwapRouter02) un seul hop (necessite `fee`, le fee tier de la
+    ///         pool V3 concernee), kind=3 -> router Aerodrome Slipstream un
+    ///         seul hop (le champ `fee` (uint24) est reutilise pour stocker
+    ///         le `tickSpacing` (int24), toujours petit et positif, caste
+    ///         explicitement dans `_executeLeg` -- aucun champ Leg additionnel).
     struct Leg {
         uint8 kind;
         address router;
@@ -191,6 +217,21 @@ contract FlashArbitrage {
                     tokenOut: leg.tokenOut,
                     fee: leg.fee,
                     recipient: address(this),
+                    amountIn: amountIn,
+                    amountOutMinimum: 0,
+                    sqrtPriceLimitX96: 0
+                })
+            );
+        }
+
+        if (leg.kind == 3) {
+            return ISlipstreamSwapRouter(leg.router).exactInputSingle(
+                ISlipstreamSwapRouter.ExactInputSingleParams({
+                    tokenIn: leg.tokenIn,
+                    tokenOut: leg.tokenOut,
+                    tickSpacing: int24(leg.fee),
+                    recipient: address(this),
+                    deadline: block.timestamp,
                     amountIn: amountIn,
                     amountOutMinimum: 0,
                     sqrtPriceLimitX96: 0

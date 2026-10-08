@@ -215,12 +215,72 @@ def test_build_leg_v2_fork():
     assert leg[6] == 0  # fee tier non pertinent pour un fork V2
 
 
-def test_build_leg_aerodrome():
+def test_build_leg_aerodrome_classic(monkeypatch):
+    # kind=1 : la résolution classique-vs-slipstream passe maintenant par
+    # executor._resolve_aerodrome_route (importée dans le namespace de
+    # flashloan) — on la monkeypatch pour simuler le cas "la pool classique a
+    # la meilleure liquidité" sans appel RPC réel.
     default_factory = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da"
-    leg = flashloan._build_leg("aerodrome", _FakeW3(default_factory), token_in=USDC, token_out=WETH)
+    monkeypatch.setattr(
+        flashloan,
+        "_resolve_aerodrome_route",
+        lambda w3, token_in, token_out: {
+            "is_slipstream": False, "router": "0x9999999999999999999999999999999999999999",
+            "default_factory": default_factory, "pool": "0x1111111111111111111111111111111111111111",
+        },
+    )
+    leg = flashloan._build_leg("aerodrome", _FakeW3(None), token_in=USDC, token_out=WETH)
     assert leg[0] == 1
     assert leg[5] == default_factory
     assert leg[6] == 0
+
+
+def test_build_leg_aerodrome_slipstream(monkeypatch):
+    # kind=3 : cas "la pool Slipstream (concentrated liquidity) a la
+    # meilleure liquidité" — tickSpacing transporté dans le champ `fee`.
+    slipstream_router = "0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F"
+    monkeypatch.setattr(
+        flashloan,
+        "_resolve_aerodrome_route",
+        lambda w3, token_in, token_out: {
+            "is_slipstream": True, "router": slipstream_router, "tick_spacing": 100,
+            "pool": "0x2222222222222222222222222222222222222222",
+        },
+    )
+    leg = flashloan._build_leg("aerodrome", _FakeW3(None), token_in=USDC, token_out=WETH)
+    assert leg[0] == 3
+    assert leg[1] == slipstream_router
+    assert leg[6] == 100
+
+
+def test_build_leg_pancakeswap_classic(monkeypatch):
+    monkeypatch.setattr(
+        flashloan,
+        "_resolve_pancakeswap_route",
+        lambda w3, token_in, token_out: {
+            "is_v3": False, "router": "0x9999999999999999999999999999999999999999",
+            "pool": "0x1111111111111111111111111111111111111111",
+        },
+    )
+    leg = flashloan._build_leg("pancakeswap", _FakeW3(None), token_in=USDC, token_out=WETH)
+    assert leg[0] == 0
+    assert leg[6] == 0
+
+
+def test_build_leg_pancakeswap_v3(monkeypatch):
+    pcs_v3_router = "0x1b81D678ffb9C0263b24A97847620C99d213eB14"
+    monkeypatch.setattr(
+        flashloan,
+        "_resolve_pancakeswap_route",
+        lambda w3, token_in, token_out: {
+            "is_v3": True, "router": pcs_v3_router, "fee": 500,
+            "pool": "0x2222222222222222222222222222222222222222",
+        },
+    )
+    leg = flashloan._build_leg("pancakeswap", _FakeW3(None), token_in=USDC, token_out=WETH)
+    assert leg[0] == 2
+    assert leg[1] == pcs_v3_router
+    assert leg[6] == 500
 
 
 def test_build_leg_uniswap_v3(monkeypatch):
