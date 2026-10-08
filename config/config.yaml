@@ -170,5 +170,9 @@ trading:
   # tampon de slippage + gas déjà déduits) pour tenter un flashloan —
   # volontairement plus élevé que min_net_profit_usd classique : chaque
   # tentative, même en cas de revert, coûte du gas réel immédiatement.
-  flashloan_min_net_profit_usd: 1.0
+  # Abaissé de 1.0$ à 0.3$ le 08/10 : le gas Base est bon marché (quelques
+  # centimes) et un revert ne touche jamais au capital emprunté (atomique),
+  # donc un seuil plus bas capture des opportunités réelles (ex. BRETT/WETH
+  # ~0.2-0.5$ net) sans risque de perte de capital, juste plus de tentatives.
+  flashloan_min_net_profit_usd: 0.3
 
