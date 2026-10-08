@@ -58,9 +58,10 @@ trading:
     - symbol: cbETH
       address: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"
       coingecko_id: coinbase-wrapped-staked-eth
-    - symbol: cbBTC
-      address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
-      coingecko_id: coinbase-wrapped-btc
+    # cbBTC retiré le 2026-10-08 : sur 505 signaux observés en 24h, 1 seul
+    # jugé rentable (spread moyen 0,41 %, systématiquement mangé par les
+    # frais DEX ~0,6 % aller-retour) — consomme un appel DexScreener par scan
+    # pour quasiment aucune opportunité exploitable.
   min_liquidity_usd: 10000        # ignore les pools trop fines (risque de prix manipulé/non réaliste)
   max_trade_size_usd: 3           # plafond de secours si le solde réel est illisible (RPC down, etc.)
   # Dimensionnement dynamique : taille de trade = cette fraction du solde
