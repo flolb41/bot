@@ -7,13 +7,19 @@ keystore chiffre `data/trading_wallet_keystore.json`). Le deployeur devient
 automatiquement le `owner` du contrat (voir le constructeur de
 FlashArbitrage.sol) : aucune configuration supplementaire necessaire.
 
+Le contrat N'EST PAS recompile ici : le RPi est en architecture aarch64 et
+les binaires solc precompiles (solcx) ne sont disponibles qu'en
+linux-amd64. L'ABI + bytecode sont donc pre-compiles sur un poste x86_64
+via `scripts/contracts/compile_flash_arbitrage.py` et commites dans
+`contracts/FlashArbitrage.compiled.json`, que ce script se contente de lire.
+
 SECURITE :
 - Ne demande ni n'accepte jamais la cle privee en argument ou en clair :
   elle reste chiffree sur disque et n'est dechiffree qu'en memoire par
   `load_signer()`, exactement comme pour les transactions de trading du
   bot (aucun nouveau chemin de risque introduit).
-- Mode `--dry-run` (par defaut) : compile, estime le gas, affiche le cout
-  en ETH, et s'arrete LA sans rien envoyer.
+- Mode `--dry-run` (par defaut) : lit l'artefact compile, estime le gas,
+  affiche le cout en ETH, et s'arrete LA sans rien envoyer.
 - Le deploiement reel n'a lieu qu'avec `--send`, et exige en plus de taper
   exactement la phrase de confirmation ci-dessous (anti fat-finger) :
       JE CONFIRME LE DEPLOIEMENT MAINNET DE FLASHARBITRAGE
@@ -30,15 +36,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-import solcx  # noqa: E402
 from web3 import Web3  # noqa: E402
 
 from app.trading.guardrails import trading_keystore_path  # noqa: E402
 from app.wallet.signer import load_signer  # noqa: E402
 
-CONTRACT_PATH = REPO_ROOT / "contracts" / "FlashArbitrage.sol"
+COMPILED_ARTIFACT_PATH = REPO_ROOT / "contracts" / "FlashArbitrage.compiled.json"
 DEPLOYMENTS_DIR = REPO_ROOT / "contracts" / "deployments"
-SOLC_VERSION = "0.8.20"
 CONFIRMATION_PHRASE = "JE CONFIRME LE DEPLOIEMENT MAINNET DE FLASHARBITRAGE"
 
 BASE_MAINNET_CHAIN_ID = 8453
@@ -49,17 +53,16 @@ def resolve_rpc_url() -> str:
     return os.environ.get("RPC_BASE") or "https://mainnet.base.org"
 
 
-def compile_contract() -> tuple[list, str]:
-    solcx.set_solc_version(SOLC_VERSION)
-    out = solcx.compile_files(
-        [str(CONTRACT_PATH)],
-        output_values=["abi", "bin"],
-        optimize=True,
-        optimize_runs=200,
-        solc_version=SOLC_VERSION,
-    )
-    key = next(k for k in out if k.endswith("FlashArbitrage"))
-    return out[key]["abi"], out[key]["bin"]
+def load_compiled_artifact() -> tuple[list, str]:
+    if not COMPILED_ARTIFACT_PATH.exists():
+        raise SystemExit(
+            f"Artefact compile introuvable: {COMPILED_ARTIFACT_PATH}\n"
+            "Generez-le sur un poste x86_64 avec scripts/contracts/compile_flash_arbitrage.py "
+            "puis copiez-le sur le Pi (le solc precompile n'existe pas en aarch64)."
+        )
+    with COMPILED_ARTIFACT_PATH.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data["abi"], data["bytecode"]
 
 
 def main() -> None:
@@ -91,8 +94,8 @@ def main() -> None:
     print(f"Solde ETH   : {balance_eth}")
     print(f"Aave Pool   : {AAVE_V3_BASE_MAINNET_POOL}")
 
-    abi, bytecode = compile_contract()
-    print(f"Contrat compile (solc {SOLC_VERSION}), bytecode: {len(bytecode)} caracteres")
+    abi, bytecode = load_compiled_artifact()
+    print(f"Artefact compile charge, bytecode: {len(bytecode)} caracteres")
 
     contract = w3.eth.contract(abi=abi, bytecode=bytecode)
     nonce = w3.eth.get_transaction_count(account.address)
