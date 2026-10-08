@@ -48,6 +48,28 @@ _PAIR_COOLDOWN_SECONDS = 600
 _PAIR_COOLDOWN_SECONDS_NO_CAPITAL_RISK = 90
 
 
+def _effective_profit_usd(signal: dict) -> float:
+    """Profit utilisé pour CLASSER les signaux "rentables" entre eux (quel
+    candidat tenter en premier ce cycle). Doit refléter le profit RÉEL que le
+    bot captera s'il exécute ce signal, pas seulement `net_profit_usd` (profit
+    au micro-capital du wallet, quelques dollars) — un signal éligible
+    flashloan (`would_execute_flashloan`, voir app.trading.flashloan) est
+    exécuté avec un notionnel bien plus grand (jusqu'à `flashloan_notional_usd`,
+    financé par Aave, sans risque de capital propre), donc avec un profit
+    `flashloan_net_profit_usd` potentiellement 10-100x supérieur.
+
+    Bug corrigé ici (observé en conditions réelles) : avant ce correctif, le tri
+    se faisait uniquement sur `net_profit_usd`, si bien qu'une paire fiable mais
+    marginale (ex: WETH/USDC, quelques centimes de profit par trade) gagnait
+    systématiquement le tri et monopolisait les tentatives du cycle, empêchant
+    de VRAIS gros profits flashloan (BRETT/AERO/DEGEN, jusqu'à plusieurs
+    dollars par opportunité) d'être jamais tentés."""
+    flashloan_profit = signal.get("flashloan_net_profit_usd")
+    if signal.get("would_execute_flashloan") and flashloan_profit is not None:
+        return flashloan_profit
+    return signal.get("net_profit_usd") or 0.0
+
+
 def _pair_cooldown_key(signal: dict) -> str:
     return f"arbitrage_cooldown:{signal['chain']}:{signal['token_address']}:{signal['quote_address']}"
 
@@ -155,12 +177,20 @@ def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = No
         except Exception as exc:  # noqa: BLE001
             logger.warning("Cross-DEX triangular scan (informationnel) en échec : %s", exc)
         all_signals.extend(signals)
-        # Toujours le plus rentable d'abord (net_profit_usd décroissant), tous
-        # types confondus — pas l'ordre de détection, qui dépend juste de
-        # l'ordre des seed tokens/DEX.
+        # Toujours le plus rentable d'abord, tous types confondus — pas l'ordre
+        # de détection, qui dépend juste de l'ordre des seed tokens/DEX. Trié
+        # sur `_effective_profit_usd` (pas directement `net_profit_usd`) :
+        # un signal éligible flashloan doit être comparé à son profit à
+        # l'échelle flashloan (potentiellement 10-100x supérieur au profit au
+        # micro-capital du wallet), sans quoi une paire fiable mais marginale
+        # (ex: WETH/USDC, quelques centimes) monopolise systématiquement le
+        # tri et empêche les vraies grosses opportunités flashloan (BRETT/
+        # AERO/DEGEN, jusqu'à plusieurs dollars) d'être jamais tentées — bug
+        # confirmé en conditions réelles (45 opportunités flashloan ≥0,10$
+        # jamais exécutées sur ~23h, ~44$ de profit manqué).
         profitable = sorted(
             (s for s in signals if s["would_execute"]),
-            key=lambda s: s["net_profit_usd"] or 0.0,
+            key=_effective_profit_usd,
             reverse=True,
         )
 
