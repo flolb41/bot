@@ -23,6 +23,7 @@ import logging
 from app.database import Database
 from app.trading import fees
 from app.trading.arbitrage import _DEFAULT_DEX_WHITELIST, _DEFAULT_SEED_TOKENS, _collect_pairs
+from app.trading.flashloan import estimate_triangular_signal_flashloan_preview
 from app.wallet.pricing import get_price_usd
 
 logger = logging.getLogger(__name__)
@@ -200,6 +201,14 @@ def run_triangular_scan(db: Database, config: dict | None = None) -> list[dict]:
                         "mode": "simulation",
                         "executed": False,
                     }
+                    # Aperçu du profit à l'échelle flashloan, même principe que
+                    # `app.trading.arbitrage.run_arbitrage_scan` — voir
+                    # `app.trading.flashloan.estimate_triangular_signal_flashloan_preview`.
+                    flashloan_preview = estimate_triangular_signal_flashloan_preview(config or {}, signal)
+                    signal["flashloan_notional_usd"] = flashloan_preview["notional_usd"] if flashloan_preview else None
+                    signal["flashloan_net_profit_usd"] = (
+                        flashloan_preview["net_profit_usd"] if flashloan_preview else None
+                    )
                     signal["id"] = db.add_triangular_signal(signal)
                     signals.append(signal)
 

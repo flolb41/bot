@@ -21,6 +21,7 @@ from itertools import combinations
 
 from app.database import Database
 from app.trading import dex_sources, fees
+from app.trading.flashloan import estimate_pair_signal_flashloan_preview
 from app.wallet.pricing import get_price_usd
 
 logger = logging.getLogger(__name__)
@@ -290,6 +291,14 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
                 "mode": "simulation",
                 "executed": False,
             }
+            # Aperçu du profit à l'échelle flashloan (notionnel bien plus grand
+            # que `trade_size_usd` ci-dessus, borné par la liquidité et non par
+            # le solde du wallet) — `None` si le signal n'est pas éligible
+            # flashloan ou si le gas est indisponible, voir
+            # `app.trading.flashloan.estimate_pair_signal_flashloan_preview`.
+            flashloan_preview = estimate_pair_signal_flashloan_preview(config or {}, signal)
+            signal["flashloan_notional_usd"] = flashloan_preview["notional_usd"] if flashloan_preview else None
+            signal["flashloan_net_profit_usd"] = flashloan_preview["net_profit_usd"] if flashloan_preview else None
             signal["id"] = db.add_arbitrage_signal(signal)
             signals.append(signal)
 

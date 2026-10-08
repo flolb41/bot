@@ -123,6 +123,58 @@ def triangular_signal_is_flashloan_eligible(config: dict, signal: dict) -> bool:
     )
 
 
+def estimate_pair_signal_flashloan_preview(config: dict, signal: dict) -> dict | None:
+    """Aperçu (dashboard/API/Telegram UNIQUEMENT — aucune transaction envoyée) du
+    notionnel et du profit net qu'aurait ce signal 'pair' s'il était exécuté via
+    flashloan plutôt qu'en financement classique. Calculé à partir des données
+    DÉJÀ mesurées par le scan (`spread_pct`, liquidités) — contrairement à
+    `execute_pair_signal_via_flashloan`, qui revalide les prix en direct avant
+    d'envoyer la vraie transaction, ceci est une ESTIMATION affichée en amont,
+    pas une garantie de rentabilité au moment d'une éventuelle exécution.
+    Retourne `None` si le signal n'est pas éligible flashloan, si la liquidité
+    ne permet aucun notionnel positif, ou si le coût de gas Base est
+    indisponible."""
+    if not pair_signal_is_flashloan_eligible(config, signal):
+        return None
+    safety_fraction = flashloan_liquidity_safety_fraction(config)
+    min_liquidity_usd = min(signal.get("buy_liquidity_usd") or 0.0, signal.get("sell_liquidity_usd") or 0.0)
+    notional_usd = min(flashloan_notional_usd(config), safety_fraction * min_liquidity_usd)
+    if notional_usd <= 0:
+        return None
+    gross_profit_usd = notional_usd * (signal.get("spread_pct") or 0.0) / 100
+    fees_usd = notional_usd * (dex_fee_pct(signal["buy_dex"]) + dex_fee_pct(signal["sell_dex"])) / 100
+    slippage_buffer_usd = notional_usd * DEFAULT_SLIPPAGE_BUFFER_PCT / 100
+    premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_PAIR)
+    if gas_cost_usd is None:
+        return None
+    net_profit_usd = gross_profit_usd - fees_usd - slippage_buffer_usd - premium_usd - gas_cost_usd
+    return {"notional_usd": notional_usd, "net_profit_usd": net_profit_usd}
+
+
+def estimate_triangular_signal_flashloan_preview(config: dict, signal: dict) -> dict | None:
+    """Équivalent triangulaire de `estimate_pair_signal_flashloan_preview` — même
+    principe (aperçu affiché en amont, aucune transaction, aucune revérification
+    de prix en direct)."""
+    if not triangular_signal_is_flashloan_eligible(config, signal):
+        return None
+    safety_fraction = flashloan_liquidity_safety_fraction(config)
+    min_liquidity_usd = signal.get("min_liquidity_usd") or 0.0
+    notional_usd = min(flashloan_notional_usd(config), safety_fraction * min_liquidity_usd)
+    if notional_usd <= 0:
+        return None
+    fee_pct_total = 3 * dex_fee_pct(signal["dex"])
+    gross_profit_usd = notional_usd * (signal.get("spread_pct") or 0.0) / 100
+    fees_usd = notional_usd * fee_pct_total / 100
+    slippage_buffer_usd = notional_usd * DEFAULT_SLIPPAGE_BUFFER_PCT / 100
+    premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(
+        notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_TRIANGULAR
+    )
+    if gas_cost_usd is None:
+        return None
+    net_profit_usd = gross_profit_usd - fees_usd - slippage_buffer_usd - premium_usd - gas_cost_usd
+    return {"notional_usd": notional_usd, "net_profit_usd": net_profit_usd}
+
+
 def _build_leg(dex: str, w3, *, token_in: str, token_out: str) -> tuple:
     """Construit une jambe `(kind, router, tokenIn, tokenOut, aerodromeStable,
     aerodromeFactory)` — ordre EXACT de la struct `FlashArbitrage.Leg` (voir

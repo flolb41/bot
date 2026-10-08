@@ -133,6 +133,10 @@ class Database:
             "ALTER TABLE arbitrage_signals ADD COLUMN tx_hash_buy TEXT",
             "ALTER TABLE arbitrage_signals ADD COLUMN tx_hash_sell TEXT",
             "ALTER TABLE arbitrage_signals ADD COLUMN execution_error TEXT",
+            "ALTER TABLE arbitrage_signals ADD COLUMN flashloan_notional_usd REAL",
+            "ALTER TABLE arbitrage_signals ADD COLUMN flashloan_net_profit_usd REAL",
+            "ALTER TABLE triangular_signals ADD COLUMN flashloan_notional_usd REAL",
+            "ALTER TABLE triangular_signals ADD COLUMN flashloan_net_profit_usd REAL",
         ]
         for stmt in migrations:
             try:
@@ -207,8 +211,9 @@ class Database:
             "chain, token_symbol, token_address, quote_symbol, quote_address, "
             "buy_dex, buy_price_usd, buy_liquidity_usd, sell_dex, sell_price_usd, sell_liquidity_usd, "
             "spread_pct, trade_size_usd, gross_profit_usd, fees_usd, slippage_buffer_usd, "
-            "gas_cost_usd, net_profit_usd, would_execute, mode, executed, tx_hash"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "gas_cost_usd, net_profit_usd, would_execute, mode, executed, tx_hash, "
+            "flashloan_notional_usd, flashloan_net_profit_usd"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 signal["chain"], signal["token_symbol"], signal["token_address"],
                 signal["quote_symbol"], signal["quote_address"],
@@ -219,6 +224,7 @@ class Database:
                 signal.get("net_profit_usd"), int(bool(signal.get("would_execute"))),
                 signal.get("mode", "simulation"), int(bool(signal.get("executed"))),
                 signal.get("tx_hash"),
+                signal.get("flashloan_notional_usd"), signal.get("flashloan_net_profit_usd"),
             ),
         )
 
@@ -305,8 +311,9 @@ class Database:
             "chain, dex, token_a_symbol, token_a_address, token_b_symbol, token_b_address, "
             "token_c_symbol, token_c_address, cycle_multiplier, spread_pct, min_liquidity_usd, "
             "trade_size_usd, gross_profit_usd, fees_usd, slippage_buffer_usd, gas_cost_usd, "
-            "net_profit_usd, would_execute, mode, executed, tx_hash"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "net_profit_usd, would_execute, mode, executed, tx_hash, "
+            "flashloan_notional_usd, flashloan_net_profit_usd"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 signal["chain"], signal["dex"],
                 signal["token_a_symbol"], signal["token_a_address"],
@@ -318,6 +325,7 @@ class Database:
                 signal.get("net_profit_usd"), int(bool(signal.get("would_execute"))),
                 signal.get("mode", "simulation"), int(bool(signal.get("executed"))),
                 signal.get("tx_hash"),
+                signal.get("flashloan_notional_usd"), signal.get("flashloan_net_profit_usd"),
             ),
         )
 

@@ -89,11 +89,20 @@ def build_dashboard_html(db: Database) -> str:
                     exec_tag = " <span class='badge' style='background:#92400e'>close (solde nul, pas de vente)</span>"
                 else:
                     exec_tag = " <span class='badge' style='background:#166534'>round-trip réel complet</span>"
+            flashloan_notional = s.get("flashloan_notional_usd")
+            flashloan_net = s.get("flashloan_net_profit_usd")
+            if flashloan_notional is not None and flashloan_net is not None:
+                flashloan_cell = (
+                    f"<span class='badge' style='background:#6d28d9'>⚡ {flashloan_notional:.0f} $</span> "
+                    f"{flashloan_net:.3f} $"
+                )
+            else:
+                flashloan_cell = "<span class='empty'>—</span>"
             arb_rows.append(
                 f"<tr><td>{escape(s['token_symbol'])}/{escape(s['quote_symbol'])}</td>"
                 f"<td>{escape(s['buy_dex'])} → {escape(s['sell_dex'])}</td>"
                 f"<td>{s['spread_pct']:.2f}%</td><td>{s['trade_size_usd']:.2f} $</td>"
-                f"<td>{net}</td><td>{tag}{exec_tag}</td></tr>"
+                f"<td>{net}</td><td>{flashloan_cell}</td><td>{tag}{exec_tag}</td></tr>"
             )
         cumulative = arb_stats.get("cumulative_net_profit_usd") or 0.0
         if mode_subtitle is None:
@@ -108,7 +117,7 @@ def build_dashboard_html(db: Database) -> str:
             f"<h2>{mode_title}</h2>"
             f"<p class='subtitle'>{mode_subtitle}</p>"
             "<table><tr><th>Paire</th><th>Achat → Vente</th><th>Spread</th><th>Taille</th>"
-            "<th>Profit net est.</th><th></th></tr>"
+            "<th>Profit net est.</th><th>⚡ Potentiel flashloan</th><th></th></tr>"
             + "".join(arb_rows) + "</table>"
             "</section>"
         )
