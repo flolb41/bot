@@ -155,19 +155,21 @@ def _onchain_price_is_plausible(onchain_price: float | None, reference_price_usd
     Bug observé en prod le 2026-10-08 sur TOSHI/WETH et AERO/WETH (quote=WETH,
     donc `EXECUTABLE_QUOTE_TOKENS`, pas concerné par le fix du même jour sur
     `_quote_token_usd_price`) : `_onchain_pool_price_usd("uniswap", ...)`
-    s'appuie sur `_find_uniswap_v3_fee_tier`, qui retient le PREMIER fee tier
-    dont la pool existe on-chain, sans vérifier sa liquidité (volontairement
-    inchangé pour ne pas risquer la route d'exécution réelle, voir
-    `_best_v3_style_pool`) — pour ces deux tokens récemment ajoutés comme seed
-    tokens, ce premier fee tier correspondait à une pool quasi vide/jamais
-    tradée, dont le `sqrtPriceX96` ne reflète aucun prix de marché réel :
-    résultat, un prix ~10^42 à 10^46 fois le prix réel. Conséquence concrète
-    au-delà de l'affichage corrompu : ce `net_profit_usd` factice gagnait
-    SYSTÉMATIQUEMENT le tri par profit décroissant du scheduler
-    (`app.scheduler.run_arbitrage_scan_job`), monopolisant la seule tentative
-    d'exécution de chaque cycle sur un signal bidon (toujours refusé par la
-    simulation `eth_call`, donc sans perte réelle de fonds) au détriment de
-    vraies opportunités rentables qui n'étaient alors jamais tentées."""
+    s'appuyait sur `_find_uniswap_v3_fee_tier`, qui retenait alors le PREMIER
+    fee tier dont la pool existe on-chain, sans vérifier sa liquidité — pour
+    ces deux tokens récemment ajoutés comme seed tokens, ce premier fee tier
+    correspondait à une pool quasi vide/jamais tradée, dont le `sqrtPriceX96`
+    ne reflète aucun prix de marché réel : résultat, un prix ~10^42 à 10^46
+    fois le prix réel. Conséquence concrète au-delà de l'affichage corrompu :
+    ce `net_profit_usd` factice gagnait SYSTÉMATIQUEMENT le tri par profit
+    décroissant du scheduler (`app.scheduler.run_arbitrage_scan_job`),
+    monopolisant la seule tentative d'exécution de chaque cycle sur un signal
+    bidon (toujours refusé par la simulation `eth_call`, donc sans perte
+    réelle de fonds) au détriment de vraies opportunités rentables qui
+    n'étaient alors jamais tentées. `_find_uniswap_v3_fee_tier` a depuis été
+    corrigé le 08/10 (second incident, DEGEN/WETH en flashloan cette fois,
+    voir son propre docstring) pour retenir le fee tier le plus liquide — ce
+    garde-fou de plausibilité reste néanmoins conservé par prudence."""
     if onchain_price is None or onchain_price <= 0:
         return False
     if reference_price_usd is None or reference_price_usd <= 0:
@@ -258,17 +260,30 @@ def get_usdc_trading_balance_usd(config: dict) -> float | None:
 
 
 def _find_uniswap_v3_fee_tier(w3, token_in: str, token_out: str) -> int:
-    from web3 import Web3
-    factory = w3.eth.contract(address=Web3.to_checksum_address(UNISWAP_V3_FACTORY_ADDRESS), abi=UNISWAP_V3_FACTORY_ABI)
-    for fee_tier in UNISWAP_V3_FEE_TIERS:
-        pool = factory.functions.getPool(
-            Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out), fee_tier
-        ).call()
-        if int(pool, 16) != 0:
-            return fee_tier
-    raise TradingRefused(
-        f"Aucune pool Uniswap V3 trouvée pour {token_in}/{token_out} (fee tiers testés: {UNISWAP_V3_FEE_TIERS})."
+    """Choisit le fee tier Uniswap V3 avec la plus grande réserve de
+    `token_out` (voir `_best_v3_style_pool`, même méthode que PancakeSwap V3
+    et Aerodrome Slipstream) — PLUS "le premier fee tier dont la pool existe",
+    comportement corrigé le 08/10 après confirmation en conditions réelles
+    d'un revert `InsufficientProfit` sur DEGEN/WETH (flashloan) : la pool
+    choisie par l'ancienne méthode (premier fee tier trouvé, souvent 500) ne
+    correspondait PAS à la pool la plus liquide utilisée pour chiffrer le
+    signal (`app.trading.arbitrage._collect_pairs`, qui retient la pool de
+    plus grande liquidité par DEX) — route d'exécution et prix/liquidité du
+    signal portaient donc sur DEUX pools différentes du même DEX, un écart de
+    prix/profondeur qui a fait perdre ~29$ en simulation (capital jamais
+    engagé, bloqué par le garde-fou `InsufficientProfit` du contrat
+    FlashArbitrage, voir contracts/FlashArbitrage.sol). Le docstring de
+    `_collect_pairs` affirmait d'ailleurs déjà (à tort, avant ce correctif) que
+    cette fonction retenait "le fee tier réellement liquide"."""
+    result = _best_v3_style_pool(
+        w3, UNISWAP_V3_FACTORY_ADDRESS, UNISWAP_V3_FACTORY_ABI, UNISWAP_V3_FEE_TIERS, token_in, token_out
     )
+    if result is None:
+        raise TradingRefused(
+            f"Aucune pool Uniswap V3 trouvée pour {token_in}/{token_out} (fee tiers testés: {UNISWAP_V3_FEE_TIERS})."
+        )
+    fee_tier, _pool_address = result
+    return fee_tier
 
 
 def _quote_reserve_in_pool(w3, pool_address: str, quote_address: str) -> int | None:
@@ -289,11 +304,13 @@ def _best_v3_style_pool(w3, factory_address: str, factory_abi: list[dict], fee_t
                          token_address: str, quote_address: str) -> tuple[int, str] | None:
     """Cherche, parmi `fee_tiers`, la pool Uniswap-V3-style (`getPool(tokenA,
     tokenB, fee)`) avec la plus grande réserve de `quote_address` -- réutilisée
-    pour PancakeSwap V3 (voir `_best_pancakeswap_v3_pool`). Uniswap V3 garde sa
-    propre logique historique inchangée (`_find_uniswap_v3_fee_tier`, choisit
-    le premier fee tier existant plutôt que le plus liquide -- comportement
-    éprouvé en production, volontairement non modifié ici). Retourne
-    (fee_tier, pool_address) ou None si aucune pool n'existe."""
+    pour PancakeSwap V3 (voir `_best_pancakeswap_v3_pool`) ET, depuis le 08/10,
+    pour Uniswap V3 lui-même via `_find_uniswap_v3_fee_tier` (corrigé ce
+    jour-là : l'ancienne logique "premier fee tier existant" pouvait router
+    l'exécution vers une pool différente de celle utilisée pour chiffrer le
+    signal, confirmé par un revert `InsufficientProfit` sur DEGEN/WETH en
+    flashloan). Retourne (fee_tier, pool_address) ou None si aucune pool
+    n'existe."""
     from web3 import Web3
     factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=factory_abi)
     token_cs = Web3.to_checksum_address(token_address)

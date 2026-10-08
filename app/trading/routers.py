@@ -269,9 +269,9 @@ UNISWAP_V2_PAIR_ABI = [
 
 # Factory générique "Uniswap-V3-style" : même signature `getPool(tokenA,
 # tokenB, fee)` pour Uniswap V3 ET PancakeSwap V3 (fork quasi-identique) —
-# réutilisée par `executor._best_v3_style_pool` pour PancakeSwap V3 (Uniswap
-# V3 garde sa logique historique inchangée via `_find_uniswap_v3_fee_tier`,
-# voir son docstring).
+# réutilisée par `executor._best_v3_style_pool`, aussi utilisée pour Uniswap V3
+# lui-même depuis le 08/10 via `_find_uniswap_v3_fee_tier` (voir son
+# docstring).
 PANCAKESWAP_V3_FACTORY_ABI = UNISWAP_V3_FACTORY_ABI
 
 # Pool Uniswap-V3-style générique (même shape que UNISWAP_V3_POOL_ABI, utilisée
