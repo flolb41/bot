@@ -117,6 +117,39 @@ trading:
     - symbol: TOSHI
       address: "0xAC1Bd2486aAf3B5C0fc3Fd868558b082a531B2B4"
       coingecko_id: toshi
+    # EURC, MORPHO et ZORA ajoutés le 2026-10-08 : adresses vérifiées via DEUX
+    # sources indépendantes (API CoinGecko officielle `platforms.base` + API
+    # DexScreener en direct, pools confirmées). Critère retenu cette fois :
+    # même quote token sur ≥2 DEX whitelistés (condition nécessaire pour que
+    # `_collect_pairs` les groupe sous la même paire canonique et génère un
+    # signal — un token coté WETH sur un DEX et USDC sur un autre ne produit
+    # JAMAIS de signal, même si chacun est individuellement très liquide ;
+    # exclu pour cette raison : SPX6900, MOG, tBTC).
+    # - EURC (Euro Coin, Circle, rank CoinGecko #118) : coté USDC sur 4 DEX
+    #   whitelistés — aerodrome (~1,5M$, ~3,6M$/j), pancakeswap (~132k$),
+    #   uniswap (~113k$), alien-base (~46k$). Stablecoin EUR/USD : spread
+    #   potentiellement plus stable/récurrent (tracking de parité) que les
+    #   tokens volatils, à surveiller.
+    # - MORPHO (protocole de prêt, rank #61) : coté WETH sur 2 DEX — aerodrome
+    #   (~940k$, ~1,9M$/j) et uniswap (~908k$, ~932k$/j). Liquidité/volume très
+    #   supérieurs aux seed tokens volatils existants (DEGEN/BRETT).
+    # - ZORA (écosystème Zora, rank #650) : coté USDC sur 2 DEX — aerodrome
+    #   (~78k$, ~247k$/j) et uniswap (~76k$, ~46k$/j). Plus modeste que
+    #   MORPHO/EURC mais au-dessus du plancher de liquidité sur les deux DEX.
+    # Écartés lors de cette recherche : WEETH (liquidité aerodrome élevée mais
+    # volume quasi nul ~1$/j — prix potentiellement figé/non réaliste), WELL/
+    # Moonwell (exploit ~8,7M$ signalé récemment sur leur protocole), cbBTC
+    # (déjà retiré le 2026-10-08, rentabilité testée insuffisante).
+    - symbol: EURC
+      address: "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42"
+      coingecko_id: euro-coin
+    - symbol: MORPHO
+      address: "0xbaa5cc21fd487b8fcc2f632f3f4e8d37262a0842"
+      coingecko_id: morpho
+    - symbol: ZORA
+      address: "0x1111111111166b7fe7bd91427724b487980afc69"
+      coingecko_id: zora
+      coingecko_id: toshi
   min_liquidity_usd: 10000        # ignore les pools trop fines (risque de prix manipulé/non réaliste)
   max_trade_size_usd: 3           # plafond de secours si le solde réel est illisible (RPC down, etc.)
   # Dimensionnement dynamique : taille de trade = cette fraction du solde
