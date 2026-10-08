@@ -1,6 +1,6 @@
 # FlashArbitrage — contrat de flashloan atomique (point 8 de la feuille de route)
 
-## Statut actuel : **deploye et operationnel sur Base mainnet**
+## Statut actuel : **deploye et operationnel sur Base mainnet** (v2, avec Uniswap V3)
 
 Ce contrat emprunte un actif via un flashloan Aave V3, execute une sequence
 de swaps (2 jambes classiques ou cycle triangulaire) sur des routers DEX,
@@ -9,25 +9,45 @@ est atomique : si le resultat final ne couvre pas le remboursement + le
 profit minimum exige, la transaction entiere `revert` — aucune perte de
 capital possible au-dela du gas de la tentative.
 
+### Historique des versions
+
+- **v1** (deployee le 8 octobre, PLUS UTILISEE) : jambes `kind=0`
+  (fork UniswapV2 classique) et `kind=1` (Aerodrome) uniquement.
+
+  | Champ          | Valeur                                                                 |
+  |----------------|-------------------------------------------------------------------------|
+  | Adresse        | `0x73beAacEE6CD3Dc0cb4816Dd48cbdCEE45dcc1e8`                            |
+  | Tx hash        | `0x9d91d458c69dd2e946c6d44c92ebb5fc7a3d4e04e2b57c435362e068aa1f7642`    |
+
+- **v2** (deployee, ADRESSE ACTIVE — voir `app.trading.routers.FLASH_ARBITRAGE_ADDRESS`) :
+  ajoute `kind=2` (Uniswap V3 SwapRouter02, single-hop `exactInputSingle`,
+  champ `fee` ajoute a la struct `Leg`). Motivation : la route reellement la
+  plus profitable observee en production (uniswap -> aerodrome) ne
+  beneficiait jamais du financement flashloan car Uniswap V3 n'etait pas
+  supporte par le contrat, la limitant a la taille du solde du wallet
+  (~7-8$) au lieu d'un notionnel optimise bien plus grand.
+
+  | Champ          | Valeur                                                                 |
+  |----------------|-------------------------------------------------------------------------|
+  | Adresse        | `0x6991D2e6cDB057c50978a6111E31fd8f3c524727`                            |
+  | Reseau         | Base mainnet (chain_id 8453)                                            |
+  | Owner/deployer | `0x032d16Ec1F4382287cBBFbB87Dd8163934A01803` (wallet de trading du bot) |
+  | Aave V3 Pool   | `0xA238Dd80C259a72e81d7e4664a9801593F98d1c5`                            |
+  | Tx hash        | `0xdb08dc75f7ab042fd66cee7251e424899e1dbc275cf3a203da4e5c857be39964`    |
+  | Gas utilise    | 1 018 292 (cout reel ≈ 0,0000062 ETH au gas price du moment)            |
+  | Explorer       | https://basescan.org/address/0x6991D2e6cDB057c50978a6111E31fd8f3c524727 |
+
 ### Validation effectuee
 
 1. **Remix VM** (simulateur EVM dans le navigateur, `test/RemixHarness.sol`
    + `test/Mocks.sol`) : scenario rentable reussi (profit transfere
    correctement), scenario perdant correctement `revert` (aucune perte de
-   fonds). Validation confirmee par l'utilisateur.
-2. **Deploiement reel sur Base mainnet**, le 8 octobre, depuis le wallet de
-   trading de production du bot (devient automatiquement `owner` du
-   contrat, voir `constructor`) :
-
-   | Champ          | Valeur                                                                 |
-   |----------------|-------------------------------------------------------------------------|
-   | Adresse        | `0x73beAacEE6CD3Dc0cb4816Dd48cbdCEE45dcc1e8`                            |
-   | Reseau         | Base mainnet (chain_id 8453)                                            |
-   | Owner/deployer | `0x032d16Ec1F4382287cBBFbB87Dd8163934A01803` (wallet de trading du bot) |
-   | Aave V3 Pool   | `0xA238Dd80C259a72e81d7e4664a9801593F98d1c5`                            |
-   | Tx hash        | `0x9d91d458c69dd2e946c6d44c92ebb5fc7a3d4e04e2b57c435362e068aa1f7642`    |
-   | Gas utilise    | 948 667 (cout reel ≈ 0,0000057 ETH au gas price du moment)              |
-   | Explorer       | https://basescan.org/address/0x73beAacEE6CD3Dc0cb4816Dd48cbdCEE45dcc1e8 |
+   fonds). Validation confirmee par l'utilisateur pour la v1. La v2 ajoute
+   `runV3LegScenario` (meme harnais) pour valider la jambe `kind=2` ; le
+   deploiement v2 a ete decide sur la base de la suite de tests Python
+   (43/43) et de la compilation propre du contrat + du harnais, sans
+   repasser par un clic Remix manuel (choix explicite de l'utilisateur).
+2. **Deploiement reel sur Base mainnet**, voir tableaux ci-dessus (v1 et v2).
 
 ## Fichiers
 
@@ -85,13 +105,14 @@ Un script generique plus ancien, `scripts/contracts/deploy_flash_arbitrage.py`
 (cle privee via variable d'environnement, utilisable sur testnet avec un
 wallet jetable), reste disponible pour des tests sur un autre reseau.
 
-## Integration future avec le bot (non faite)
+## Integration avec le bot
 
-Le contrat est deploye mais **le bot Python ne l'utilise pas encore**.
-L'integration cote Python (`app/trading/executor.py`) consistera a ajouter
-un mode d'execution "flashloan" qui, pour un signal juge rentable par
-`arbitrage.py` / `triangular.py` mais dont la taille depasse le solde
-disponible du wallet, encode la sequence de jambes en `Leg[]` et appelle
-`startArbitrage` sur `0x73beAacEE6CD3Dc0cb4816Dd48cbdCEE45dcc1e8` au lieu
-d'executer les swaps directement depuis le wallet. Ce travail n'a pas
-encore commence.
+L'integration cote Python est faite (`app/trading/flashloan.py`) : pour un
+signal juge rentable mais dont la taille optimale depasse le solde
+disponible du wallet, le scheduler route vers
+`execute_pair_signal_via_flashloan`/`execute_triangular_signal_via_flashloan`
+au lieu de l'execution classique de `executor.py` — controle par
+`trading.flashloan_enabled` dans `config.yaml` (desactive par defaut).
+Apres le redeploiement v2 (Uniswap V3), penser a verifier que
+`app.trading.routers.FLASH_ARBITRAGE_ADDRESS` pointe bien vers la nouvelle
+adresse avant de reactiver `flashloan_enabled` en production.

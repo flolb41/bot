@@ -61,14 +61,19 @@ UNISWAP_V3_FEE_TIERS = (500, 3000, 10000, 100)  # ordre d'essai : les plus coura
 
 # Contrat `FlashArbitrage` (arbitrage financé par flashloan Aave V3, voir
 # contracts/FlashArbitrage.sol et contracts/README.md) déployé RÉELLEMENT sur
-# Base mainnet le 2026-10-08 par le wallet de trading du bot (tx
-# 0x9d91d458c69dd2e946c6d44c92ebb5fc7a3d4e04e2b57c435362e068aa1f7642). C'est la
-# SEULE adresse, en dehors des routers DEX ci-dessus, vers laquelle
-# `app.trading.guardrails.send_trading_transaction` autorise l'envoi d'une
-# transaction — volontairement codée en dur ici pour rester cohérente avec le
-# principe "whitelist fixe, non modifiable par variable d'environnement" déjà
-# appliqué à ROUTER_ADDRESSES (voir docstring de guardrails.send_trading_transaction).
-FLASH_ARBITRAGE_ADDRESS = "0x73beAacEE6CD3Dc0cb4816Dd48cbdCEE45dcc1e8"
+# Base mainnet. C'est la SEULE adresse, en dehors des routers DEX ci-dessus,
+# vers laquelle `app.trading.guardrails.send_trading_transaction` autorise
+# l'envoi d'une transaction — volontairement codée en dur ici pour rester
+# cohérente avec le principe "whitelist fixe, non modifiable par variable
+# d'environnement" déjà appliqué à ROUTER_ADDRESSES (voir docstring de
+# guardrails.send_trading_transaction).
+#
+# v1 (2026-10-08, tx 0x9d91d458c69dd2e946c6d44c92ebb5fc7a3d4e04e2b57c435362e068aa1f7642) :
+#   0x73beAacEE6CD3Dc0cb4816Dd48cbdCEE45dcc1e8 — legs kind=0 (V2 fork) / kind=1
+#   (Aerodrome) uniquement, PLUS UTILISÉ.
+# v2 (déploiement courant, tx db08dc75f7ab042fd66cee7251e424899e1dbc275cf3a203da4e5c857be39964) :
+#   ajoute kind=2 (Uniswap V3 SwapRouter02, single-hop exactInputSingle).
+FLASH_ARBITRAGE_ADDRESS = "0x6991D2e6cDB057c50978a6111E31fd8f3c524727"
 FLASHLOAN_CONTRACT_ADDRESSES = frozenset({FLASH_ARBITRAGE_ADDRESS})
 
 ERC20_ABI = [

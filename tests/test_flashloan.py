@@ -33,13 +33,14 @@ def test_pair_signal_eligibility_requires_flashloan_enabled():
     assert flashloan.pair_signal_is_flashloan_eligible({"trading": {"flashloan_enabled": True}}, signal) is True
 
 
-def test_pair_signal_eligibility_rejects_uniswap_v3():
-    # Uniswap V3 non supporté par le contrat FlashArbitrage (voir docstring
-    # du module) : un signal utilisant "uniswap" comme buy_dex ou sell_dex
-    # doit retomber sur l'exécution classique, jamais le flashloan.
+def test_pair_signal_eligibility_accepts_uniswap_v3():
+    # Uniswap V3 supporté par le contrat FlashArbitrage depuis l'ajout de la
+    # jambe single-hop kind=2 (SwapRouter02 exactInputSingle, voir docstring
+    # du module et contracts/FlashArbitrage.sol) : un signal utilisant
+    # "uniswap" comme buy_dex ou sell_dex est désormais éligible au flashloan.
     config = {"trading": {"flashloan_enabled": True}}
     signal = {"buy_dex": "uniswap", "sell_dex": "sushiswap", "quote_address": USDC}
-    assert flashloan.pair_signal_is_flashloan_eligible(config, signal) is False
+    assert flashloan.pair_signal_is_flashloan_eligible(config, signal) is True
 
 
 def test_pair_signal_eligibility_rejects_non_executable_quote():
@@ -53,8 +54,13 @@ def test_triangular_signal_eligibility():
     eligible_signal = {"dex": "aerodrome", "token_a_address": WETH}
     assert flashloan.triangular_signal_is_flashloan_eligible(config, eligible_signal) is True
 
+    # Cas théorique : "uniswap" fait partie de FLASHLOAN_CAPABLE_DEXES (jambe
+    # kind=2 single-hop supportée par le contrat), mais en pratique
+    # `triangular.TRIANGULAR_CAPABLE_DEXES` ne propose jamais "uniswap" comme
+    # `dex` d'un signal triangulaire (scan dédié, scope distinct) — ce test
+    # documente le comportement de la fonction elle-même, pas un cas réel.
     uniswap_signal = {"dex": "uniswap", "token_a_address": WETH}
-    assert flashloan.triangular_signal_is_flashloan_eligible(config, uniswap_signal) is False
+    assert flashloan.triangular_signal_is_flashloan_eligible(config, uniswap_signal) is True
 
     disabled_config = {"trading": {"flashloan_enabled": False}}
     assert flashloan.triangular_signal_is_flashloan_eligible(disabled_config, eligible_signal) is False
@@ -162,3 +168,74 @@ def test_triangular_signal_flashloan_preview_computes_notional_and_profit(monkey
     # sur un aller-retour classique, rendant les gros notionnels non rentables.
     assert round(preview["notional_usd"], 2) == 87.73
     assert round(preview["net_profit_usd"], 2) == 0.26
+
+
+class _FakeContractFunctions:
+    def __init__(self, return_value):
+        self._return_value = return_value
+
+    def __getattr__(self, name):
+        def _call(*args, **kwargs):
+            return _FakeCallable(self._return_value)
+        return _call
+
+
+class _FakeCallable:
+    def __init__(self, return_value):
+        self._return_value = return_value
+
+    def call(self):
+        return self._return_value
+
+
+class _FakeContract:
+    def __init__(self, return_value):
+        self.functions = _FakeContractFunctions(return_value)
+
+
+class _FakeEth:
+    def __init__(self, return_value):
+        self._return_value = return_value
+
+    def contract(self, address, abi):  # noqa: ARG002 - signature imposée par web3
+        return _FakeContract(self._return_value)
+
+
+class _FakeW3:
+    def __init__(self, return_value):
+        self.eth = _FakeEth(return_value)
+
+
+def test_build_leg_v2_fork():
+    # kind=0, pas d'appel RPC nécessaire : w3 n'est jamais utilisé.
+    leg = flashloan._build_leg("sushiswap", _FakeW3(None), token_in=USDC, token_out=WETH)
+    assert leg[0] == 0
+    assert leg[2] == USDC and leg[3] == WETH
+    assert leg[4] is False
+    assert leg[6] == 0  # fee tier non pertinent pour un fork V2
+
+
+def test_build_leg_aerodrome():
+    default_factory = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da"
+    leg = flashloan._build_leg("aerodrome", _FakeW3(default_factory), token_in=USDC, token_out=WETH)
+    assert leg[0] == 1
+    assert leg[5] == default_factory
+    assert leg[6] == 0
+
+
+def test_build_leg_uniswap_v3(monkeypatch):
+    # kind=2 : le fee tier est résolu on-chain via executor._find_uniswap_v3_fee_tier
+    # (importée dans le namespace de flashloan) — on la monkeypatch ici pour
+    # éviter tout appel RPC réel.
+    monkeypatch.setattr(flashloan, "_find_uniswap_v3_fee_tier", lambda w3, token_in, token_out: 500)
+    leg = flashloan._build_leg("uniswap", _FakeW3(None), token_in=USDC, token_out=WETH)
+    assert leg[0] == 2
+    assert leg[2] == USDC and leg[3] == WETH
+    assert leg[6] == 500
+
+
+def test_build_leg_rejects_unsupported_dex():
+    import pytest
+
+    with pytest.raises(flashloan.TradingRefused):
+        flashloan._build_leg("not-a-dex", _FakeW3(None), token_in=USDC, token_out=WETH)

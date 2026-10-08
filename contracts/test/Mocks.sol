@@ -123,3 +123,34 @@ contract MockRouter {
         amounts[1] = amountOut;
     }
 }
+
+/// @notice Simule le router Uniswap V3 "SwapRouter02" (meme struct exacte que
+///         `IUniswapV3SwapRouter02` dans FlashArbitrage.sol, sans champ
+///         `deadline`) avec un taux de change fixe par (tokenIn, tokenOut,
+///         fee). Permet de valider la jambe `kind=2` du contrat.
+contract MockV3Router {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    mapping(address => mapping(address => mapping(uint24 => uint256))) public rateBps;
+
+    function setRate(address tokenIn, address tokenOut, uint24 fee, uint256 bps) external {
+        rateBps[tokenIn][tokenOut][fee] = bps;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params) external returns (uint256 amountOut) {
+        uint256 bps = rateBps[params.tokenIn][params.tokenOut][params.fee];
+        require(bps > 0, "rate not set");
+
+        IERC20Min(params.tokenIn).transferFrom(msg.sender, address(this), params.amountIn);
+        amountOut = (params.amountIn * bps) / 10000;
+        IERC20Min(params.tokenOut).transfer(params.recipient, amountOut);
+    }
+}

@@ -19,11 +19,13 @@ Pourquoi un module séparé plutôt qu'intégré à `executor.py` :
   dépasser la contrainte de capital qui limite `execute_signal`/
   `execute_triangular_signal` à une fraction du solde réel détenu).
 
-DEX supportés : uniquement les forks UniswapV2 classiques + Aerodrome — même
-restriction que `app.trading.triangular.TRIANGULAR_CAPABLE_DEXES` (Uniswap V3
-est exclu : son interface `exactInputSingle` n'est pas celle que le contrat
-`FlashArbitrage` sait appeler, voir ses interfaces `IUniswapV2Router`/
-`IAerodromeRouter`).
+DEX supportés : forks UniswapV2 classiques + Aerodrome + Uniswap V3 (single-hop
+uniquement, `exactInputSingle` sur SwapRouter02 — voir `_build_leg` kind=2 et
+`contracts/FlashArbitrage.sol::IUniswapV3SwapRouter02`). Le multi-hop V3
+(`exactInput`, chemin bytes packé) reste hors scope : c'est pourquoi Uniswap V3
+reste exclu de `app.trading.triangular.TRIANGULAR_CAPABLE_DEXES` (cycle à 3
+jambes nécessiterait soit 3 appels single-hop distincts côté scanner — non
+implémenté côté détection triangulaire — soit l'encodage multi-hop).
 
 Activation : désactivée par défaut (`trading.flashloan_enabled: false` dans
 config.yaml), EN PLUS de toutes les conditions de
@@ -40,6 +42,7 @@ from pathlib import Path
 from app.database import Database
 from app.trading.executor import (
     EXECUTABLE_QUOTE_TOKENS,
+    _find_uniswap_v3_fee_tier,
     _get_decimals,
     _quote_token_usd_price,
     _refresh_price_usd,
@@ -51,10 +54,12 @@ from app.trading.routers import AERODROME_ROUTER_ABI, EXECUTABLE_DEXES, FLASH_AR
 
 logger = logging.getLogger("app.trading.flashloan")
 
-# Forks UniswapV2 classiques + Aerodrome uniquement (Uniswap V3 exclu, voir
-# docstring ci-dessus) — même principe que `triangular.TRIANGULAR_CAPABLE_DEXES`.
+# Forks UniswapV2 classiques + Aerodrome + Uniswap V3 (single-hop, voir
+# docstring ci-dessus) — par contraste, `triangular.TRIANGULAR_CAPABLE_DEXES`
+# exclut toujours Uniswap V3 (scope différent, cycles à 3 jambes non
+# supportés côté scanner triangulaire).
 FLASHLOAN_CAPABLE_DEXES = frozenset({
-    "aerodrome", "sushiswap", "pancakeswap", "baseswap", "alien-base", "swapbased",
+    "uniswap", "aerodrome", "sushiswap", "pancakeswap", "baseswap", "alien-base", "swapbased",
 })
 
 _ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
@@ -177,10 +182,14 @@ def estimate_triangular_signal_flashloan_preview(config: dict, signal: dict) -> 
 
 def _build_leg(dex: str, w3, *, token_in: str, token_out: str) -> tuple:
     """Construit une jambe `(kind, router, tokenIn, tokenOut, aerodromeStable,
-    aerodromeFactory)` — ordre EXACT de la struct `FlashArbitrage.Leg` (voir
-    contracts/FlashArbitrage.sol). `kind=0` pour un fork UniswapV2 classique,
-    `kind=1` pour Aerodrome (nécessite sa `defaultFactory` on-chain, même
-    lecture que `executor._build_triangular_swap_call`)."""
+    aerodromeFactory, fee)` — ordre EXACT de la struct `FlashArbitrage.Leg`
+    (voir contracts/FlashArbitrage.sol). `kind=0` pour un fork UniswapV2
+    classique, `kind=1` pour Aerodrome (nécessite sa `defaultFactory`
+    on-chain, même lecture que `executor._build_triangular_swap_call`),
+    `kind=2` pour Uniswap V3 single-hop (SwapRouter02 `exactInputSingle` —
+    nécessite le fee tier de la pool concernée, résolu on-chain via
+    `executor._find_uniswap_v3_fee_tier`, même logique que l'exécution
+    classique `_build_swap_call`)."""
     from web3 import Web3
 
     if dex not in FLASHLOAN_CAPABLE_DEXES or dex not in EXECUTABLE_DEXES:
@@ -191,8 +200,11 @@ def _build_leg(dex: str, w3, *, token_in: str, token_out: str) -> tuple:
     if dex == "aerodrome":
         router = w3.eth.contract(address=router_cs, abi=AERODROME_ROUTER_ABI)
         default_factory = router.functions.defaultFactory().call()
-        return (1, router_cs, token_in_cs, token_out_cs, False, default_factory)
-    return (0, router_cs, token_in_cs, token_out_cs, False, _ZERO_ADDRESS)
+        return (1, router_cs, token_in_cs, token_out_cs, False, default_factory, 0)
+    if dex == "uniswap":
+        fee_tier = _find_uniswap_v3_fee_tier(w3, token_in, token_out)
+        return (2, router_cs, token_in_cs, token_out_cs, False, _ZERO_ADDRESS, fee_tier)
+    return (0, router_cs, token_in_cs, token_out_cs, False, _ZERO_ADDRESS, 0)
 
 
 def _amm_price_impact_pct(notional_usd: float, pool_liquidity_usd: float | None) -> float:

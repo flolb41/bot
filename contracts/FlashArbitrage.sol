@@ -62,9 +62,32 @@ interface IAerodromeRouter {
     ) external returns (uint256[] memory amounts);
 }
 
+/// @notice Router Uniswap V3 "SwapRouter02" (PAS le SwapRouter original : sur
+///         Base, l'adresse utilisee par le bot est bien SwapRouter02, dont la
+///         struct ExactInputSingleParams n'a PAS de champ `deadline`,
+///         contrairement au SwapRouter V3 original -- voir
+///         app/trading/routers.py::UNISWAP_V3_ROUTER_ABI, meme struct ici).
+///         Un seul hop par jambe (exactInputSingle) ; le multi-hop
+///         (exactInput, chemin bytes packe) reste hors scope.
+interface IUniswapV3SwapRouter02 {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
 contract FlashArbitrage {
     /// @notice Jambe generique du cycle d'arbitrage. kind=0 -> router V2 classique,
-    ///         kind=1 -> router Aerodrome (necessite stable + factory).
+    ///         kind=1 -> router Aerodrome (necessite stable + factory),
+    ///         kind=2 -> router Uniswap V3 SwapRouter02, un seul hop
+    ///         (necessite `fee`, le fee tier de la pool V3 concernee).
     struct Leg {
         uint8 kind;
         address router;
@@ -72,6 +95,7 @@ contract FlashArbitrage {
         address tokenOut;
         bool aerodromeStable;
         address aerodromeFactory;
+        uint24 fee;
     }
 
     address public immutable owner;
@@ -159,6 +183,20 @@ contract FlashArbitrage {
 
     function _executeLeg(Leg memory leg, uint256 amountIn) private returns (uint256) {
         IERC20(leg.tokenIn).approve(leg.router, amountIn);
+
+        if (leg.kind == 2) {
+            return IUniswapV3SwapRouter02(leg.router).exactInputSingle(
+                IUniswapV3SwapRouter02.ExactInputSingleParams({
+                    tokenIn: leg.tokenIn,
+                    tokenOut: leg.tokenOut,
+                    fee: leg.fee,
+                    recipient: address(this),
+                    amountIn: amountIn,
+                    amountOutMinimum: 0,
+                    sqrtPriceLimitX96: 0
+                })
+            );
+        }
 
         uint256[] memory amountsOut;
         if (leg.kind == 1) {
