@@ -143,7 +143,10 @@ def estimate_pair_signal_flashloan_preview(config: dict, signal: dict) -> dict |
         return None
     gross_profit_usd = notional_usd * (signal.get("spread_pct") or 0.0) / 100
     fees_usd = notional_usd * (dex_fee_pct(signal["buy_dex"]) + dex_fee_pct(signal["sell_dex"])) / 100
-    slippage_buffer_usd = notional_usd * DEFAULT_SLIPPAGE_BUFFER_PCT / 100
+    amm_impact_pct = _amm_price_impact_pct(notional_usd, signal.get("buy_liquidity_usd")) + _amm_price_impact_pct(
+        notional_usd, signal.get("sell_liquidity_usd")
+    )
+    slippage_buffer_usd = notional_usd * max(DEFAULT_SLIPPAGE_BUFFER_PCT, amm_impact_pct) / 100
     premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_PAIR)
     if gas_cost_usd is None:
         return None
@@ -165,7 +168,10 @@ def estimate_triangular_signal_flashloan_preview(config: dict, signal: dict) -> 
     fee_pct_total = 3 * dex_fee_pct(signal["dex"])
     gross_profit_usd = notional_usd * (signal.get("spread_pct") or 0.0) / 100
     fees_usd = notional_usd * fee_pct_total / 100
-    slippage_buffer_usd = notional_usd * DEFAULT_SLIPPAGE_BUFFER_PCT / 100
+    # 3 jambes sur le même DEX : seule la liquidité minimale du cycle est
+    # connue (voir `run_triangular_scan`), appliquée par prudence aux 3 jambes.
+    amm_impact_pct = 3 * _amm_price_impact_pct(notional_usd, min_liquidity_usd)
+    slippage_buffer_usd = notional_usd * max(DEFAULT_SLIPPAGE_BUFFER_PCT, amm_impact_pct) / 100
     premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(
         notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_TRIANGULAR
     )
@@ -193,6 +199,28 @@ def _build_leg(dex: str, w3, *, token_in: str, token_out: str) -> tuple:
         default_factory = router.functions.defaultFactory().call()
         return (1, router_cs, token_in_cs, token_out_cs, False, default_factory)
     return (0, router_cs, token_in_cs, token_out_cs, False, _ZERO_ADDRESS)
+
+
+def _amm_price_impact_pct(notional_usd: float, pool_liquidity_usd: float | None) -> float:
+    """Estimation du slippage réel subi en swappant `notional_usd` dans un pool
+    à produit constant (x*y=k) de profondeur totale `pool_liquidity_usd` (TVL
+    approximatif, les deux côtés du pool confondus — on suppose ~moitié de
+    cette valeur du côté du token swappé, approximation standard).
+
+    Remplace le tampon fixe `DEFAULT_SLIPPAGE_BUFFER_PCT` (0,20 %, pensé pour
+    les trades classiques à 3-5 $) : à l'échelle flashloan (ex: 1000 $), ce
+    tampon fixe sous-estime massivement le coût réel sur des pools peu
+    profonds — cas réel observé : BRETT/WETH sur PancakeSwap (~195k$ de TVL)
+    affichait +5,67 $ de profit net estimé au tampon fixe, alors que la
+    revérification on-chain juste avant l'envoi de la transaction trouvait un
+    profit réel négatif (-7 à -8 $), le spread s'étant refermé entre-temps sur
+    une paire fine et volatile. Ce modèle de slippage, appliqué en PLUS de la
+    revérification de prix, rend l'estimation affichée cohérente avec ce que
+    le marché impose réellement sur un pool de cette taille."""
+    if not pool_liquidity_usd or pool_liquidity_usd <= 0:
+        return 100.0  # Liquidité inconnue/nulle -> slippage jugé prohibitif.
+    half_liquidity_usd = pool_liquidity_usd / 2
+    return (notional_usd / (notional_usd + half_liquidity_usd)) * 100
 
 
 def _estimate_premium_and_gas_cost_usd(notional_usd: float, gas_units: int) -> tuple[float, float | None]:
@@ -269,7 +297,10 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
 
         gross_profit_usd = notional_usd * fresh_spread_pct / 100
         fees_usd = notional_usd * (dex_fee_pct(signal["buy_dex"]) + dex_fee_pct(signal["sell_dex"])) / 100
-        slippage_buffer_usd = notional_usd * DEFAULT_SLIPPAGE_BUFFER_PCT / 100
+        amm_impact_pct = _amm_price_impact_pct(notional_usd, signal["buy_liquidity_usd"]) + _amm_price_impact_pct(
+            notional_usd, signal["sell_liquidity_usd"]
+        )
+        slippage_buffer_usd = notional_usd * max(DEFAULT_SLIPPAGE_BUFFER_PCT, amm_impact_pct) / 100
         premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_PAIR)
         if gas_cost_usd is None:
             result["error"] = "Coût de gas Base indisponible — refus par prudence."
@@ -391,7 +422,8 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
         fee_pct_total = 3 * dex_fee_pct(signal["dex"])
         gross_profit_usd = notional_usd * signal["spread_pct"] / 100
         fees_usd = notional_usd * fee_pct_total / 100
-        slippage_buffer_usd = notional_usd * DEFAULT_SLIPPAGE_BUFFER_PCT / 100
+        amm_impact_pct = 3 * _amm_price_impact_pct(notional_usd, signal["min_liquidity_usd"])
+        slippage_buffer_usd = notional_usd * max(DEFAULT_SLIPPAGE_BUFFER_PCT, amm_impact_pct) / 100
         premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(
             notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_TRIANGULAR
         )

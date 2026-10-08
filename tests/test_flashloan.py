@@ -60,6 +60,14 @@ def test_triangular_signal_eligibility():
     assert flashloan.triangular_signal_is_flashloan_eligible(disabled_config, eligible_signal) is False
 
 
+def test_amm_price_impact_pct_grows_with_notional_vs_liquidity():
+    # Pool profond -> impact faible ; pool fin -> impact nettement plus élevé,
+    # modèle à produit constant (x*y=k), voir docstring de la fonction.
+    assert flashloan._amm_price_impact_pct(1000, 1_000_000) < flashloan._amm_price_impact_pct(1000, 195_000)
+    assert flashloan._amm_price_impact_pct(1000, None) == 100.0
+    assert flashloan._amm_price_impact_pct(1000, 0) == 100.0
+
+
 def test_pair_signal_flashloan_preview_returns_none_when_not_eligible():
     # Flashloan désactivé -> pas d'aperçu affiché sur le dashboard.
     config = {"trading": {"flashloan_enabled": False}}
@@ -80,8 +88,10 @@ def test_pair_signal_flashloan_preview_computes_notional_and_profit(monkeypatch)
     assert preview is not None
     # Notionnel borné par 2% de la liquidité min (2000$) ET par flashloan_notional_usd (1000$) -> 1000$.
     assert preview["notional_usd"] == 1000.0
-    # gross=10$ (1% de 1000) - fees (0.3%*2=6$) - slippage(0.2%=2$) - premium(0.5) - gas(0.2) = 1.3$
-    assert round(preview["net_profit_usd"], 2) == 1.3
+    # gross=10$ (1% de 1000) - fees (0.3%*2=6$) - slippage AMM (impact ~1,96%
+    # par jambe sur un pool de 100k$, soit ~3,92% au total, >> tampon fixe
+    # 0,20% -> slippage≈39,22$) - premium(0.5) - gas(0.2) = -35,92$ environ.
+    assert round(preview["net_profit_usd"], 2) == -35.92
 
 
 def test_pair_signal_flashloan_preview_bounded_by_liquidity(monkeypatch):
@@ -98,6 +108,26 @@ def test_pair_signal_flashloan_preview_bounded_by_liquidity(monkeypatch):
     assert preview["notional_usd"] == 20.0
 
 
+def test_pair_signal_flashloan_preview_penalizes_thin_liquidity_pool(monkeypatch):
+    # Cas réel observé en production (BRETT/WETH, pool PancakeSwap ~195k$) :
+    # un pool nettement moins profond que l'autre côté doit faire chuter le
+    # profit net estimé bien plus que le tampon fixe 0,20% ne le laissait
+    # penser — c'est précisément le correctif demandé par l'utilisateur après
+    # avoir observé un aperçu de +5,67$ suivi d'un refus réel à -6,98$.
+    monkeypatch.setattr(flashloan, "_estimate_premium_and_gas_cost_usd", lambda notional, gas_units: (0.5, 0.2))
+    config = {"trading": {"flashloan_enabled": True, "flashloan_notional_usd": 1000, "liquidity_safety_fraction": 0.02}}
+    deep_pool_signal = {"buy_dex": "aerodrome", "sell_dex": "sushiswap", "quote_address": USDC,
+                         "buy_liquidity_usd": 1_000_000, "sell_liquidity_usd": 1_000_000, "spread_pct": 1.37}
+    thin_pool_signal = {"buy_dex": "aerodrome", "sell_dex": "sushiswap", "quote_address": USDC,
+                         "buy_liquidity_usd": 1_000_000, "sell_liquidity_usd": 195_000, "spread_pct": 1.37}
+    deep_preview = flashloan.estimate_pair_signal_flashloan_preview(config, deep_pool_signal)
+    thin_preview = flashloan.estimate_pair_signal_flashloan_preview(config, thin_pool_signal)
+    assert deep_preview["net_profit_usd"] > thin_preview["net_profit_usd"]
+    # Même notionnel (1000$, bien en dessous des deux liquidités) mais un
+    # écart de profit net de plusieurs dollars uniquement dû à la liquidité.
+    assert deep_preview["net_profit_usd"] - thin_preview["net_profit_usd"] > 1.0
+
+
 def test_triangular_signal_flashloan_preview_computes_notional_and_profit(monkeypatch):
     monkeypatch.setattr(flashloan, "_estimate_premium_and_gas_cost_usd", lambda notional, gas_units: (0.5, 0.2))
     config = {"trading": {"flashloan_enabled": True, "flashloan_notional_usd": 1000, "liquidity_safety_fraction": 0.02}}
@@ -105,5 +135,7 @@ def test_triangular_signal_flashloan_preview_computes_notional_and_profit(monkey
     preview = flashloan.estimate_triangular_signal_flashloan_preview(config, signal)
     assert preview is not None
     assert preview["notional_usd"] == 1000.0
-    # gross=20$ (2% de 1000) - fees (3*0.3%=9$) - slippage(0.2%=2$) - premium(0.5) - gas(0.2) = 8.3$
-    assert round(preview["net_profit_usd"], 2) == 8.3
+    # gross=20$ (2% de 1000) - fees (3*0.3%=9$) - slippage AMM (impact ~1,96%
+    # par jambe sur un pool de 100k$, x3 jambes ≈ 5,88% -> slippage≈58,82$)
+    # - premium(0.5) - gas(0.2) = -48,52$ environ.
+    assert round(preview["net_profit_usd"], 2) == -48.52
