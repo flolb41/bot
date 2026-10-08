@@ -44,6 +44,7 @@ from app.trading.executor import (
     EXECUTABLE_QUOTE_TOKENS,
     _find_uniswap_v3_fee_tier,
     _get_decimals,
+    _is_connected_with_retry,
     _quote_token_usd_price,
     _refresh_price_usd,
     _resolve_aerodrome_route,
@@ -361,7 +362,7 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
         from web3 import Web3
 
         w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
-        if not w3.is_connected():
+        if not _is_connected_with_retry(w3):
             result["error"] = "RPC Base injoignable."
             return result
 
@@ -496,7 +497,7 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
         from web3 import Web3
 
         w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
-        if not w3.is_connected():
+        if not _is_connected_with_retry(w3):
             result["error"] = "RPC Base injoignable."
             return result
 

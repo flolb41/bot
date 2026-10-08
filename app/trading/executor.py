@@ -49,7 +49,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 from app.database import Database
 from app.trading import dex_sources, fees
-from app.trading.guardrails import TradingRefused, is_trading_live, send_trading_transaction, slippage_pct
+from app.trading.guardrails import (
+    TradingRefused,
+    call_with_rate_limit_retry,
+    is_trading_live,
+    send_trading_transaction,
+    slippage_pct,
+)
 from app.trading.routers import (
     AERODROME_POOL_ABI,
     AERODROME_ROUTER_ABI,
@@ -137,6 +143,26 @@ def _route_cache_set(key: tuple, value: object) -> None:
 
 def _resolve_rpc_url() -> str:
     return os.environ.get("RPC_BASE") or "https://mainnet.base.org"
+
+
+def _is_connected_with_retry(w3) -> bool:
+    """`w3.is_connected()` avec retry sur rate-limit RPC (429) — voir
+    `call_with_rate_limit_retry`. Sans ce retry, un simple 429 transitoire du
+    RPC (ex: Infura free tier sous charge) est confondu avec une VRAIE panne
+    réseau ("RPC Base injoignable"), ce qui faisait échouer QUASI-SYSTÉMATIQUEMENT
+    chaque tentative d'exécution réelle malgré des signaux rentables (confirmé
+    en conditions réelles, 100% des tentatives sur plusieurs heures)."""
+    try:
+        return bool(call_with_rate_limit_retry(lambda: w3.is_connected()))
+    except Exception:  # noqa: BLE001 - un échec réseau persistant reste traité comme "injoignable"
+        return False
+
+
+def _balance_of_with_retry(contract, address: str) -> int:
+    """`contract.functions.balanceOf(address).call()` avec retry sur rate-limit
+    RPC (429) — même raison que `_is_connected_with_retry` ci-dessus."""
+    from web3 import Web3
+    return int(call_with_rate_limit_retry(lambda: contract.functions.balanceOf(Web3.to_checksum_address(address)).call()))
 
 
 def _get_decimals(w3, token_address: str) -> int:
@@ -258,7 +284,7 @@ def get_quote_trading_balance_usd(quote_address: str, config: dict) -> float | N
     try:
         from web3 import Web3
         w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
-        if not w3.is_connected():
+        if not _is_connected_with_retry(w3):
             return None
 
         from app.trading.guardrails import trading_keystore_path
@@ -271,7 +297,7 @@ def get_quote_trading_balance_usd(quote_address: str, config: dict) -> float | N
 
         decimals = _get_decimals(w3, quote_key)
         contract = w3.eth.contract(address=Web3.to_checksum_address(quote_key), abi=ERC20_ABI)
-        balance_units = int(contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call())
+        balance_units = _balance_of_with_retry(contract, wallet_address)
         balance_tokens = balance_units / (10 ** decimals)
 
         coingecko_id = _QUOTE_TOKEN_COINGECKO_ID[quote_key]
@@ -820,7 +846,7 @@ def execute_triangular_signal(db: Database, config: dict, signal: dict) -> dict:
     try:
         from web3 import Web3
         w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
-        if not w3.is_connected():
+        if not _is_connected_with_retry(w3):
             result["error"] = "RPC Base injoignable."
             return result
 
@@ -848,9 +874,7 @@ def execute_triangular_signal(db: Database, config: dict, signal: dict) -> dict:
 
         # --- Garde-fou solde réel : ne jamais trader plus que ce qui est dispo ---
         token_a_contract = w3.eth.contract(address=Web3.to_checksum_address(token_a), abi=ERC20_ABI)
-        token_a_balance_units = int(
-            token_a_contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
-        )
+        token_a_balance_units = _balance_of_with_retry(token_a_contract, wallet_address)
         amount_in_tokens = trade_size_usd / quote_usd_price
         amount_in_units = int(amount_in_tokens * (10 ** token_a_decimals))
         if amount_in_units > token_a_balance_units:
@@ -949,7 +973,7 @@ def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) ->
     try:
         from web3 import Web3
         w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 10}))
-        if not w3.is_connected():
+        if not _is_connected_with_retry(w3):
             return None
 
         token_cs = Web3.to_checksum_address(token_address)
@@ -1192,7 +1216,7 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
     try:
         from web3 import Web3
         w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
-        if not w3.is_connected():
+        if not _is_connected_with_retry(w3):
             result["error"] = "RPC Base injoignable."
             return result
 
@@ -1220,7 +1244,7 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
 
         # --- Garde-fou solde réel : ne jamais trader plus que ce qui est dispo ---
         quote_contract = w3.eth.contract(address=Web3.to_checksum_address(quote_address), abi=ERC20_ABI)
-        quote_balance_units = int(quote_contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call())
+        quote_balance_units = _balance_of_with_retry(quote_contract, wallet_address)
         amount_in_quote_tokens = trade_size_usd / quote_usd_price
         amount_in_units = int(amount_in_quote_tokens * (10 ** quote_decimals))
         if amount_in_units > quote_balance_units:
@@ -1271,9 +1295,7 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
         token_contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
         token_balance_units = 0
         for attempt in range(4):
-            token_balance_units = int(
-                token_contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
-            )
+            token_balance_units = _balance_of_with_retry(token_contract, wallet_address)
             if token_balance_units > 0:
                 break
             if attempt < 3:
@@ -1403,7 +1425,7 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
     try:
         from web3 import Web3
         w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
-        if not w3.is_connected():
+        if not _is_connected_with_retry(w3):
             return results
 
         from app.trading.guardrails import trading_keystore_path
@@ -1425,9 +1447,7 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
             quote_address = position["quote_address"]
 
             token_contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
-            token_balance_units = int(
-                token_contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
-            )
+            token_balance_units = _balance_of_with_retry(token_contract, wallet_address)
             if token_balance_units <= 0:
                 # Rien à récupérer (déjà revendu manuellement, ou poussière consommée) :
                 # on referme réellement la ligne (sentinelle non-nulle) pour ne plus la

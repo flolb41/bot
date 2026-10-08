@@ -47,7 +47,7 @@ _RATE_LIMIT_MAX_ATTEMPTS = 3
 _RATE_LIMIT_RETRY_DELAY_SECONDS = 2.0
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
+def is_rate_limit_error(exc: Exception) -> bool:
     """Détecte un 429 Too Many Requests (ou équivalent) renvoyé par le RPC,
     par opposition à un VRAI revert de simulation (manque de rentabilité,
     slippage, etc.) — seule l'erreur réseau transitoire doit être retentée."""
@@ -55,18 +55,26 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "429" in message or "too many requests" in message.lower()
 
 
-def _call_with_rate_limit_retry(fn_call):
-    """Exécute `fn_call` (ex. `fn.call(...)` ou `fn.estimate_gas(...)`) en
-    retentant jusqu'à `_RATE_LIMIT_MAX_ATTEMPTS` fois UNIQUEMENT si l'échec
-    est un rate-limit RPC (429) — toute autre exception (revert réel) est
-    immédiatement propagée sans retry."""
+def call_with_rate_limit_retry(fn_call):
+    """Exécute `fn_call` (ex. `fn.call(...)`, `fn.estimate_gas(...)` ou
+    `w3.is_connected()`) en retentant jusqu'à `_RATE_LIMIT_MAX_ATTEMPTS` fois
+    UNIQUEMENT si l'échec est un rate-limit RPC (429) — toute autre exception
+    (revert réel) est immédiatement propagée sans retry.
+
+    Nom PUBLIC (pas de préfixe `_`) : réutilisé par `app.trading.executor`
+    (voir `execute_signal`/`execute_triangular_signal`), dont les vérifications
+    de solde/connexion RPC avant envoi d'une transaction réelle subissaient le
+    même 429 transitoire d'un RPC gratuit/limité (ex: Infura free tier) sans
+    aucun retry — confirmé en conditions réelles responsable d'un échec
+    QUASI-SYSTÉMATIQUE ("RPC Base injoignable" / "Erreur inattendue : 429 ...")
+    de chaque tentative d'exécution réelle malgré des signaux rentables."""
     last_exc: Exception | None = None
     for attempt in range(1, _RATE_LIMIT_MAX_ATTEMPTS + 1):
         try:
             return fn_call()
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            if not _is_rate_limit_error(exc) or attempt == _RATE_LIMIT_MAX_ATTEMPTS:
+            if not is_rate_limit_error(exc) or attempt == _RATE_LIMIT_MAX_ATTEMPTS:
                 raise
             logger.warning(
                 "RPC rate-limited (429), nouvelle tentative %d/%d dans %.1fs : %s",
@@ -204,7 +212,11 @@ def send_trading_transaction(
     from web3 import Web3
 
     w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 15}))
-    if not w3.is_connected():
+    try:
+        connected = call_with_rate_limit_retry(lambda: w3.is_connected())
+    except Exception:  # noqa: BLE001 - un vrai échec réseau persistant reste traité comme "injoignable"
+        connected = False
+    if not connected:
         return {"sent": False, "tx_hash": None, "error": "RPC injoignable"}
 
     signer_account = load_signer(
@@ -216,7 +228,7 @@ def send_trading_transaction(
     if count_against_daily_limit and max_tx_per_day() > 0 and db.today_executed_trades_count() >= max_tx_per_day():
         raise TradingRefused(f"Limite quotidienne de trades atteinte (TRADING_MAX_TX_PER_DAY={max_tx_per_day()}).")
 
-    gas_price_wei = _call_with_rate_limit_retry(lambda: w3.eth.gas_price)
+    gas_price_wei = call_with_rate_limit_retry(lambda: w3.eth.gas_price)
     gas_price_gwei = float(Web3.from_wei(gas_price_wei, "gwei"))
     if gas_price_gwei > max_gas_price_gwei():
         raise TradingRefused(
@@ -228,14 +240,14 @@ def send_trading_transaction(
 
     # --- Simulation obligatoire avant tout envoi -----------------------------
     # Retry automatique UNIQUEMENT sur rate-limit RPC (429, voir
-    # `_call_with_rate_limit_retry`) : le RPC public gratuit
+    # `call_with_rate_limit_retry`) : le RPC public gratuit
     # (https://mainnet.base.org par défaut) renvoie parfois des 429 sous
     # charge, ce qui serait sinon confondu avec un vrai revert et déclencherait
     # à tort le disjoncteur de sécurité (pair_health) alors que la rentabilité
     # du trade n'a jamais été réellement testée.
     try:
-        _call_with_rate_limit_retry(lambda: fn.call({"from": wallet_address}))
-        estimated_gas = _call_with_rate_limit_retry(lambda: fn.estimate_gas({"from": wallet_address}))
+        call_with_rate_limit_retry(lambda: fn.call({"from": wallet_address}))
+        estimated_gas = call_with_rate_limit_retry(lambda: fn.estimate_gas({"from": wallet_address}))
     except Exception as exc:  # noqa: BLE001
         return {"sent": False, "tx_hash": None,
                 "error": f"Simulation échouée pour {action_label or function_name} : {exc}"}
