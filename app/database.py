@@ -65,6 +65,44 @@ CREATE TABLE IF NOT EXISTS arbitrage_signals (
 
 CREATE INDEX IF NOT EXISTS idx_arbitrage_detected ON arbitrage_signals(detected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_arbitrage_would_execute ON arbitrage_signals(would_execute);
+
+-- Signaux d'arbitrage TRIANGULAIRE (un seul DEX, cycle à 3 jambes
+-- token_a -> token_b -> token_c -> token_a, exécuté en UNE SEULE transaction
+-- multi-hop — voir app/trading/triangular.py). `token_a` est toujours un
+-- quote token exécutable (USDC/WETH, voir EXECUTABLE_QUOTE_TOKENS) : c'est le
+-- capital qui part et revient dans le wallet. Contrairement à
+-- arbitrage_signals (2 transactions séparées), un cycle triangulaire est
+-- atomique par construction (si une jambe échoue, toute la transaction
+-- revert) : pas de risque de position résiduelle ouverte.
+CREATE TABLE IF NOT EXISTS triangular_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    detected_at REAL DEFAULT (strftime('%s','now')),
+    chain TEXT NOT NULL,
+    dex TEXT NOT NULL,
+    token_a_symbol TEXT NOT NULL,
+    token_a_address TEXT NOT NULL,
+    token_b_symbol TEXT NOT NULL,
+    token_b_address TEXT NOT NULL,
+    token_c_symbol TEXT NOT NULL,
+    token_c_address TEXT NOT NULL,
+    cycle_multiplier REAL NOT NULL,
+    spread_pct REAL NOT NULL,
+    min_liquidity_usd REAL,
+    trade_size_usd REAL NOT NULL,
+    gross_profit_usd REAL NOT NULL,
+    fees_usd REAL NOT NULL,
+    slippage_buffer_usd REAL NOT NULL,
+    gas_cost_usd REAL,
+    net_profit_usd REAL,
+    would_execute INTEGER DEFAULT 0,
+    mode TEXT DEFAULT 'simulation',
+    executed INTEGER DEFAULT 0,
+    tx_hash TEXT,
+    execution_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_triangular_detected ON triangular_signals(detected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_triangular_would_execute ON triangular_signals(would_execute);
 """
 
 
@@ -221,11 +259,16 @@ class Database:
 
     def today_executed_trades_count(self) -> int:
         """Nombre de round-trips d'arbitrage réellement exécutés depuis minuit UTC
-        (garde-fou de plafond quotidien, voir app/trading/guardrails.py)."""
+        (garde-fou de plafond quotidien, voir app/trading/guardrails.py).
+        Compte à la fois les round-trips classiques (2 jambes) ET les cycles
+        triangulaires (1 transaction) : le plafond TRADING_MAX_TX_PER_DAY
+        s'applique globalement, pas par type de stratégie."""
         start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         row = self.fetch_one(
-            "SELECT COUNT(*) AS n FROM arbitrage_signals WHERE executed = 1 AND detected_at >= ?",
-            (start_of_day,),
+            "SELECT "
+            "(SELECT COUNT(*) FROM arbitrage_signals WHERE executed = 1 AND detected_at >= ?) + "
+            "(SELECT COUNT(*) FROM triangular_signals WHERE executed = 1 AND detected_at >= ?) AS n",
+            (start_of_day, start_of_day),
         )
         return int(row["n"]) if row else 0
 
@@ -254,3 +297,60 @@ class Database:
             "FROM arbitrage_signals WHERE mode = 'live' AND tx_hash_buy IS NOT NULL"
         )
         return row if row else {"total_live": 0, "completed": 0, "open_count": 0}
+
+    # --- bot de trading : signaux d'arbitrage TRIANGULAIRE (1 seul DEX, 1 seule tx) ---
+    def add_triangular_signal(self, signal: dict[str, Any]) -> int:
+        return self.execute(
+            "INSERT INTO triangular_signals ("
+            "chain, dex, token_a_symbol, token_a_address, token_b_symbol, token_b_address, "
+            "token_c_symbol, token_c_address, cycle_multiplier, spread_pct, min_liquidity_usd, "
+            "trade_size_usd, gross_profit_usd, fees_usd, slippage_buffer_usd, gas_cost_usd, "
+            "net_profit_usd, would_execute, mode, executed, tx_hash"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                signal["chain"], signal["dex"],
+                signal["token_a_symbol"], signal["token_a_address"],
+                signal["token_b_symbol"], signal["token_b_address"],
+                signal["token_c_symbol"], signal["token_c_address"],
+                signal["cycle_multiplier"], signal["spread_pct"], signal.get("min_liquidity_usd"),
+                signal["trade_size_usd"], signal["gross_profit_usd"], signal["fees_usd"],
+                signal["slippage_buffer_usd"], signal.get("gas_cost_usd"),
+                signal.get("net_profit_usd"), int(bool(signal.get("would_execute"))),
+                signal.get("mode", "simulation"), int(bool(signal.get("executed"))),
+                signal.get("tx_hash"),
+            ),
+        )
+
+    def list_triangular_signals(self, limit: int = 50, only_would_execute: bool = False) -> list[dict[str, Any]]:
+        query = "SELECT * FROM triangular_signals"
+        if only_would_execute:
+            query += " WHERE would_execute = 1"
+        query += " ORDER BY detected_at DESC LIMIT ?"
+        return self.fetch_all(query, (limit,))
+
+    def mark_triangular_signal_executed(self, signal_id: int, *, tx_hash: str | None = None,
+                                         execution_error: str | None = None) -> None:
+        """Enregistre le résultat réel d'une tentative d'exécution d'un cycle
+        triangulaire. Contrairement à `mark_arbitrage_signal_executed`, une
+        seule transaction (atomique) : soit elle passe entièrement (tx_hash
+        renseigné, execution_error=None), soit elle revert entièrement
+        (execution_error renseigné, tx_hash=None) — jamais d'état intermédiaire."""
+        self.execute(
+            "UPDATE triangular_signals SET executed = 1, tx_hash = ?, execution_error = ?, "
+            "mode = 'live' WHERE id = ?",
+            (tx_hash, execution_error, signal_id),
+        )
+
+    def triangular_stats_summary(self) -> dict[str, Any]:
+        """Agrégat utile pour le dashboard, équivalent de `arbitrage_stats_summary`
+        pour les cycles triangulaires."""
+        row = self.fetch_one(
+            "SELECT COUNT(*) AS total, "
+            "SUM(would_execute) AS would_execute_count, "
+            "SUM(CASE WHEN would_execute = 1 THEN net_profit_usd ELSE 0 END) AS cumulative_net_profit_usd, "
+            "MAX(detected_at) AS last_scan_at "
+            "FROM triangular_signals"
+        )
+        return row if row else {
+            "total": 0, "would_execute_count": 0, "cumulative_net_profit_usd": 0.0, "last_scan_at": None,
+        }

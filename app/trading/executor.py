@@ -239,6 +239,185 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
     raise TradingRefused(f"Exécution non implémentée pour le DEX '{dex}' (voir EXECUTABLE_DEXES).")
 
 
+def _build_triangular_swap_call(dex: str, w3, *, token_a: str, token_b: str, token_c: str,
+                                 amount_in: int, min_amount_out: int, recipient: str,
+                                 deadline: int) -> tuple[str, list[dict], str, tuple]:
+    """Construit l'appel multi-hop UNIQUE token_a -> token_b -> token_c -> token_a
+    (voir `app.trading.triangular`) : UNE SEULE transaction pour tout le cycle,
+    atomique (si une jambe échoue, l'intégralité revert — aucun état
+    intermédiaire possible, contrairement au round-trip classique 2-jambes de
+    `_build_swap_call`/`execute_signal`). Ne supporte que les DEX listés dans
+    `app.trading.triangular.TRIANGULAR_CAPABLE_DEXES` (Uniswap V3 exclu, voir
+    son docstring) ; lève `TradingRefused` sinon."""
+    from web3 import Web3
+
+    from app.trading.triangular import TRIANGULAR_CAPABLE_DEXES
+    if dex not in TRIANGULAR_CAPABLE_DEXES or dex not in EXECUTABLE_DEXES:
+        raise TradingRefused(
+            f"Exécution triangulaire non implémentée pour le DEX '{dex}' (voir TRIANGULAR_CAPABLE_DEXES)."
+        )
+    router_address = ROUTER_ADDRESSES[dex]
+    a_cs = Web3.to_checksum_address(token_a)
+    b_cs = Web3.to_checksum_address(token_b)
+    c_cs = Web3.to_checksum_address(token_c)
+    recipient_cs = Web3.to_checksum_address(recipient)
+
+    if dex == "aerodrome":
+        router = w3.eth.contract(address=Web3.to_checksum_address(router_address), abi=AERODROME_ROUTER_ABI)
+        default_factory = router.functions.defaultFactory().call()
+        routes = [
+            (a_cs, b_cs, False, default_factory),
+            (b_cs, c_cs, False, default_factory),
+            (c_cs, a_cs, False, default_factory),
+        ]
+        return router_address, AERODROME_ROUTER_ABI, "swapExactTokensForTokens", (
+            amount_in, min_amount_out, routes, recipient_cs, deadline,
+        )
+
+    # Forks V2 classiques : chemin multi-hop natif à swapExactTokensForTokens
+    # (même fonction/ABI que le round-trip 2-jambes, juste un path à 4 adresses
+    # au lieu de 2 — aucune nouvelle primitive de routeur nécessaire).
+    path = [a_cs, b_cs, c_cs, a_cs]
+    return router_address, UNISWAP_V2_ROUTER_ABI, "swapExactTokensForTokens", (
+        amount_in, min_amount_out, path, recipient_cs, deadline,
+    )
+
+
+def execute_triangular_signal(db: Database, config: dict, signal: dict) -> dict:
+    """Tente d'exécuter réellement un cycle triangulaire pour `signal` (dict au
+    format retourné par `app.trading.triangular.run_triangular_scan`) : UNE
+    SEULE transaction multi-hop token_a -> token_b -> token_c -> token_a.
+
+    Retourne toujours un dict `{"executed": bool, "tx_hash": str|None,
+    "error": str|None}`. Contrairement à `execute_signal` (2 transactions
+    séparées), il n'y a ICI aucun état intermédiaire possible à gérer : soit
+    la transaction entière passe (tous les 3 hops ont respecté leur
+    `min_amount_out` implicite via le `min_amount_out` final du cycle), soit
+    elle revert entièrement on-chain et le wallet n'a RIEN perdu d'autre que
+    le gas de la tentative — pas de garde-fou de récupération de position
+    équivalent à `recover_open_positions` nécessaire ici."""
+    result = {"executed": False, "tx_hash": None, "error": None}
+
+    if not is_trading_live(config):
+        result["error"] = "Trading live désactivé (voir app.trading.guardrails.is_trading_live)."
+        return result
+
+    from app.trading.triangular import TRIANGULAR_CAPABLE_DEXES
+    if signal["dex"] not in TRIANGULAR_CAPABLE_DEXES or signal["dex"] not in EXECUTABLE_DEXES:
+        result["error"] = (
+            f"DEX non exécutable en triangulaire ({signal['dex']}) "
+            f"— seuls {sorted(TRIANGULAR_CAPABLE_DEXES & EXECUTABLE_DEXES)} sont implémentés."
+        )
+        return result
+
+    if signal["token_a_address"].lower() not in EXECUTABLE_QUOTE_TOKENS:
+        result["error"] = (
+            f"Token de départ/arrivée {signal['token_a_symbol']} non exécutable — seuls USDC/WETH sont supportés."
+        )
+        return result
+
+    if not signal.get("would_execute"):
+        result["error"] = "Signal non marqué rentable (would_execute=False) — refus par prudence."
+        return result
+
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
+        if not w3.is_connected():
+            result["error"] = "RPC Base injoignable."
+            return result
+
+        from app.trading.guardrails import trading_keystore_path
+        from app.wallet.signer import load_signer
+        signer_account = load_signer(
+            keystore_path=trading_keystore_path(), passphrase=os.environ.get("WALLET_TRADING_PASSPHRASE")
+        )
+        wallet_address = signer_account.address
+        signer_account = None
+
+        token_a = signal["token_a_address"]
+        token_b = signal["token_b_address"]
+        token_c = signal["token_c_address"]
+        trade_size_usd = float(signal["trade_size_usd"])
+        slip = slippage_pct() / 100.0
+        deadline = int(time.time()) + 180
+
+        token_a_decimals = _get_decimals(w3, token_a)
+
+        quote_usd_price = _quote_token_usd_price(token_a)
+        if not quote_usd_price or quote_usd_price <= 0:
+            result["error"] = f"Prix USD de {signal['token_a_symbol']} indisponible — refus par prudence."
+            return result
+
+        # --- Garde-fou solde réel : ne jamais trader plus que ce qui est dispo ---
+        token_a_contract = w3.eth.contract(address=Web3.to_checksum_address(token_a), abi=ERC20_ABI)
+        token_a_balance_units = int(
+            token_a_contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
+        )
+        amount_in_tokens = trade_size_usd / quote_usd_price
+        amount_in_units = int(amount_in_tokens * (10 ** token_a_decimals))
+        if amount_in_units > token_a_balance_units:
+            result["error"] = (
+                f"Solde {signal['token_a_symbol']} insuffisant "
+                f"({token_a_balance_units / 10**token_a_decimals:.6f} < {amount_in_tokens:.6f} requis "
+                f"pour {trade_size_usd:.4f}$) — refus."
+            )
+            return result
+
+        # min_amount_out dérivé du cycle_multiplier mesuré à la détection
+        # (même token en entrée et en sortie : pas de conversion de décimales
+        # à faire, le ratio s'applique directement en unités brutes).
+        expected_amount_out_units = int(amount_in_units * signal["cycle_multiplier"])
+        min_amount_out_units = int(expected_amount_out_units * (1 - slip))
+
+        approve_result = _ensure_allowance(
+            db, w3, token_address=token_a, owner=wallet_address,
+            spender=ROUTER_ADDRESSES[signal["dex"]], amount=amount_in_units,
+        )
+        if approve_result["error"]:
+            result["error"] = f"Approve échoué : {approve_result['error']}"
+            return result
+
+        contract_address, abi, fn_name, args = _build_triangular_swap_call(
+            signal["dex"], w3, token_a=token_a, token_b=token_b, token_c=token_c,
+            amount_in=amount_in_units, min_amount_out=min_amount_out_units,
+            recipient=wallet_address, deadline=deadline,
+        )
+        swap_result = send_trading_transaction(
+            db, rpc_url=_resolve_rpc_url(), contract_address=contract_address, abi=abi,
+            function_name=fn_name, args=args, whitelist_target=contract_address,
+            action_label=(
+                f"arbitrage triangulaire {signal['token_a_symbol']}->{signal['token_b_symbol']}->"
+                f"{signal['token_c_symbol']}->{signal['token_a_symbol']} sur {signal['dex']}"
+            ),
+        )
+        result["tx_hash"] = swap_result["tx_hash"]
+        if swap_result["error"]:
+            result["error"] = f"Cycle triangulaire échoué (revert complet, aucun fonds déplacé) : {swap_result['error']}"
+            db.mark_triangular_signal_executed(signal["id"], tx_hash=result["tx_hash"], execution_error=result["error"])
+            return result
+
+        result["executed"] = True
+        db.mark_triangular_signal_executed(signal["id"], tx_hash=result["tx_hash"])
+        db.add_notification(
+            title="✅ Cycle triangulaire exécuté",
+            message=(
+                f"{signal['token_a_symbol']}->{signal['token_b_symbol']}->{signal['token_c_symbol']}->"
+                f"{signal['token_a_symbol']} sur {signal['dex']} — tx {result['tx_hash']}"
+            ),
+            level="info",
+        )
+        return result
+
+    except TradingRefused as exc:
+        result["error"] = f"Refusé par un garde-fou : {exc}"
+        return result
+    except Exception as exc:  # noqa: BLE001 - jamais de crash du scheduler pour une tentative de trade
+        logger.exception("Erreur inattendue pendant execute_triangular_signal")
+        result["error"] = f"Erreur inattendue : {exc}"
+        return result
+
+
 def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) -> float | None:
     """Lit le prix de `token_address` (exprimé en `quote_address` puis converti
     en $) DIRECTEMENT depuis le pool on-chain réellement utilisé par
