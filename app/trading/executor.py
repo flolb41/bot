@@ -99,6 +99,40 @@ _QUOTE_TOKEN_COINGECKO_ID: dict[str, str | None] = {
 
 _DECIMALS_CACHE: dict[str, int] = {}
 
+# Cache TTL (secondes) pour les résolutions de route/pool "la plus liquide"
+# (`_best_v3_style_pool`, `_resolve_aerodrome_route`, `_resolve_pancakeswap_route`)
+# — ces résolutions nécessitent jusqu'à 2 appels RPC PAR fee tier testé (jusqu'à
+# 8 pour Uniswap/PancakeSwap V3 à 4 fee tiers), coût ajouté le 08/10 en
+# remplaçant "premier fee tier existant" par "fee tier le plus liquide" (voir
+# `_find_uniswap_v3_fee_tier`). Sans cache, LA MÊME paire était re-résolue
+# plusieurs fois par cycle de scan (une fois par `_refine_spread_with_onchain_price`
+# pour chaque côté du spread, puis à nouveau lors de la construction réelle du
+# swap en cas de tentative d'exécution) — confirmé responsable de l'essentiel
+# du dépassement d'un cycle de scan au-delà de l'intervalle configuré (passage
+# de ~70s à ~116s après ce correctif). La liquidité d'une pool ne varie pas
+# assez en quelques dizaines de secondes pour justifier une relecture RPC à
+# chaque appel ; un TTL court (très inférieur à la durée d'un cycle de scan)
+# élimine la redondance intra-cycle sans risquer de route obsolète d'un cycle
+# à l'autre.
+_ROUTE_CACHE_TTL_SECONDS = 20.0
+_ROUTE_CACHE_MISSING = object()
+_route_cache: dict[tuple, tuple[float, object]] = {}
+
+
+def _route_cache_get(key: tuple) -> object:
+    entry = _route_cache.get(key)
+    if entry is None:
+        return _ROUTE_CACHE_MISSING
+    expires_at, value = entry
+    if time.monotonic() > expires_at:
+        _route_cache.pop(key, None)
+        return _ROUTE_CACHE_MISSING
+    return value
+
+
+def _route_cache_set(key: tuple, value: object) -> None:
+    _route_cache[key] = (time.monotonic() + _ROUTE_CACHE_TTL_SECONDS, value)
+
 
 def _resolve_rpc_url() -> str:
     return os.environ.get("RPC_BASE") or "https://mainnet.base.org"
@@ -310,7 +344,20 @@ def _best_v3_style_pool(w3, factory_address: str, factory_abi: list[dict], fee_t
     l'exécution vers une pool différente de celle utilisée pour chiffrer le
     signal, confirmé par un revert `InsufficientProfit` sur DEGEN/WETH en
     flashloan). Retourne (fee_tier, pool_address) ou None si aucune pool
-    n'existe."""
+    n'existe.
+
+    Résultat mis en cache (`_route_cache`, TTL `_ROUTE_CACHE_TTL_SECONDS`) :
+    cette recherche coûte jusqu'à 2 appels RPC par fee tier testé, et est
+    appelée plusieurs fois pour LA MÊME paire au sein d'un même cycle de scan
+    (affinage de prix des deux côtés du spread, puis construction du swap en
+    cas de tentative d'exécution) — voir commentaire sur `_ROUTE_CACHE_TTL_SECONDS`."""
+    cache_key = (
+        "v3_style_pool", factory_address.lower(), fee_tiers, token_address.lower(), quote_address.lower(),
+    )
+    cached = _route_cache_get(cache_key)
+    if cached is not _ROUTE_CACHE_MISSING:
+        return cached  # type: ignore[return-value]
+
     from web3 import Web3
     factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=factory_abi)
     token_cs = Web3.to_checksum_address(token_address)
@@ -329,6 +376,7 @@ def _best_v3_style_pool(w3, factory_address: str, factory_abi: list[dict], fee_t
             continue
         best_reserve = reserve
         best = (fee_tier, pool_address)
+    _route_cache_set(cache_key, best)
     return best
 
 
@@ -350,7 +398,16 @@ def _best_aerodrome_slipstream_pool(w3, token_address: str, quote_address: str) 
     PAS codé en dur, car potentiellement incomplet/évolutif). Choisie par plus
     grande réserve on-chain de `quote_address`. Retourne
     (router_address, tick_spacing, pool_address) ou None si aucune pool
-    n'existe sur aucune des 3 factories."""
+    n'existe sur aucune des 3 factories.
+
+    Résultat mis en cache (`_route_cache`, voir `_best_v3_style_pool`) : coût
+    RPC similaire (jusqu'à 2 appels par tick spacing, sur 3 factories), rappelé
+    plusieurs fois par cycle pour la même paire."""
+    cache_key = ("aerodrome_slipstream_pool", token_address.lower(), quote_address.lower())
+    cached = _route_cache_get(cache_key)
+    if cached is not _ROUTE_CACHE_MISSING:
+        return cached  # type: ignore[return-value]
+
     from web3 import Web3
     token_cs = Web3.to_checksum_address(token_address)
     quote_cs = Web3.to_checksum_address(quote_address)
@@ -376,6 +433,7 @@ def _best_aerodrome_slipstream_pool(w3, token_address: str, quote_address: str) 
                 continue
             best_reserve = reserve
             best = (router_address, tick_spacing, pool_address)
+    _route_cache_set(cache_key, best)
     return best
 
 
@@ -390,7 +448,17 @@ def _resolve_aerodrome_route(w3, token_in: str, token_out: str) -> dict | None:
     de prix) — les deux doivent appeler EXACTEMENT cette fonction pour rester
     cohérents sur la pool choisie. Retourne un dict (`is_slipstream`, `router`,
     `pool`, + `default_factory` ou `tick_spacing` selon le cas), ou `None` si
-    aucune pool n'existe nulle part pour cette paire."""
+    aucune pool n'existe nulle part pour cette paire.
+
+    Résultat mis en cache (`_route_cache`, voir `_best_v3_style_pool`) : en
+    plus de `_best_aerodrome_slipstream_pool` (déjà caché), les lectures
+    "classic pool" ci-dessous (`defaultFactory`/`poolFor`/`balanceOf`) sont
+    elles aussi rappelées plusieurs fois par cycle pour la même paire."""
+    cache_key = ("aerodrome_route", token_in.lower(), token_out.lower())
+    cached = _route_cache_get(cache_key)
+    if cached is not _ROUTE_CACHE_MISSING:
+        return cached  # type: ignore[return-value]
+
     from web3 import Web3
     token_in_cs = Web3.to_checksum_address(token_in)
     token_out_cs = Web3.to_checksum_address(token_out)
@@ -426,20 +494,32 @@ def _resolve_aerodrome_route(w3, token_in: str, token_out: str) -> dict | None:
 
     if slipstream is not None and slipstream_reserve > classic_reserve:
         router_address, tick_spacing, pool_address = slipstream
-        return {"is_slipstream": True, "router": router_address, "tick_spacing": tick_spacing, "pool": pool_address}
-    if classic_pool is not None:
-        return {
+        result = {
+            "is_slipstream": True, "router": router_address, "tick_spacing": tick_spacing, "pool": pool_address,
+        }
+    elif classic_pool is not None:
+        result = {
             "is_slipstream": False, "router": ROUTER_ADDRESSES["aerodrome"],
             "default_factory": default_factory, "pool": classic_pool,
         }
-    return None
+    else:
+        result = None
+    _route_cache_set(cache_key, result)
+    return result
 
 
 def _resolve_pancakeswap_route(w3, token_in: str, token_out: str) -> dict | None:
     """Même principe que `_resolve_aerodrome_route`, pour PancakeSwap v2
     (classique) vs PancakeSwap V3 (`_best_pancakeswap_v3_pool`). Retourne un
     dict (`is_v3`, `router`, `pool`, + `fee` si v3), ou `None` si aucune pool
-    n'existe nulle part pour cette paire."""
+    n'existe nulle part pour cette paire.
+
+    Résultat mis en cache (`_route_cache`, voir `_resolve_aerodrome_route`)."""
+    cache_key = ("pancakeswap_route", token_in.lower(), token_out.lower())
+    cached = _route_cache_get(cache_key)
+    if cached is not _ROUTE_CACHE_MISSING:
+        return cached  # type: ignore[return-value]
+
     from web3 import Web3
     token_in_cs = Web3.to_checksum_address(token_in)
     token_out_cs = Web3.to_checksum_address(token_out)
@@ -475,10 +555,13 @@ def _resolve_pancakeswap_route(w3, token_in: str, token_out: str) -> dict | None
 
     if v3 is not None and v3_reserve > classic_reserve:
         fee_tier, pool_address = v3
-        return {"is_v3": True, "router": PANCAKESWAP_V3_ROUTER_ADDRESS, "fee": fee_tier, "pool": pool_address}
-    if classic_pool is not None:
-        return {"is_v3": False, "router": ROUTER_ADDRESSES["pancakeswap"], "pool": classic_pool}
-    return None
+        result = {"is_v3": True, "router": PANCAKESWAP_V3_ROUTER_ADDRESS, "fee": fee_tier, "pool": pool_address}
+    elif classic_pool is not None:
+        result = {"is_v3": False, "router": ROUTER_ADDRESSES["pancakeswap"], "pool": classic_pool}
+    else:
+        result = None
+    _route_cache_set(cache_key, result)
+    return result
 
 
 def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: int,
