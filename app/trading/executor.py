@@ -28,9 +28,12 @@ PÉRIMÈTRE VOLONTAIREMENT RESTREINT (choix de sécurité explicites)
   uniquement son Router v2 classique (`swapExactTokensForTokens`, vérifié sur
   deux sources indépendantes — voir `app/trading/routers.py`) ; son "Smart
   Router"/Universal Router (encodage multi-route) n'est jamais utilisé.
-- Quote token exécutable : uniquement USDC (`EXECUTABLE_QUOTE_TOKENS`). Un
-  round-trip part et termine en USDC — jamais dans un token volatile — pour
-  ne jamais finir avec un "reste" de valeur imprévisible si la 2e jambe échoue.
+- Quote tokens exécutables : USDC et WETH (`EXECUTABLE_QUOTE_TOKENS`). Un
+  round-trip part et termine dans LE MÊME quote token (jamais un mélange) —
+  pour ne jamais finir avec un "reste" de valeur imprévisible si la 2e jambe
+  échoue. WETH étant volatile (contrairement à l'USDC), son solde est
+  reconverti en $ via `get_quote_trading_balance_usd` (prix CoinGecko) pour
+  le dimensionnement dynamique des trades (voir `app/trading/arbitrage.py`).
 - Risque non-atomique assumé : 2 transactions séparées (achat puis vente), pas
   un contrat atomique. Avant la 2e jambe, le prix est revérifié en direct ; si
   l'écart s'est refermé, le round-trip est annulé et le wallet garde le token
@@ -60,8 +63,19 @@ from app.trading.routers import (
 
 logger = logging.getLogger("app.trading.executor")
 
-# USDC sur Base — seul token "quote" exécutable (voir docstring ci-dessus).
-EXECUTABLE_QUOTE_TOKENS = frozenset({"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"})
+# USDC et WETH sur Base — tokens "quote" exécutables (voir docstring ci-dessus).
+# Un round-trip part et termine dans UN de ces deux tokens (jamais un mélange).
+USDC_ADDRESS = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+WETH_ADDRESS = "0x4200000000000000000000000000000000000006"
+EXECUTABLE_QUOTE_TOKENS = frozenset({USDC_ADDRESS, WETH_ADDRESS})
+
+# Pour convertir le solde réel de chaque quote token en $ (dimensionnement
+# dynamique des trades) : None = stablecoin (1 unité ≈ 1 $), sinon l'id
+# CoinGecko à passer à `app.wallet.pricing.get_price_usd`.
+_QUOTE_TOKEN_COINGECKO_ID: dict[str, str | None] = {
+    USDC_ADDRESS: None,
+    WETH_ADDRESS: "ethereum",
+}
 
 _DECIMALS_CACHE: dict[str, int] = {}
 
@@ -77,6 +91,22 @@ def _get_decimals(w3, token_address: str) -> int:
         contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
         _DECIMALS_CACHE[key] = int(contract.functions.decimals().call())
     return _DECIMALS_CACHE[key]
+
+
+def _quote_token_usd_price(quote_address: str) -> float | None:
+    """Prix USD actuel du quote token `quote_address` : 1.0 pour un stablecoin
+    (USDC), prix CoinGecko live pour un token volatile (WETH). Toutes les
+    conversions USD <-> unités de quote token dans `execute_signal` passent
+    par cette fonction — indispensable depuis l'ajout de WETH (sans elle, un
+    budget de trade en $ serait traité comme un nombre d'ETH, soit ~2500x
+    trop gros). Retourne `None` si indisponible : l'appelant doit alors
+    refuser le trade par prudence plutôt que supposer un prix."""
+    coingecko_id = _QUOTE_TOKEN_COINGECKO_ID.get(quote_address.lower())
+    if coingecko_id is None:
+        return 1.0
+    from app.wallet.pricing import get_price_usd
+    return get_price_usd(coingecko_id)
+
 
 
 def _ensure_allowance(db: Database, w3, *, token_address: str, owner: str, spender: str, amount: int,
@@ -101,16 +131,21 @@ def _ensure_allowance(db: Database, w3, *, token_address: str, owner: str, spend
     )
 
 
-def get_usdc_trading_balance_usd(config: dict) -> float | None:
-    """Retourne le solde USDC réel (en $, 1 USDC ≈ 1 $) du wallet de trading, ou
-    `None` si le trading live n'est pas actif ou si la lecture échoue (RPC
-    injoignable, keystore absent, etc.) — jamais d'exception levée, pour que
-    l'appelant (dimensionnement dynamique des trades) retombe proprement sur
-    la taille de trade statique configurée en cas de souci.
+def get_quote_trading_balance_usd(quote_address: str, config: dict) -> float | None:
+    """Retourne le solde réel (en $) du wallet de trading pour le token "quote"
+    `quote_address` (doit être dans `EXECUTABLE_QUOTE_TOKENS`), ou `None` si le
+    trading live n'est pas actif ou si la lecture échoue (RPC injoignable,
+    keystore absent, prix indisponible, etc.) — jamais d'exception levée, pour
+    que l'appelant (dimensionnement dynamique des trades) retombe proprement
+    sur la taille de trade statique configurée en cas de souci.
 
     Ne nécessite PAS la clé privée elle-même (lecture seule) : le solde est
     interrogé via l'adresse publique issue du signer déchiffré, comme pour
     `recover_open_positions`."""
+    quote_key = quote_address.lower()
+    if quote_key not in _QUOTE_TOKEN_COINGECKO_ID:
+        logger.warning("get_quote_trading_balance_usd: token '%s' non exécutable.", quote_address)
+        return None
     if not is_trading_live(config):
         return None
     try:
@@ -127,14 +162,29 @@ def get_usdc_trading_balance_usd(config: dict) -> float | None:
         wallet_address = signer_account.address
         signer_account = None
 
-        usdc_address = next(iter(EXECUTABLE_QUOTE_TOKENS))  # seul token quote exécutable (USDC Base)
-        decimals = _get_decimals(w3, usdc_address)
-        contract = w3.eth.contract(address=Web3.to_checksum_address(usdc_address), abi=ERC20_ABI)
+        decimals = _get_decimals(w3, quote_key)
+        contract = w3.eth.contract(address=Web3.to_checksum_address(quote_key), abi=ERC20_ABI)
         balance_units = int(contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call())
-        return balance_units / (10 ** decimals)
+        balance_tokens = balance_units / (10 ** decimals)
+
+        coingecko_id = _QUOTE_TOKEN_COINGECKO_ID[quote_key]
+        if coingecko_id is None:  # stablecoin : 1 unité ≈ 1 $
+            return balance_tokens
+        from app.wallet.pricing import get_price_usd
+        price_usd = get_price_usd(coingecko_id)
+        if price_usd is None:
+            logger.warning("get_quote_trading_balance_usd: prix indisponible pour %s.", coingecko_id)
+            return None
+        return balance_tokens * price_usd
     except Exception as exc:  # noqa: BLE001
-        logger.warning("get_usdc_trading_balance_usd: échec lecture solde réel : %s", exc)
+        logger.warning("get_quote_trading_balance_usd: échec lecture solde réel (%s) : %s", quote_address, exc)
         return None
+
+
+def get_usdc_trading_balance_usd(config: dict) -> float | None:
+    """Alias rétrocompatible de `get_quote_trading_balance_usd` pour l'USDC
+    (conservé car encore utilisé tel quel ailleurs/en tests)."""
+    return get_quote_trading_balance_usd(USDC_ADDRESS, config)
 
 
 def _find_uniswap_v3_fee_tier(w3, token_in: str, token_out: str) -> int:
@@ -243,7 +293,7 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
 
     if signal["quote_address"].lower() not in EXECUTABLE_QUOTE_TOKENS:
         result["error"] = (
-            f"Quote token {signal['quote_symbol']} non exécutable — seul USDC est supporté pour l'instant."
+            f"Quote token {signal['quote_symbol']} non exécutable — seuls USDC/WETH sont supportés."
         )
         return result
 
@@ -275,14 +325,20 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
         quote_decimals = _get_decimals(w3, quote_address)
         token_decimals = _get_decimals(w3, token_address)
 
+        quote_usd_price = _quote_token_usd_price(quote_address)
+        if not quote_usd_price or quote_usd_price <= 0:
+            result["error"] = f"Prix USD de {signal['quote_symbol']} indisponible — refus par prudence."
+            return result
+
         # --- Garde-fou solde réel : ne jamais trader plus que ce qui est dispo ---
         quote_contract = w3.eth.contract(address=Web3.to_checksum_address(quote_address), abi=ERC20_ABI)
         quote_balance_units = int(quote_contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call())
-        amount_in_units = int(trade_size_usd * (10 ** quote_decimals))
+        amount_in_quote_tokens = trade_size_usd / quote_usd_price
+        amount_in_units = int(amount_in_quote_tokens * (10 ** quote_decimals))
         if amount_in_units > quote_balance_units:
             result["error"] = (
-                f"Solde USDC insuffisant ({quote_balance_units / 10**quote_decimals:.4f} < "
-                f"{trade_size_usd:.4f} requis) — refus."
+                f"Solde {signal['quote_symbol']} insuffisant ({quote_balance_units / 10**quote_decimals:.6f} < "
+                f"{amount_in_quote_tokens:.6f} requis pour {trade_size_usd:.4f}$) — refus."
             )
             return result
 
@@ -369,8 +425,10 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
             return result
 
         # --- Jambe 2 : vente de token_address contre quote_address sur sell_dex ---
-        expected_quote_out = token_balance_units / (10 ** token_decimals) * fresh_sell_price
-        min_quote_out_units = int(expected_quote_out * (1 - slip) * (10 ** quote_decimals))
+        quote_usd_price_sell = _quote_token_usd_price(quote_address) or quote_usd_price
+        expected_quote_out_usd = token_balance_units / (10 ** token_decimals) * fresh_sell_price
+        expected_quote_out_tokens = expected_quote_out_usd / quote_usd_price_sell
+        min_quote_out_units = int(expected_quote_out_tokens * (1 - slip) * (10 ** quote_decimals))
 
         approve_result = _ensure_allowance(
             db, w3, token_address=token_address, owner=wallet_address,
@@ -493,6 +551,11 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
 
             token_decimals = _get_decimals(w3, token_address)
             quote_decimals = _get_decimals(w3, quote_address)
+            quote_usd_price = _quote_token_usd_price(quote_address)
+            if not quote_usd_price or quote_usd_price <= 0:
+                outcome["error"] = f"Prix USD de {position['quote_symbol']} indisponible — nouvelle tentative au prochain cycle."
+                results.append(outcome)
+                continue
 
             # Classe tous les DEX exécutables par prix décroissant, puis tente la vente
             # sur chacun jusqu'au premier succès. Le prix affiché par `_refresh_price_usd`
@@ -526,7 +589,7 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
             last_error = None
             for dex, price in dex_prices:
                 min_quote_out_units = int(
-                    token_balance_units / (10 ** token_decimals) * price * (1 - slip) * (10 ** quote_decimals)
+                    token_balance_units / (10 ** token_decimals) * price / quote_usd_price * (1 - slip) * (10 ** quote_decimals)
                 )
 
                 approve_result = _ensure_allowance(

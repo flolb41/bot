@@ -169,22 +169,25 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
 
     # Dimensionnement dynamique optionnel : au lieu d'une taille de trade fixe
     # (`max_trade_size_usd`), utiliser une fraction du capital RÉEL disponible
-    # (solde USDC on-chain du wallet de trading) si `trade_size_capital_fraction`
-    # est configuré. N'affecte jamais le coût de gas (indépendant de la taille
-    # du trade — voir `fees.estimate_gas_cost_usd`, qui ne prend pas trade_size
-    # en paramètre) : seul le montant tradé change, pas le nombre/coût des
-    # transactions. Retombe sur `max_trade_size_usd` si le trading n'est pas
-    # live ou si la lecture du solde échoue (RPC injoignable, etc.).
+    # (solde on-chain du wallet de trading, dans LE quote token du signal
+    # concerné — USDC ou WETH, voir `app.trading.executor.EXECUTABLE_QUOTE_TOKENS`)
+    # si `trade_size_capital_fraction` est configuré. N'affecte jamais le coût
+    # de gas (indépendant de la taille du trade — voir `fees.estimate_gas_cost_usd`,
+    # qui ne prend pas trade_size en paramètre) : seul le montant tradé change,
+    # pas le nombre/coût des transactions. Retombe sur `max_trade_size_usd`
+    # (par quote token non exécutable, ou si le trading n'est pas live, ou si
+    # la lecture du solde échoue — RPC injoignable, etc.).
     trade_size_capital_fraction = float(trading_cfg.get("trade_size_capital_fraction", 0) or 0)
+    quote_capital_balances_usd: dict[str, float] = {}
     if trade_size_capital_fraction > 0:
         try:
-            from app.trading.executor import get_usdc_trading_balance_usd
-            real_balance_usd = get_usdc_trading_balance_usd(config or {})
+            from app.trading.executor import EXECUTABLE_QUOTE_TOKENS, get_quote_trading_balance_usd
+            for quote_address in EXECUTABLE_QUOTE_TOKENS:
+                balance_usd = get_quote_trading_balance_usd(quote_address, config or {})
+                if balance_usd is not None and balance_usd > 0:
+                    quote_capital_balances_usd[quote_address] = balance_usd
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Dimensionnement dynamique : échec lecture solde réel, repli sur max_trade_size_usd : %s", exc)
-            real_balance_usd = None
-        if real_balance_usd is not None and real_balance_usd > 0:
-            max_trade_size_usd = trade_size_capital_fraction * real_balance_usd
+            logger.warning("Dimensionnement dynamique : échec lecture des soldes réels, repli sur max_trade_size_usd : %s", exc)
 
     groups = _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd)
     if not groups:
@@ -207,8 +210,15 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
             if spread is None or spread["spread_pct"] < min_spread_pct_to_log:
                 continue
 
+            other_address = token_b if token_address == token_a else token_a
+            quote_balance_usd = quote_capital_balances_usd.get(other_address.lower())
+            trade_size_cap_usd = (
+                trade_size_capital_fraction * quote_balance_usd
+                if trade_size_capital_fraction > 0 and quote_balance_usd is not None
+                else max_trade_size_usd
+            )
             trade_size_usd = min(
-                max_trade_size_usd,
+                trade_size_cap_usd,
                 liquidity_safety_fraction * min(spread["buy_liquidity_usd"], spread["sell_liquidity_usd"]),
             )
             if trade_size_usd <= 0:
@@ -228,7 +238,6 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
             # légèrement différents selon la pool ; on prend le premier trouvé).
             token_symbol = next((p["base_symbol"] for p in pairs if p["base_address"] == token_address),
                                  next((p["quote_symbol"] for p in pairs if p["quote_address"] == token_address), "?"))
-            other_address = token_b if token_address == token_a else token_a
             other_symbol = next((p["base_symbol"] for p in pairs if p["base_address"] == other_address),
                                  next((p["quote_symbol"] for p in pairs if p["quote_address"] == other_address), "?"))
 

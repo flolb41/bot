@@ -63,8 +63,9 @@ trading:
       coingecko_id: coinbase-wrapped-btc
   min_liquidity_usd: 10000        # ignore les pools trop fines (risque de prix manipulé/non réaliste)
   max_trade_size_usd: 3           # plafond de secours si le solde réel est illisible (RPC down, etc.)
-  # Dimensionnement dynamique : taille de trade = cette fraction du solde USDC
-  # RÉEL du wallet de trading (relu à chaque scan), au lieu d'un montant fixe.
+  # Dimensionnement dynamique : taille de trade = cette fraction du solde
+  # RÉEL (USDC ou WETH, selon la devise de cotation du signal) du wallet de
+  # trading (relu à chaque scan), au lieu d'un montant fixe.
   # Le coût de gas n'est PAS affecté (indépendant de la taille du trade, voir
   # `fees.estimate_gas_cost_usd`) : seul le montant tradé augmente avec le
   # capital disponible. Mettre à 0 pour désactiver et retomber sur

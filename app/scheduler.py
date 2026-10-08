@@ -141,13 +141,14 @@ def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = No
             s for s in profitable
             if not _is_pair_in_cooldown(db, s)
             # execute_signal refuse systématiquement tout signal dont le quote
-            # n'est pas USDC (voir app.trading.executor.EXECUTABLE_QUOTE_TOKENS) ;
+            # n'est pas USDC ou WETH (voir app.trading.executor.EXECUTABLE_QUOTE_TOKENS) ;
             # les exclure ICI évite de "gaspiller" la tentative du cycle (et le
             # cooldown qui s'ensuit) sur un signal qui ne pourra jamais
-            # s'exécuter, au détriment d'un vrai candidat USDC moins rentable
-            # mais réellement exécutable (bug observé en conditions réelles :
-            # les paires croisées WETH/cbETH affichent souvent le net_profit_usd
-            # le plus élevé mais ne sont jamais exécutables).
+            # s'exécuter, au détriment d'un vrai candidat USDC/WETH moins
+            # rentable mais réellement exécutable (bug observé en conditions
+            # réelles : les paires croisées cbETH/AERO/cbBTC/USDbC affichent
+            # souvent le net_profit_usd le plus élevé mais ne sont jamais
+            # exécutables).
             and s["quote_address"].lower() in EXECUTABLE_QUOTE_TOKENS
         ]
 
