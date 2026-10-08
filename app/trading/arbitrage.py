@@ -180,13 +180,31 @@ def _refine_spread_with_onchain_price(spread: dict, token_address: str, quote_ad
     WETH/AERO : spread à 10^44 %). Comme ces paires ne sont de toute façon
     jamais exécutables (quote non supporté), on retombe simplement sur le
     spread DexScreener d'origine sans tenter de lecture on-chain."""
-    from app.trading.executor import EXECUTABLE_QUOTE_TOKENS, _onchain_pool_price_usd
+    from app.trading.executor import EXECUTABLE_QUOTE_TOKENS, _onchain_pool_price_usd, _onchain_price_is_plausible
 
     if quote_address.lower() not in EXECUTABLE_QUOTE_TOKENS:
         return spread
 
     buy_price = _onchain_pool_price_usd(spread["buy_dex"], token_address, quote_address)
     sell_price = _onchain_pool_price_usd(spread["sell_dex"], token_address, quote_address)
+    # Garde-fou de plausibilité (voir `_onchain_price_is_plausible`) : écarte
+    # une lecture on-chain aberrante (ex. pool Uniswap V3 quasi vide pour un
+    # token récemment ajouté) plutôt que de lui faire confiance aveuglément —
+    # bug observé en prod le 2026-10-08 sur TOSHI/WETH et AERO/WETH (prix
+    # ~10^42-10^46x la référence DexScreener, faisant gagner ces signaux
+    # bidons à chaque tri par profit décroissant du scheduler).
+    if buy_price is not None and not _onchain_price_is_plausible(buy_price, spread["buy_price_usd"]):
+        logger.warning(
+            "Prix on-chain implausible ignoré pour %s sur %s (%.6g vs référence DexScreener %.6g).",
+            token_address, spread["buy_dex"], buy_price, spread["buy_price_usd"],
+        )
+        buy_price = None
+    if sell_price is not None and not _onchain_price_is_plausible(sell_price, spread["sell_price_usd"]):
+        logger.warning(
+            "Prix on-chain implausible ignoré pour %s sur %s (%.6g vs référence DexScreener %.6g).",
+            token_address, spread["sell_dex"], sell_price, spread["sell_price_usd"],
+        )
+        sell_price = None
     if buy_price is None and sell_price is None:
         return spread
     buy_price = buy_price if buy_price is not None else spread["buy_price_usd"]

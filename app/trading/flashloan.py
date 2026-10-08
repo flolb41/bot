@@ -376,8 +376,10 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
 
         # Revérification du prix en direct (le spread détecté peut s'être
         # refermé depuis le dernier scan) — même mitigation que `execute_signal`.
-        fresh_buy_price = _refresh_price_usd(signal["chain"], token_address, quote_address, signal["buy_dex"])
-        fresh_sell_price = _refresh_price_usd(signal["chain"], token_address, quote_address, signal["sell_dex"])
+        fresh_buy_price = _refresh_price_usd(signal["chain"], token_address, quote_address, signal["buy_dex"],
+                                              reference_price_usd=signal.get("buy_price_usd"))
+        fresh_sell_price = _refresh_price_usd(signal["chain"], token_address, quote_address, signal["sell_dex"],
+                                               reference_price_usd=signal.get("sell_price_usd"))
         if fresh_buy_price is None or fresh_sell_price is None:
             result["error"] = "Impossible de revérifier les prix avant la tentative flashloan — refus par prudence."
             return result

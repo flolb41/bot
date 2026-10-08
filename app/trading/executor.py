@@ -136,6 +136,48 @@ def _quote_token_usd_price(quote_address: str) -> float | None:
     return get_price_usd(coingecko_id)
 
 
+# Marge tolérée entre un prix on-chain lu directement et un prix de référence
+# (DexScreener, ou dernier prix connu) avant de considérer la lecture on-chain
+# comme non fiable — voir `_onchain_price_is_plausible`.
+_ONCHAIN_PRICE_MAX_PLAUSIBLE_RATIO = 10.0
+
+
+def _onchain_price_is_plausible(onchain_price: float | None, reference_price_usd: float | None,
+                                 max_ratio: float = _ONCHAIN_PRICE_MAX_PLAUSIBLE_RATIO) -> bool:
+    """Garde-fou de plausibilité pour un prix lu directement via
+    `_onchain_pool_price_usd` : un vrai écart de marché entre deux relectures
+    rapprochées ne dépasse jamais un facteur `max_ratio` (10x par défaut, déjà
+    très généreux) par rapport à un prix de référence connu (DexScreener au
+    moment du scan, ou dernier prix d'achat enregistré). Un ratio plus extrême
+    trahit presque toujours une lecture corrompue plutôt qu'un vrai mouvement
+    de marché.
+
+    Bug observé en prod le 2026-10-08 sur TOSHI/WETH et AERO/WETH (quote=WETH,
+    donc `EXECUTABLE_QUOTE_TOKENS`, pas concerné par le fix du même jour sur
+    `_quote_token_usd_price`) : `_onchain_pool_price_usd("uniswap", ...)`
+    s'appuie sur `_find_uniswap_v3_fee_tier`, qui retient le PREMIER fee tier
+    dont la pool existe on-chain, sans vérifier sa liquidité (volontairement
+    inchangé pour ne pas risquer la route d'exécution réelle, voir
+    `_best_v3_style_pool`) — pour ces deux tokens récemment ajoutés comme seed
+    tokens, ce premier fee tier correspondait à une pool quasi vide/jamais
+    tradée, dont le `sqrtPriceX96` ne reflète aucun prix de marché réel :
+    résultat, un prix ~10^42 à 10^46 fois le prix réel. Conséquence concrète
+    au-delà de l'affichage corrompu : ce `net_profit_usd` factice gagnait
+    SYSTÉMATIQUEMENT le tri par profit décroissant du scheduler
+    (`app.scheduler.run_arbitrage_scan_job`), monopolisant la seule tentative
+    d'exécution de chaque cycle sur un signal bidon (toujours refusé par la
+    simulation `eth_call`, donc sans perte réelle de fonds) au détriment de
+    vraies opportunités rentables qui n'étaient alors jamais tentées."""
+    if onchain_price is None or onchain_price <= 0:
+        return False
+    if reference_price_usd is None or reference_price_usd <= 0:
+        # Pas de référence disponible : on ne peut pas juger, on fait confiance
+        # (comportement historique, inchangé quand aucune référence n'existe).
+        return True
+    ratio = onchain_price / reference_price_usd
+    return (1.0 / max_ratio) <= ratio <= max_ratio
+
+
 
 def _ensure_allowance(db: Database, w3, *, token_address: str, owner: str, spender: str, amount: int,
                        count_against_daily_limit: bool = True) -> dict:
@@ -826,7 +868,8 @@ def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) ->
         return None
 
 
-def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, dex: str) -> float | None:
+def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, dex: str,
+                        reference_price_usd: float | None = None) -> float | None:
     """Revérifie le prix courant sur `dex` juste avant d'agir (mitigation du
     risque non-atomique documenté en tête de fichier). Retourne None si
     indisponible (dans ce cas l'appelant doit refuser, pas supposer).
@@ -837,6 +880,15 @@ def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, de
     routé, sans ambiguïté. Si indisponible (DEX non supporté par cette lecture,
     RPC injoignable...), retombe sur DexScreener ci-dessous.
 
+    `reference_price_usd`, si fourni (dernier prix connu pour ce token : prix
+    DexScreener du signal, ou prix d'achat enregistré pour une position à
+    recouvrer), sert à écarter une lecture on-chain implausible via
+    `_onchain_price_is_plausible` AVANT de la faire confiance — voir sa
+    docstring pour le bug concret évité (pool Uniswap V3 quasi vide pour un
+    token récemment ajouté, prix ~10^42x réel, toujours gagnant du tri par
+    profit du scheduler). Si implausible, on retombe sur DexScreener
+    ci-dessous exactement comme si la lecture on-chain avait échoué.
+
     Parmi tous les pools DexScreener partageant ce `dex_id` (un même DEX peut
     exposer plusieurs pools distincts pour la même paire — Aerodrome
     stable/volatile, Uniswap v3/v4, plusieurs fee tiers v3...), on retient
@@ -846,7 +898,12 @@ def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, de
     le prix qui a servi à dimensionner le signal."""
     onchain_price = _onchain_pool_price_usd(dex, token_address, quote_address)
     if onchain_price is not None:
-        return onchain_price
+        if _onchain_price_is_plausible(onchain_price, reference_price_usd):
+            return onchain_price
+        logger.warning(
+            "Prix on-chain implausible ignoré pour %s/%s sur %s (%.6g, référence %.6g) — repli DexScreener.",
+            token_address, quote_address, dex, onchain_price, reference_price_usd,
+        )
     try:
         pairs = dex_sources.fetch_token_pairs(chain_id, token_address)
     except Exception as exc:  # noqa: BLE001
@@ -1021,8 +1078,10 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
             return result
 
         # --- Revérification du prix avant la jambe 2 (mitigation non-atomique) ---
-        fresh_sell_price = _refresh_price_usd(signal["chain"], token_address, quote_address, signal["sell_dex"])
-        fresh_buy_price = _refresh_price_usd(signal["chain"], token_address, quote_address, signal["buy_dex"])
+        fresh_sell_price = _refresh_price_usd(signal["chain"], token_address, quote_address, signal["sell_dex"],
+                                               reference_price_usd=signal.get("sell_price_usd"))
+        fresh_buy_price = _refresh_price_usd(signal["chain"], token_address, quote_address, signal["buy_dex"],
+                                              reference_price_usd=signal.get("buy_price_usd"))
         if fresh_sell_price is None:
             result["error"] = (
                 "Impossible de revérifier le prix de vente avant la 2e jambe — round-trip interrompu "
@@ -1186,7 +1245,8 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
             # DEX exécutables soient affectés — d'où le repli au lieu d'abandonner.
             dex_prices = []
             for dex in EXECUTABLE_DEXES:
-                price = _refresh_price_usd(position["chain"], token_address, quote_address, dex)
+                price = _refresh_price_usd(position["chain"], token_address, quote_address, dex,
+                                            reference_price_usd=position.get("buy_price_usd"))
                 if price:
                     dex_prices.append((dex, price))
             if not dex_prices:
