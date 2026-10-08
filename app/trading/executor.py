@@ -119,9 +119,17 @@ def _quote_token_usd_price(quote_address: str) -> float | None:
     conversions USD <-> unités de quote token dans `execute_signal` passent
     par cette fonction — indispensable depuis l'ajout de WETH (sans elle, un
     budget de trade en $ serait traité comme un nombre d'ETH, soit ~2500x
-    trop gros). Retourne `None` si indisponible : l'appelant doit alors
-    refuser le trade par prudence plutôt que supposer un prix."""
-    coingecko_id = _QUOTE_TOKEN_COINGECKO_ID.get(quote_address.lower())
+    trop gros). Retourne `None` si indisponible OU si `quote_address` n'est pas
+    un quote token connu (ni USDC ni WETH) : l'appelant doit alors refuser le
+    trade par prudence plutôt que supposer un prix de 1$ pour un token
+    volatile quelconque (bug corrigé le 2026-10-08 — `dict.get` renvoyait
+    `None` aussi bien pour "c'est un stablecoin" que pour "token absent du
+    dict", confondant les deux cas et traitant par erreur n'importe quel token
+    inconnu comme un stablecoin à 1$)."""
+    key = quote_address.lower()
+    if key not in _QUOTE_TOKEN_COINGECKO_ID:
+        return None
+    coingecko_id = _QUOTE_TOKEN_COINGECKO_ID[key]
     if coingecko_id is None:
         return 1.0
     from app.wallet.pricing import get_price_usd

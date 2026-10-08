@@ -170,8 +170,20 @@ def _refine_spread_with_onchain_price(spread: dict, token_address: str, quote_ad
     Ne modifie `spread` que si au moins un prix on-chain a pu être lu ;
     retombe silencieusement sur les prix DexScreener d'origine sinon (RPC
     indisponible, DEX non supporté par cette lecture directe...) — jamais
-    d'échec dur ici, seulement une précision en moins."""
-    from app.trading.executor import _onchain_pool_price_usd
+    d'échec dur ici, seulement une précision en moins.
+
+    Réservé aux quote tokens exécutables (USDC/WETH, `EXECUTABLE_QUOTE_TOKENS`) :
+    `_onchain_pool_price_usd` convertit via `_quote_token_usd_price`, qui ne
+    connaît que ces deux tokens — un quote exotique (ex. AERO) y était
+    auparavant silencieusement traité comme un stablecoin à 1$, produisant des
+    spreads/prix totalement aberrants (observé en prod le 2026-10-08 sur
+    WETH/AERO : spread à 10^44 %). Comme ces paires ne sont de toute façon
+    jamais exécutables (quote non supporté), on retombe simplement sur le
+    spread DexScreener d'origine sans tenter de lecture on-chain."""
+    from app.trading.executor import EXECUTABLE_QUOTE_TOKENS, _onchain_pool_price_usd
+
+    if quote_address.lower() not in EXECUTABLE_QUOTE_TOKENS:
+        return spread
 
     buy_price = _onchain_pool_price_usd(spread["buy_dex"], token_address, quote_address)
     sell_price = _onchain_pool_price_usd(spread["sell_dex"], token_address, quote_address)
