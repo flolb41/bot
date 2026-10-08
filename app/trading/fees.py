@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,12 @@ _DEFAULT_DEX_FEE_PCT = 0.30
 # plutôt que de supposer "c'est négligeable".
 ESTIMATED_GAS_UNITS_ROUNDTRIP = 300_000
 
+# Cache court du gas price Base : évite de refaire un appel RPC à chaque scan/
+# estimation de profit alors que le gas price varie peu d'une seconde à
+# l'autre — voir `estimate_base_gas_price_gwei`.
+_GAS_PRICE_CACHE_TTL_SECONDS = 20.0
+_gas_price_cache: tuple[float, float] | None = None  # (expiration monotonic, valeur en gwei)
+
 # Tampon de slippage : sécurité supplémentaire au-delà du spread affiché,
 # pour couvrir le mouvement de prix entre détection et exécution ainsi que
 # l'impact de prix de notre propre trade sur des pools à faible liquidité.
@@ -52,14 +59,31 @@ def dex_fee_pct(dex_id: str) -> float:
 def estimate_base_gas_price_gwei() -> float | None:
     """Interroge le RPC Base configuré (RPC_BASE, sinon l'endpoint public
     gratuit mainnet.base.org) pour le gas price courant. Lecture seule,
-    aucune clé privée utilisée. Retourne None si indisponible."""
+    aucune clé privée utilisée. Retourne None si indisponible.
+
+    Mis en cache `_GAS_PRICE_CACHE_TTL_SECONDS` (le gas price Base bouge peu
+    d'une seconde à l'autre) ET protégé par retry sur 429 — cette fonction est
+    appelée à CHAQUE scan (`app.trading.arbitrage`/`triangular`) ainsi que
+    pendant l'estimation de profit flashloan, ce qui en fait l'un des plus
+    gros consommateurs de quota RPC. Sans cache, elle contribuait de façon
+    disproportionnée au rate-limiting (429) observé en conditions réelles sur
+    l'endpoint Infura configuré, qui finissait par faire échouer les AUTRES
+    appels RPC critiques (solde, décimales, envoi de transaction)."""
+    global _gas_price_cache
+    now = time.monotonic()
+    if _gas_price_cache is not None and now < _gas_price_cache[0]:
+        return _gas_price_cache[1]
+
     rpc_url = os.environ.get("RPC_BASE") or "https://mainnet.base.org"
     try:
         from web3 import Web3  # import local : dépendance lourde, chargée à la demande
+        from app.trading.guardrails import call_with_rate_limit_retry
 
         w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
-        gas_price_wei = w3.eth.gas_price
-        return gas_price_wei / 1e9
+        gas_price_wei = call_with_rate_limit_retry(lambda: w3.eth.gas_price)
+        gas_price_gwei = gas_price_wei / 1e9
+        _gas_price_cache = (now + _GAS_PRICE_CACHE_TTL_SECONDS, gas_price_gwei)
+        return gas_price_gwei
     except Exception as exc:  # defensif : RPC public parfois instable
         logger.warning("Impossible de récupérer le gas price Base (%s) : %s", rpc_url, exc)
         return None

@@ -43,7 +43,15 @@ LIVE_CONFIRMATION_PHRASE = "JE CONFIRME LE TRADING REEL AVEC MON WALLET PRINCIPA
 # avec un VRAI revert (manque de rentabilité), ce qui déclenche à tort le
 # disjoncteur de sécurité (`app.trading.pair_health`, 3 échecs consécutifs →
 # pause de 2h) alors que rien n'indique que le trade n'était pas rentable.
-_RATE_LIMIT_MAX_ATTEMPTS = 3
+#
+# Relevé en conditions réelles (endpoint Infura configuré) : les 429 ne sont
+# PAS rares/isolés mais quasi-CONTINUS sous la charge actuelle (plusieurs par
+# minute, sur des appels complètement différents — gas price, decimals, solde,
+# connexion). 3 tentatives à 2s fixes (≈4s de patience totale) s'épuisaient
+# avant la fin du rate-limit et laissaient échouer la tentative d'exécution
+# quand même. Backoff exponentiel (2s, 4s, 8s, 16s, 32s) sur 6 tentatives
+# (≈62s de patience totale) pour survivre aux rafales observées.
+_RATE_LIMIT_MAX_ATTEMPTS = 6
 _RATE_LIMIT_RETRY_DELAY_SECONDS = 2.0
 
 
@@ -58,8 +66,9 @@ def is_rate_limit_error(exc: Exception) -> bool:
 def call_with_rate_limit_retry(fn_call):
     """Exécute `fn_call` (ex. `fn.call(...)`, `fn.estimate_gas(...)` ou
     `w3.is_connected()`) en retentant jusqu'à `_RATE_LIMIT_MAX_ATTEMPTS` fois
-    UNIQUEMENT si l'échec est un rate-limit RPC (429) — toute autre exception
-    (revert réel) est immédiatement propagée sans retry.
+    avec un délai qui DOUBLE à chaque tentative (2s, 4s, 8s, ...) UNIQUEMENT si
+    l'échec est un rate-limit RPC (429) — toute autre exception (revert réel)
+    est immédiatement propagée sans retry.
 
     Nom PUBLIC (pas de préfixe `_`) : réutilisé par `app.trading.executor`
     (voir `execute_signal`/`execute_triangular_signal`), dont les vérifications
@@ -69,6 +78,7 @@ def call_with_rate_limit_retry(fn_call):
     QUASI-SYSTÉMATIQUE ("RPC Base injoignable" / "Erreur inattendue : 429 ...")
     de chaque tentative d'exécution réelle malgré des signaux rentables."""
     last_exc: Exception | None = None
+    delay = _RATE_LIMIT_RETRY_DELAY_SECONDS
     for attempt in range(1, _RATE_LIMIT_MAX_ATTEMPTS + 1):
         try:
             return fn_call()
@@ -78,9 +88,10 @@ def call_with_rate_limit_retry(fn_call):
                 raise
             logger.warning(
                 "RPC rate-limited (429), nouvelle tentative %d/%d dans %.1fs : %s",
-                attempt + 1, _RATE_LIMIT_MAX_ATTEMPTS, _RATE_LIMIT_RETRY_DELAY_SECONDS, exc,
+                attempt + 1, _RATE_LIMIT_MAX_ATTEMPTS, delay, exc,
             )
-            time.sleep(_RATE_LIMIT_RETRY_DELAY_SECONDS)
+            time.sleep(delay)
+            delay *= 2
     raise last_exc  # pragma: no cover - inatteignable (la boucle raise ou return toujours)
 
 

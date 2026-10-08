@@ -170,7 +170,7 @@ def _get_decimals(w3, token_address: str) -> int:
     if key not in _DECIMALS_CACHE:
         from web3 import Web3
         contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
-        _DECIMALS_CACHE[key] = int(contract.functions.decimals().call())
+        _DECIMALS_CACHE[key] = int(call_with_rate_limit_retry(lambda: contract.functions.decimals().call()))
     return _DECIMALS_CACHE[key]
 
 
