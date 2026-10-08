@@ -12,7 +12,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.database import Database
 from app.killswitch import is_stopped
-from app.trading.arbitrage import run_arbitrage_scan
+from app.trading.arbitrage import collect_pairs_for_config, run_arbitrage_scan
 from app.trading.triangular import run_cross_dex_triangular_scan, run_triangular_scan
 
 logger = logging.getLogger("app.scheduler")
@@ -158,10 +158,20 @@ def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = No
                             level="warning",
                         )
 
-        pair_signals = run_arbitrage_scan(db, config)
+        # Récupère les pools DexScreener UNE SEULE FOIS pour ce cycle, partagées
+        # entre les 3 scans ci-dessous (voir le docstring de
+        # `collect_pairs_for_config` : ils portaient auparavant chacun sur les
+        # mêmes tokens/whitelist/liquidité et déclenchaient 3 fetches DexScreener
+        # indépendants, ce qui faisait déjà dépasser la durée d'un cycle
+        # au-delà de l'intervalle configuré — un fetch unique permet un cycle
+        # ~3x plus rapide, condition nécessaire avant de pouvoir réduire
+        # l'intervalle de scan sans effet nul (ticks sautés).
+        shared_groups = collect_pairs_for_config(config)
+
+        pair_signals = run_arbitrage_scan(db, config, groups=shared_groups)
         for s in pair_signals:
             s["kind"] = "pair"
-        triangular_signals = run_triangular_scan(db, config)
+        triangular_signals = run_triangular_scan(db, config, groups=shared_groups)
         for s in triangular_signals:
             s["kind"] = "triangular"
         signals = pair_signals + triangular_signals
@@ -173,7 +183,7 @@ def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = No
         # son propre try/except pour qu'une erreur ici ne puisse jamais
         # empêcher le scan/l'exécution réels de tourner.
         try:
-            run_cross_dex_triangular_scan(db, config)
+            run_cross_dex_triangular_scan(db, config, groups=shared_groups)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Cross-DEX triangular scan (informationnel) en échec : %s", exc)
         all_signals.extend(signals)

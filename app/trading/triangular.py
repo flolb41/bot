@@ -60,15 +60,19 @@ def _pool_rate(pair: dict, from_token: str, to_token: str) -> float | None:
     return None
 
 
-def run_triangular_scan(db: Database, config: dict | None = None) -> list[dict]:
+def run_triangular_scan(
+    db: Database, config: dict | None = None, groups: dict[str, list[dict]] | None = None
+) -> list[dict]:
     """Scanne les cycles triangulaires sur les DEX multi-hop-compatibles
     (`TRIANGULAR_CAPABLE_DEXES`), journalise tout cycle significatif en base
     (table `triangular_signals`) et retourne les signaux détectés durant ce
     cycle. N'exécute jamais de transaction — voir `app.trading.executor`.
 
-    Réutilise les pools déjà récupérés par `app.trading.arbitrage._collect_pairs`
-    (même déduplication par pool de plus grande liquidité par (paire, dex) —
-    aucun appel DexScreener supplémentaire)."""
+    `groups` : pools déjà récupérées par le scheduler cette cycle (voir
+    `app.trading.arbitrage.collect_pairs_for_config`), fetchées avec la
+    whitelist COMPLETE (pas restreinte à `TRIANGULAR_CAPABLE_DEXES`) — on
+    filtre donc nous-mêmes par `dex_whitelist` ci-dessous avant usage. Si
+    `None` (usage autonome), fetch comme avant via `_collect_pairs`."""
     trading_cfg = (config or {}).get("trading", {}) or {}
     chain_id = trading_cfg.get("chain", "base")
     dex_whitelist = (set(trading_cfg.get("dex_whitelist") or _DEFAULT_DEX_WHITELIST)
@@ -100,14 +104,19 @@ def run_triangular_scan(db: Database, config: dict | None = None) -> list[dict]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Triangular scan : échec lecture des soldes réels, repli sur max_trade_size_usd : %s", exc)
 
-    groups = _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd)
+    groups = _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd) if groups is None else groups
     if not groups:
         return []
 
-    # Index par dex : {dex_id: {frozenset({addr_a, addr_b}): pair}}
+    # Index par dex : {dex_id: {frozenset({addr_a, addr_b}): pair}}. Filtre
+    # explicitement par `dex_whitelist` (restreinte à TRIANGULAR_CAPABLE_DEXES) :
+    # nécessaire si `groups` provient du cache partagé du scheduler, qui couvre
+    # la whitelist complète (sans incidence si `groups` était déjà filtré).
     by_dex: dict[str, dict[frozenset, dict]] = {}
     for pairs in groups.values():
         for pair in pairs:
+            if pair["dex_id"] not in dex_whitelist:
+                continue
             by_dex.setdefault(pair["dex_id"], {})[
                 frozenset({pair["base_address"], pair["quote_address"]})
             ] = pair
@@ -241,7 +250,9 @@ def run_triangular_scan(db: Database, config: dict | None = None) -> list[dict]:
     return signals
 
 
-def run_cross_dex_triangular_scan(db: Database, config: dict | None = None) -> list[dict]:
+def run_cross_dex_triangular_scan(
+    db: Database, config: dict | None = None, groups: dict[str, list[dict]] | None = None
+) -> list[dict]:
     """Détecte des cycles triangulaires dont les 3 jambes prennent chacune le
     MEILLEUR taux disponible tous DEX confondus, sans exiger qu'elles soient
     toutes cotées sur le même DEX (contrairement à `run_triangular_scan`, qui
@@ -256,7 +267,12 @@ def run_cross_dex_triangular_scan(db: Database, config: dict | None = None) -> l
     hors scope de ce lot d'améliorations). Les cycles détectés sont
     journalisés en base (table `cross_dex_triangular_signals`, voir
     `Database.list_cross_dex_triangular_signals`) pour inspection manuelle —
-    jamais exécutés ni proposés à l'exécution automatique."""
+    jamais exécutés ni proposés à l'exécution automatique.
+
+    `groups` : pools déjà récupérées cette cycle avec la MÊME whitelist complète
+    (voir `app.trading.arbitrage.collect_pairs_for_config`) — aucun filtrage
+    supplémentaire nécessaire ici, contrairement à `run_triangular_scan`. Si
+    `None` (usage autonome), fetch comme avant via `_collect_pairs`."""
     trading_cfg = (config or {}).get("trading", {}) or {}
     chain_id = trading_cfg.get("chain", "base")
     dex_whitelist = set(trading_cfg.get("dex_whitelist") or _DEFAULT_DEX_WHITELIST)
@@ -270,7 +286,7 @@ def run_cross_dex_triangular_scan(db: Database, config: dict | None = None) -> l
     if not dex_whitelist:
         return []
 
-    groups = _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd)
+    groups = _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd) if groups is None else groups
     if not groups:
         return []
 

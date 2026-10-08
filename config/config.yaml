@@ -13,12 +13,25 @@ telegram:
   chat_id: "${TELEGRAM_CHAT_ID}"
 
 scheduler:
-  # Fréquence du scan d'arbitrage inter-DEX (bot de trading, LIVE). 5 appels
-  # DEX Screener par scan (1 par token seed), throttlés à 1,1s d'intervalle
-  # (voir app/trading/dex_sources.py) : même à 1 min, on reste ~5 req/min,
-  # très en dessous de la limite documentée de 60 req/min. CoinGecko est mis
-  # en cache 10 min indépendamment de cette fréquence (pas d'appel supplémentaire).
-  arbitrage_scan_interval_minutes: 3
+  # Fréquence du scan d'arbitrage inter-DEX (bot de trading, LIVE). 14 appels
+  # DEX Screener par CYCLE (1 par token seed — 14 seed tokens au 08/10, pas 5),
+  # throttlés à 1,1s d'intervalle (voir app/trading/dex_sources.py) : ~14
+  # req/min même à 1 min d'intervalle, très en dessous de la limite documentée
+  # de 60 req/min. CoinGecko est mis en cache 10 min indépendamment de cette
+  # fréquence (pas d'appel supplémentaire).
+  #
+  # Abaissé de 3 à 1 min le 08/10, APRÈS avoir corrigé un bug distinct qui
+  # rendait cette valeur sans effet : `run_arbitrage_scan`, `run_triangular_scan`
+  # ET `run_cross_dex_triangular_scan` (tous appelés dans le même cycle, voir
+  # app/scheduler.py::run_arbitrage_scan_job) interrogeaient CHACUN DexScreener
+  # indépendamment pour les MÊMES tokens/whitelist/liquidité (39 appels/cycle,
+  # pas 13), faisant déjà dépasser la durée réelle d'un cycle au-delà de 3 min
+  # — confirmé en production : "maximum number of running instances reached"
+  # sur la quasi-totalité des ticks programmés. Un seul fetch partagé par
+  # cycle (voir app/trading/arbitrage.py::collect_pairs_for_config) règle ce
+  # problème ET justifie de pouvoir descendre à 1 min sans risquer de
+  # surcharger DexScreener ni de faire chevaucher les cycles.
+  arbitrage_scan_interval_minutes: 1
 
 dashboard:
   enabled: true
@@ -149,7 +162,21 @@ trading:
     - symbol: ZORA
       address: "0x1111111111166b7fe7bd91427724b487980afc69"
       coingecko_id: zora
-      coingecko_id: toshi
+    # wstETH (Wrapped liquid staked Ether, bridgé via Superbridge) ajouté le
+    # 08/10 : adresse vérifiée via DEUX sources indépendantes (API CoinGecko
+    # officielle `platforms.base` + API DexScreener en direct). Coté WETH sur
+    # 2 DEX whitelistés — uniswap (~98k$) et aerodrome (~859k$, ~10 achats/8
+    # ventes en 24h, pool active malgré un volume modeste pour sa taille) —
+    # satisfait le critère "même quote token sur ≥2 DEX whitelistés". LST
+    # (Lido) : volatilité de prix nettement plus faible que DEGEN/BRETT, mais
+    # dérive lentement vs WETH (taux de staking), source de spread récurrent.
+    # Écartés lors de cette recherche : EIGEN (une seule pool DexScreener
+    # détectée, aerodrome/WETH ~15k$ — aucun second DEX pour former une paire),
+    # SEAM/Seamless (pool USDC principale ~55k$ sur uniswap mais toutes les
+    # pools concurrentes sous 10k$ — pas de second DEX exploitable).
+    - symbol: wstETH
+      address: "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452"
+      coingecko_id: superbridge-bridged-wsteth-base
   min_liquidity_usd: 10000        # ignore les pools trop fines (risque de prix manipulé/non réaliste)
   max_trade_size_usd: 3           # plafond de secours si le solde réel est illisible (RPC down, etc.)
   # Dimensionnement dynamique : taille de trade = cette fraction du solde
@@ -201,9 +228,8 @@ trading:
   # (décision explicite de l'utilisateur), EN PLUS de
   # `enabled`/`TRADING_ENABLED`/`TRADING_LIVE_CONFIRMED` ci-dessus (voir
   # app/trading/guardrails.py::is_trading_live, toujours requis en plus).
-  # Uniswap V3 n'est jamais utilisé par cette voie (contrat non compatible
-  # avec son interface) : seuls aerodrome/sushiswap/pancakeswap/baseswap/
-  # alien-base/swapbased sont éligibles (voir
+  # Uniswap V3, aerodrome, sushiswap, pancakeswap, baseswap, alien-base et
+  # swapbased sont éligibles à cette voie (voir
   # app/trading/flashloan.py::FLASHLOAN_CAPABLE_DEXES).
   flashloan_enabled: true
   # Plafond du montant notionnel empruntable par flashloan, en $ (indépendant
@@ -214,7 +240,21 @@ trading:
   # `liquidity_safety_fraction` ci-dessus (2% de la plus petite liquidité de
   # pool parmi les jambes du cycle) : cette valeur reste un plafond de risque
   # configurable, pas le montant systématiquement emprunté.
-  flashloan_notional_usd: 1000
+  #
+  # Relevé le 08/10 de 1000$ à 10000$ : vérification DexScreener en
+  # production a confirmé que ce plafond à 1000$ était le facteur BLOQUANT
+  # (pas la liquidité réelle des pools) sur les paires flashloan les plus
+  # rentables observées : BRETT/WETH aerodrome↔pancakeswap (liquidité min.
+  # ~195k$ → borne réelle liquidity_safety_fraction ≈3900$), BRETT/WETH
+  # uniswap↔aerodrome (liquidité min. ~827k$ → borne ≈16500$), VIRTUAL/WETH
+  # (liquidité min. ~352k$ → borne ≈7000$), MORPHO/WETH (liquidité min.
+  # ~908k$ → borne ≈18000$). Le nouveau plafond (10000$) reste strictement
+  # borné individuellement par `liquidity_safety_fraction` pour CHAQUE paire
+  # (ex. DEGEN/WETH via aerodrome, liquidité ~33k$ → reste capé à ≈650$ même
+  # avec ce plafond relevé) : aucune paire ne peut dépasser sa propre borne de
+  # sécurité liée à sa liquidité réelle, seul le plafond artificiel qui
+  # empêchait d'exploiter pleinement les paires les plus liquides est levé.
+  flashloan_notional_usd: 10000
   # Profit net minimum exigé (frais DEX + prime flashloan Aave ~0,05% +
   # tampon de slippage + gas déjà déduits) pour tenter un flashloan —
   # volontairement plus élevé que min_net_profit_usd classique : chaque

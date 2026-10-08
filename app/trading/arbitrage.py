@@ -240,11 +240,45 @@ def _profitability(spread: dict, trade_size_usd: float, slippage_buffer_pct: flo
     }
 
 
-def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
+def collect_pairs_for_config(config: dict | None = None) -> dict[str, list[dict]]:
+    """Point d'entrée public pour récupérer UNE SEULE FOIS les pools DexScreener
+    (tous DEX whitelistés confondus, c'est-à-dire la whitelist COMPLETE de
+    `trading.dex_whitelist` — un sur-ensemble de celle, plus restreinte, utilisée
+    par `run_triangular_scan`) à partager entre `run_arbitrage_scan`,
+    `run_triangular_scan` et `run_cross_dex_triangular_scan` au sein d'un même
+    cycle de scheduler (voir `app.scheduler.run_arbitrage_scan_job`).
+
+    Ces trois scans portaient chacun sur les MÊMES tokens seed / whitelist
+    (restreinte ou non) / seuil de liquidité et interrogeaient DexScreener de
+    façon totalement indépendante (3x `_collect_pairs`, donc 3x N appels
+    DexScreener par cycle, N = nombre de tokens seed) pour des données qui ne
+    varient pas assez en quelques secondes pour justifier une triple lecture.
+    Confirmé en production : ce triple fetch (~3 x 13 appels, throttlés à 1.1s
+    chacun dans `app.trading.dex_sources`) faisait déjà largement dépasser la
+    durée d'un cycle au-delà de l'intervalle configuré (3 min), si bien que
+    PRESQUE CHAQUE tick du scheduler était sauté ("maximum number of running
+    instances reached") — réduire l'intervalle sans régler ce point n'aurait
+    eu AUCUN effet. Partager un seul fetch par cycle divise par ~3 le temps et
+    le volume d'appels de chaque cycle."""
+    trading_cfg = (config or {}).get("trading", {}) or {}
+    chain_id = trading_cfg.get("chain", "base")
+    dex_whitelist = set(trading_cfg.get("dex_whitelist") or _DEFAULT_DEX_WHITELIST)
+    seed_tokens = trading_cfg.get("seed_tokens") or _DEFAULT_SEED_TOKENS
+    min_liquidity_usd = float(trading_cfg.get("min_liquidity_usd", 10_000))
+    return _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd)
+
+
+def run_arbitrage_scan(
+    db: Database, config: dict | None = None, groups: dict[str, list[dict]] | None = None
+) -> list[dict]:
     """Scanne les paires inter-DEX sur les tokens "seed" configurés, journalise
     tout écart significatif en base (table arbitrage_signals), et retourne les
     signaux détectés durant ce cycle. N'exécute jamais de transaction (voir
-    garde-fous en tête de fichier)."""
+    garde-fous en tête de fichier).
+
+    `groups` : pools déjà récupérées (voir `collect_pairs_for_config`), pour
+    éviter un nouvel appel DexScreener si le scheduler les a déjà fetchées ce
+    cycle. Si `None` (usage autonome, scripts, tests), fetch comme avant."""
     trading_cfg = (config or {}).get("trading", {}) or {}
     chain_id = trading_cfg.get("chain", "base")
     dex_whitelist = set(trading_cfg.get("dex_whitelist") or _DEFAULT_DEX_WHITELIST)
@@ -278,7 +312,8 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dimensionnement dynamique : échec lecture des soldes réels, repli sur max_trade_size_usd : %s", exc)
 
-    groups = _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd)
+    if groups is None:
+        groups = _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd)
     if not groups:
         logger.info("Arbitrage scan : aucune pool éligible trouvée (liquidité/DEX whitelist).")
         return []
