@@ -345,8 +345,8 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
     if quote_address.lower() not in EXECUTABLE_QUOTE_TOKENS:
         result["error"] = f"Quote token {signal['quote_symbol']} non exécutable — seuls USDC/WETH sont supportés."
         return result
-    if not signal.get("would_execute"):
-        result["error"] = "Signal non marqué rentable (would_execute=False) — refus par prudence."
+    if not signal.get("would_execute_flashloan", signal.get("would_execute")):
+        result["error"] = "Signal non marqué rentable à l'échelle flashloan (would_execute_flashloan=False) — refus par prudence."
         return result
 
     try:
@@ -478,8 +478,8 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
     if token_a.lower() not in EXECUTABLE_QUOTE_TOKENS:
         result["error"] = f"Token de départ {signal['token_a_symbol']} non exécutable — seuls USDC/WETH sont supportés."
         return result
-    if not signal.get("would_execute"):
-        result["error"] = "Signal non marqué rentable (would_execute=False) — refus par prudence."
+    if not signal.get("would_execute_flashloan", signal.get("would_execute")):
+        result["error"] = "Signal non marqué rentable à l'échelle flashloan (would_execute_flashloan=False) — refus par prudence."
         return result
 
     try:

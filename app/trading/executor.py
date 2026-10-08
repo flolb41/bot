@@ -548,8 +548,13 @@ def execute_triangular_signal(db: Database, config: dict, signal: dict) -> dict:
         )
         return result
 
-    if not signal.get("would_execute"):
-        result["error"] = "Signal non marqué rentable (would_execute=False) — refus par prudence."
+    # `would_execute_classic` (rentabilité au capital propre) si présent, sinon
+    # repli sur `would_execute` (compat signaux plus anciens/tests) — ne jamais
+    # se fier au flag combiné `would_execute` seul ici : un signal peut y être
+    # marqué True uniquement grâce à sa rentabilité à l'échelle flashloan, ce
+    # qui ne rend pas ce microtrade (capital propre) rentable pour autant.
+    if not signal.get("would_execute_classic", signal.get("would_execute")):
+        result["error"] = "Signal non marqué rentable au capital propre (would_execute_classic=False) — refus par prudence."
         return result
 
     try:
@@ -904,8 +909,9 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
         )
         return result
 
-    if not signal.get("would_execute"):
-        result["error"] = "Signal non marqué rentable (would_execute=False) — refus par prudence."
+    # Voir commentaire équivalent dans `execute_triangular_signal` ci-dessus.
+    if not signal.get("would_execute_classic", signal.get("would_execute")):
+        result["error"] = "Signal non marqué rentable au capital propre (would_execute_classic=False) — refus par prudence."
         return result
 
     try:

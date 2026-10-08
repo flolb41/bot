@@ -21,7 +21,7 @@ from itertools import combinations
 
 from app.database import Database
 from app.trading import dex_sources, fees
-from app.trading.flashloan import estimate_pair_signal_flashloan_preview
+from app.trading.flashloan import estimate_pair_signal_flashloan_preview, flashloan_min_net_profit_usd
 from app.trading.pair_health import pair_health
 from app.wallet.pricing import get_price_usd
 
@@ -272,7 +272,7 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
                 buy_dex=spread["buy_dex"], sell_dex=spread["sell_dex"],
             )
             adaptive_min_net_profit_usd = min_net_profit_usd * health["threshold_multiplier"]
-            would_execute = (
+            would_execute_classic = (
                 not health["disabled"]
                 and profit["net_profit_usd"] is not None
                 and profit["net_profit_usd"]
@@ -300,7 +300,6 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
                 "slippage_buffer_usd": profit["slippage_buffer_usd"],
                 "gas_cost_usd": profit["gas_cost_usd"],
                 "net_profit_usd": profit["net_profit_usd"],
-                "would_execute": would_execute,
                 # Phase 1 : simulation uniquement, aucun moteur d'exécution live
                 # n'existe dans ce commit — voir garde-fous en tête de fichier.
                 "mode": "simulation",
@@ -311,7 +310,26 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
             # le solde du wallet) — `None` si le signal n'est pas éligible
             # flashloan ou si le gas est indisponible, voir
             # `app.trading.flashloan.estimate_pair_signal_flashloan_preview`.
+            # Calculé AVANT `would_execute` ci-dessous : un signal peut être non
+            # rentable au micro-capital du wallet (quelques dollars, dominé par
+            # le gas) mais tout de même rentable à l'échelle flashloan — sans
+            # ce calcul préalable, le flashloan n'était jamais tenté car
+            # `would_execute` ne considérait que `would_execute_classic`.
             flashloan_preview = estimate_pair_signal_flashloan_preview(config or {}, signal)
+            would_execute_flashloan = (
+                not health["disabled"]
+                and flashloan_preview is not None
+                and flashloan_preview["net_profit_usd"] >= flashloan_min_net_profit_usd(config or {})
+            )
+            signal["would_execute"] = would_execute_classic or would_execute_flashloan
+            # Champs distincts (non persistés en base, consommés uniquement par
+            # `app.scheduler` pour router vers la bonne voie d'exécution — voir
+            # commentaire ci-dessus) : un signal rentable UNIQUEMENT via
+            # flashloan ne doit jamais être exécuté via la voie classique
+            # (capital propre), qui utiliserait sinon `trade_size_usd` alors
+            # que ce microtrade précis n'est pas rentable à cette échelle.
+            signal["would_execute_classic"] = would_execute_classic
+            signal["would_execute_flashloan"] = would_execute_flashloan
             signal["flashloan_notional_usd"] = flashloan_preview["notional_usd"] if flashloan_preview else None
             signal["flashloan_net_profit_usd"] = flashloan_preview["net_profit_usd"] if flashloan_preview else None
             signal["id"] = db.add_arbitrage_signal(signal)

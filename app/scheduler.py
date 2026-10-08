@@ -213,16 +213,28 @@ def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = No
         best_signal = executable_candidates[0]
         # Flashloan (point 8, voir app/trading/flashloan.py) : exécution
         # financée par Aave V3, indépendante du solde réel du wallet. Essayé
-        # EN PRIORITÉ quand éligible (config + DEX/quote compatibles) ; repli
-        # automatique sur l'exécution classique (auto-financée) sinon — aucun
-        # changement de comportement par défaut (`flashloan_enabled: false`).
+        # EN PRIORITÉ quand éligible (config + DEX/quote compatibles) ET
+        # effectivement rentable à l'échelle flashloan (`would_execute_flashloan`,
+        # voir app.trading.arbitrage/triangular) ; repli automatique sur
+        # l'exécution classique (auto-financée) sinon — un signal rentable
+        # UNIQUEMENT au capital propre (`would_execute_classic`) ne doit pas
+        # être routé vers le flashloan (qui le refuserait de toute façon via
+        # son propre garde-fou, gaspillant la tentative/le cooldown du cycle).
         if best_signal["kind"] == "triangular":
-            if triangular_signal_is_flashloan_eligible(config or {}, best_signal):
+            use_flashloan = (
+                triangular_signal_is_flashloan_eligible(config or {}, best_signal)
+                and best_signal.get("would_execute_flashloan", best_signal.get("would_execute"))
+            )
+            if use_flashloan:
                 exec_result = execute_triangular_signal_via_flashloan(db, config, best_signal)
             else:
                 exec_result = execute_triangular_signal(db, config, best_signal)
         else:
-            if pair_signal_is_flashloan_eligible(config or {}, best_signal):
+            use_flashloan = (
+                pair_signal_is_flashloan_eligible(config or {}, best_signal)
+                and best_signal.get("would_execute_flashloan", best_signal.get("would_execute"))
+            )
+            if use_flashloan:
                 exec_result = execute_pair_signal_via_flashloan(db, config, best_signal)
             else:
                 exec_result = execute_signal(db, config, best_signal)

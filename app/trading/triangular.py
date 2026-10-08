@@ -23,7 +23,7 @@ import logging
 from app.database import Database
 from app.trading import fees
 from app.trading.arbitrage import _DEFAULT_DEX_WHITELIST, _DEFAULT_SEED_TOKENS, _collect_pairs
-from app.trading.flashloan import estimate_triangular_signal_flashloan_preview
+from app.trading.flashloan import estimate_triangular_signal_flashloan_preview, flashloan_min_net_profit_usd
 from app.trading.pair_health import triangular_health
 from app.wallet.pricing import get_price_usd
 
@@ -176,7 +176,7 @@ def run_triangular_scan(db: Database, config: dict | None = None) -> list[dict]:
                     slippage_buffer_usd = trade_size_usd * fees.DEFAULT_SLIPPAGE_BUFFER_PCT / 100
 
                     net_profit_usd = None
-                    would_execute = False
+                    would_execute_classic = False
                     health = triangular_health(
                         db, config or {}, dex=dex, token_a_symbol=token_a_symbol,
                         token_b_symbol=token_b_symbol, token_c_symbol=token_c_symbol,
@@ -186,7 +186,7 @@ def run_triangular_scan(db: Database, config: dict | None = None) -> list[dict]:
                     if gas_cost_usd is not None:
                         net_profit_usd = gross_profit_usd - fees_usd - slippage_buffer_usd - gas_cost_usd
                         adaptive_min_net_profit_usd = min_net_profit_usd * health["threshold_multiplier"]
-                        would_execute = not health["disabled"] and net_profit_usd >= max(
+                        would_execute_classic = not health["disabled"] and net_profit_usd >= max(
                             adaptive_min_net_profit_usd, trade_size_usd * min_net_profit_pct / 100
                         )
 
@@ -205,14 +205,27 @@ def run_triangular_scan(db: Database, config: dict | None = None) -> list[dict]:
                         "slippage_buffer_usd": slippage_buffer_usd,
                         "gas_cost_usd": gas_cost_usd,
                         "net_profit_usd": net_profit_usd,
-                        "would_execute": would_execute,
                         "mode": "simulation",
                         "executed": False,
                     }
                     # Aperçu du profit à l'échelle flashloan, même principe que
                     # `app.trading.arbitrage.run_arbitrage_scan` — voir
                     # `app.trading.flashloan.estimate_triangular_signal_flashloan_preview`.
+                    # Calculé AVANT `would_execute` : un cycle peut être non
+                    # rentable au micro-capital du wallet mais rentable à
+                    # l'échelle flashloan (voir correctif identique dans
+                    # `arbitrage.py`).
                     flashloan_preview = estimate_triangular_signal_flashloan_preview(config or {}, signal)
+                    would_execute_flashloan = (
+                        not health["disabled"]
+                        and flashloan_preview is not None
+                        and flashloan_preview["net_profit_usd"] >= flashloan_min_net_profit_usd(config or {})
+                    )
+                    signal["would_execute"] = would_execute_classic or would_execute_flashloan
+                    # Champs distincts consommés par `app.scheduler` pour le
+                    # routage — voir commentaire équivalent dans `arbitrage.py`.
+                    signal["would_execute_classic"] = would_execute_classic
+                    signal["would_execute_flashloan"] = would_execute_flashloan
                     signal["flashloan_notional_usd"] = flashloan_preview["notional_usd"] if flashloan_preview else None
                     signal["flashloan_net_profit_usd"] = (
                         flashloan_preview["net_profit_usd"] if flashloan_preview else None

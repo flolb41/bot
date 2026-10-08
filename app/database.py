@@ -324,7 +324,15 @@ class Database:
         row = self.fetch_one(
             "SELECT COUNT(*) AS total, "
             "SUM(would_execute) AS would_execute_count, "
-            "SUM(CASE WHEN would_execute = 1 THEN net_profit_usd ELSE 0 END) AS cumulative_net_profit_usd, "
+            # Un signal peut être rentable via le capital propre (`net_profit_usd`)
+            # OU via flashloan (`flashloan_net_profit_usd`), voir
+            # app.trading.arbitrage.would_execute_classic/would_execute_flashloan.
+            # On retient le meilleur des deux comme estimation du P&L réalisé
+            # si exécuté (le scheduler privilégie le flashloan quand les deux
+            # sont rentables, voir app/scheduler.py).
+            "SUM(CASE WHEN would_execute = 1 "
+            "THEN COALESCE(MAX(net_profit_usd, flashloan_net_profit_usd), net_profit_usd, flashloan_net_profit_usd, 0) "
+            "ELSE 0 END) AS cumulative_net_profit_usd, "
             "MAX(detected_at) AS last_scan_at "
             "FROM arbitrage_signals"
         )
@@ -433,7 +441,9 @@ class Database:
         row = self.fetch_one(
             "SELECT COUNT(*) AS total, "
             "SUM(would_execute) AS would_execute_count, "
-            "SUM(CASE WHEN would_execute = 1 THEN net_profit_usd ELSE 0 END) AS cumulative_net_profit_usd, "
+            "SUM(CASE WHEN would_execute = 1 "
+            "THEN COALESCE(MAX(net_profit_usd, flashloan_net_profit_usd), net_profit_usd, flashloan_net_profit_usd, 0) "
+            "ELSE 0 END) AS cumulative_net_profit_usd, "
             "MAX(detected_at) AS last_scan_at "
             "FROM triangular_signals"
         )
