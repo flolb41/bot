@@ -155,6 +155,39 @@ def _best_spread(pairs: list[dict], token_address: str) -> dict | None:
     return best
 
 
+def _refine_spread_with_onchain_price(spread: dict, token_address: str, quote_address: str) -> dict:
+    """Affine `spread` (prix DexScreener, potentiellement périmés de quelques
+    secondes à quelques minutes pour une paire peu liquide) avec le prix
+    on-chain RÉEL de chaque pool concernée — la MÊME lecture que celle faite
+    juste avant d'envoyer une transaction (voir
+    `app.trading.executor._onchain_pool_price_usd` et
+    `app.trading.flashloan.execute_pair_signal_via_flashloan`). Corrige le bug
+    observé en conditions réelles : un signal affiché "rentable" sur la seule
+    base DexScreener (ex. BRETT/WETH, spread ≈ 1 %) mais systématiquement
+    refusé à l'exécution avec un profit réel quasi nul, car l'écart n'existait
+    déjà plus on-chain au moment du scan.
+
+    Ne modifie `spread` que si au moins un prix on-chain a pu être lu ;
+    retombe silencieusement sur les prix DexScreener d'origine sinon (RPC
+    indisponible, DEX non supporté par cette lecture directe...) — jamais
+    d'échec dur ici, seulement une précision en moins."""
+    from app.trading.executor import _onchain_pool_price_usd
+
+    buy_price = _onchain_pool_price_usd(spread["buy_dex"], token_address, quote_address)
+    sell_price = _onchain_pool_price_usd(spread["sell_dex"], token_address, quote_address)
+    if buy_price is None and sell_price is None:
+        return spread
+    buy_price = buy_price if buy_price is not None else spread["buy_price_usd"]
+    sell_price = sell_price if sell_price is not None else spread["sell_price_usd"]
+    if buy_price <= 0 or sell_price <= 0:
+        return spread
+    refined = dict(spread)
+    refined["buy_price_usd"] = buy_price
+    refined["sell_price_usd"] = sell_price
+    refined["spread_pct"] = (sell_price - buy_price) / buy_price * 100
+    return refined
+
+
 def _profitability(spread: dict, trade_size_usd: float, slippage_buffer_pct: float,
                     gas_cost_usd: float | None) -> dict:
     fee_pct = fees.dex_fee_pct(spread["buy_dex"]) + fees.dex_fee_pct(spread["sell_dex"])
@@ -237,6 +270,16 @@ def run_arbitrage_scan(db: Database, config: dict | None = None) -> list[dict]:
                 continue
 
             other_address = token_b if token_address == token_a else token_a
+            # Affinage on-chain réservé aux candidats qui dépassent DÉJÀ le
+            # seuil DexScreener ci-dessus (pas tous les pools scannés) — limite
+            # le coût RPC ajouté à ~2 appels par signal potentiellement
+            # rentable, pas par pool. Un signal dont l'écart s'évapore une fois
+            # vérifié on-chain est reclassé immédiatement (voir docstring de
+            # `_refine_spread_with_onchain_price`).
+            spread = _refine_spread_with_onchain_price(spread, token_address, other_address)
+            if spread["spread_pct"] < min_spread_pct_to_log:
+                continue
+
             quote_balance_usd = quote_capital_balances_usd.get(other_address.lower())
             trade_size_cap_usd = (
                 trade_size_capital_fraction * quote_balance_usd
