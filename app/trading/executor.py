@@ -240,12 +240,23 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
 def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, dex: str) -> float | None:
     """Revérifie le prix courant sur `dex` juste avant d'agir (mitigation du
     risque non-atomique documenté en tête de fichier). Retourne None si
-    indisponible (dans ce cas l'appelant doit refuser, pas supposer)."""
+    indisponible (dans ce cas l'appelant doit refuser, pas supposer).
+
+    Parmi tous les pools DexScreener partageant ce `dex_id` (un même DEX peut
+    exposer plusieurs pools distincts pour la même paire — Aerodrome
+    stable/volatile, Uniswap v3/v4, plusieurs fee tiers v3...), on retient
+    celui de plus grande liquidité : c'est l'heuristique utilisée partout
+    ailleurs (voir `app.trading.arbitrage._collect_pairs`) pour approximer le
+    pool réellement routable par `_build_swap_call`, et rester cohérent avec
+    le prix qui a servi à dimensionner le signal."""
     try:
         pairs = dex_sources.fetch_token_pairs(chain_id, token_address)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Revérification de prix échouée pour %s sur %s: %s", token_address, dex, exc)
         return None
+
+    best_price: float | None = None
+    best_liquidity = -1.0
     for raw in pairs or []:
         if raw.get("chainId") != chain_id or raw.get("dexId") != dex:
             continue
@@ -259,14 +270,25 @@ def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, de
             price_usd = float(price_usd)
         except (TypeError, ValueError):
             continue
+
         if base.get("address", "").lower() == token_address.lower():
-            return price_usd
-        if quote.get("address", "").lower() == token_address.lower() and price_native:
+            candidate_price = price_usd
+        elif quote.get("address", "").lower() == token_address.lower() and price_native:
             try:
-                return price_usd / float(price_native)
+                candidate_price = price_usd / float(price_native)
             except (TypeError, ValueError, ZeroDivisionError):
                 continue
-    return None
+        else:
+            continue
+
+        try:
+            liquidity_usd = float((raw.get("liquidity") or {}).get("usd") or -1)
+        except (TypeError, ValueError):
+            liquidity_usd = -1.0
+        if liquidity_usd > best_liquidity:
+            best_liquidity = liquidity_usd
+            best_price = candidate_price
+    return best_price
 
 
 def execute_signal(db: Database, config: dict, signal: dict) -> dict:

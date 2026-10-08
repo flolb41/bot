@@ -83,7 +83,22 @@ def _token_usd_price(pair: dict, token_address: str) -> float | None:
 def _collect_pairs(chain_id: str, seed_tokens: list[dict], dex_whitelist: set[str],
                     min_liquidity_usd: float) -> dict[str, list[dict]]:
     """Récupère et regroupe les pools par paire canonique (couple d'adresses
-    triées), tous DEX whitelistés confondus, pour chaque token "seed"."""
+    triées), tous DEX whitelistés confondus, pour chaque token "seed".
+
+    Déduplique par (paire canonique, dex_id) : un même `dex_id` DexScreener
+    (ex. "aerodrome", "uniswap") peut recouvrir PLUSIEURS pools on-chain
+    distincts pour le même couple de tokens (ex. Aerodrome stable vs volatile,
+    pools d'une factory non-par-défaut, Uniswap v3 vs v4, plusieurs fee tiers
+    v3...). Or l'exécution (`app.trading.executor._build_swap_call`) cible
+    TOUJOURS une route précise et fixe par DEX (Aerodrome : stable=False +
+    defaultFactory ; Uniswap : v3 + le fee tier réellement liquide trouvé via
+    `_find_uniswap_v3_fee_tier`). Sans cette déduplication, un signal peut être
+    dimensionné (prix, min_amount_out) sur un pool minoritaire/obsolète alors
+    que l'exécution réelle passe par un AUTRE pool du même DEX au prix
+    différent — cause confirmée des échecs `InsufficientOutputAmount` observés
+    en conditions réelles sur AERO/aerodrome. Heuristique : le pool légitime et
+    réellement routable est quasi toujours celui de plus grande liquidité pour
+    ce couple de tokens sur ce DEX ; on ne garde que celui-là."""
     groups: dict[str, list[dict]] = {}
     for seed in seed_tokens:
         raw_pairs = dex_sources.fetch_token_pairs(chain_id, seed["address"])
@@ -97,7 +112,16 @@ def _collect_pairs(chain_id: str, seed_tokens: list[dict], dex_whitelist: set[st
                 continue
             key = "_".join(sorted([pair["base_address"], pair["quote_address"]]))
             groups.setdefault(key, []).append(pair)
+
+    for key, pairs in groups.items():
+        best_by_dex: dict[str, dict] = {}
+        for pair in pairs:
+            current_best = best_by_dex.get(pair["dex_id"])
+            if current_best is None or pair["liquidity_usd"] > current_best["liquidity_usd"]:
+                best_by_dex[pair["dex_id"]] = pair
+        groups[key] = list(best_by_dex.values())
     return groups
+
 
 
 def _best_spread(pairs: list[dict], token_address: str) -> dict | None:
