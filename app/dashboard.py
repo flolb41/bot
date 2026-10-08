@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.database import Database
 from app.killswitch import is_stopped
-from app.trading.executor import _NO_SALE_CLOSED_SENTINEL
+from app.trading.executor import EXECUTABLE_QUOTE_TOKENS, _NO_SALE_CLOSED_SENTINEL
 
 
 def build_dashboard_text(db: Database) -> str:
@@ -76,10 +76,25 @@ def build_dashboard_html(db: Database) -> str:
         arb_rows = []
         for s in arb_signals:
             net = f"{s['net_profit_usd']:.3f} $" if s["net_profit_usd"] is not None else "N/A"
-            tag = (
-                "<span class='badge' style='background:#15803d'>rentable</span>" if s["would_execute"]
-                else "<span class='badge' style='background:#475569'>non rentable</span>"
-            )
+            # `would_execute` (calculé dans app.trading.arbitrage) ne tient
+            # compte QUE de la rentabilité après frais/slippage/gas — il
+            # ignore si le quote token est réellement exécutable (seuls
+            # USDC/WETH le sont, voir EXECUTABLE_QUOTE_TOKENS). Le scheduler
+            # filtre ces signaux en silence (aucune transaction jamais
+            # tentée) : sans distinction ici, le badge "rentable" était
+            # trompeur pour des paires comme WETH/cbETH qui ne seront jamais
+            # exécutées (bug de confusion observé en conditions réelles).
+            quote_not_executable = (s.get("quote_address") or "").lower() not in EXECUTABLE_QUOTE_TOKENS
+            if s["would_execute"] and quote_not_executable:
+                tag = (
+                    "<span class='badge' style='background:#a16207' "
+                    "title=\"Rentable en théorie mais jamais exécuté : quote token non supporté "
+                    "(seuls USDC/WETH le sont).\">rentable (quote non exécutable)</span>"
+                )
+            elif s["would_execute"]:
+                tag = "<span class='badge' style='background:#15803d'>rentable</span>"
+            else:
+                tag = "<span class='badge' style='background:#475569'>non rentable</span>"
             exec_tag = ""
             if s.get("mode") == "live" and s.get("tx_hash_buy"):
                 tx_sell = s.get("tx_hash_sell")
