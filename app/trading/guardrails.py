@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 
 from app.database import Database
 from app.killswitch import is_stopped, stop as killswitch_stop
-from app.trading.routers import ROUTER_ADDRESSES
+from app.trading.routers import FLASHLOAN_CONTRACT_ADDRESSES, ROUTER_ADDRESSES
 from app.wallet.signer import DEFAULT_KEYSTORE_PATH, load_signer
 
 logger = logging.getLogger("app.trading.guardrails")
@@ -148,10 +148,15 @@ def send_trading_transaction(
 
     Retourne toujours un dict `{"sent": bool, "tx_hash": str|None, "error": str|None}`.
     """
-    whitelist = {addr.lower() for addr in ROUTER_ADDRESSES.values()}
+    # Whitelist fixe = routers DEX connus + contrat(s) FlashArbitrage déployé(s)
+    # (voir app/trading/routers.py) — jamais étendue par variable d'environnement.
+    whitelist = {addr.lower() for addr in ROUTER_ADDRESSES.values()} | {
+        addr.lower() for addr in FLASHLOAN_CONTRACT_ADDRESSES
+    }
     if whitelist_target.lower() not in whitelist:
         raise TradingRefused(
-            f"{whitelist_target} absent de la whitelist fixe des routers DEX ({sorted(whitelist)}) — refusé."
+            f"{whitelist_target} absent de la whitelist fixe des routers DEX/contrats flashloan "
+            f"({sorted(whitelist)}) — refusé."
         )
 
     if is_stopped(db):

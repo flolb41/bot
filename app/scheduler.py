@@ -92,7 +92,10 @@ def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = No
     2. Exécute le signal rentable le PLUS rentable (net_profit_usd le plus élevé,
        classique OU triangulaire confondus) parmi ceux dont la clé de cooldown
        n'est pas active, via `app.trading.executor.execute_signal` (classique)
-       ou `execute_triangular_signal` (triangulaire).
+       ou `execute_triangular_signal` (triangulaire) — ou, si éligible et activé
+       (`trading.flashloan_enabled`, voir `app.trading.flashloan`), via le
+       contrat `FlashArbitrage` financé par flashloan Aave V3 (montant
+       indépendant du solde réel du wallet).
     3. Si cette exécution aboutit PLEINEMENT, relance immédiatement un nouveau
        cycle complet (recovery + scan + exécution) SANS attendre le prochain
        tick du scheduler — jusqu'à ce qu'il n'y ait plus d'opportunité rentable
@@ -190,11 +193,28 @@ def run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = No
             break
 
         from app.trading.executor import execute_signal, execute_triangular_signal
+        from app.trading.flashloan import (
+            execute_pair_signal_via_flashloan,
+            execute_triangular_signal_via_flashloan,
+            pair_signal_is_flashloan_eligible,
+            triangular_signal_is_flashloan_eligible,
+        )
         best_signal = executable_candidates[0]
+        # Flashloan (point 8, voir app/trading/flashloan.py) : exécution
+        # financée par Aave V3, indépendante du solde réel du wallet. Essayé
+        # EN PRIORITÉ quand éligible (config + DEX/quote compatibles) ; repli
+        # automatique sur l'exécution classique (auto-financée) sinon — aucun
+        # changement de comportement par défaut (`flashloan_enabled: false`).
         if best_signal["kind"] == "triangular":
-            exec_result = execute_triangular_signal(db, config, best_signal)
+            if triangular_signal_is_flashloan_eligible(config or {}, best_signal):
+                exec_result = execute_triangular_signal_via_flashloan(db, config, best_signal)
+            else:
+                exec_result = execute_triangular_signal(db, config, best_signal)
         else:
-            exec_result = execute_signal(db, config, best_signal)
+            if pair_signal_is_flashloan_eligible(config or {}, best_signal):
+                exec_result = execute_pair_signal_via_flashloan(db, config, best_signal)
+            else:
+                exec_result = execute_signal(db, config, best_signal)
         attempts += 1
         if exec_result["executed"]:
             # Exécution pleinement réussie : on boucle tout de suite (recovery
