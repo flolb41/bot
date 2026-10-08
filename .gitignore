@@ -12,3 +12,6 @@ logs/*.log
 *.egg-info/
 .pytest_cache/
 ohlcv_cache/
+.foundry/
+contracts/build/
+contracts/deployments/*.json
