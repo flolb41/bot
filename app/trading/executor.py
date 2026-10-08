@@ -50,6 +50,7 @@ from app.database import Database
 from app.trading import dex_sources, fees
 from app.trading.guardrails import TradingRefused, is_trading_live, send_trading_transaction, slippage_pct
 from app.trading.routers import (
+    AERODROME_POOL_ABI,
     AERODROME_ROUTER_ABI,
     ERC20_ABI,
     EXECUTABLE_DEXES,
@@ -58,6 +59,7 @@ from app.trading.routers import (
     UNISWAP_V3_FACTORY_ABI,
     UNISWAP_V3_FACTORY_ADDRESS,
     UNISWAP_V3_FEE_TIERS,
+    UNISWAP_V3_POOL_ABI,
     UNISWAP_V3_ROUTER_ABI,
 )
 
@@ -226,9 +228,9 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
             amount_in, min_amount_out, routes, recipient_cs, deadline,
         )
 
-    # sushiswap / pancakeswap / baseswap / alien-base : ABI UniswapV2Router02
+    # sushiswap / pancakeswap / baseswap / alien-base / swapbased : ABI UniswapV2Router02
     # standard, chemin direct token_in->token_out (tous forks V2 classiques).
-    if dex in ("sushiswap", "pancakeswap", "baseswap", "alien-base"):
+    if dex in ("sushiswap", "pancakeswap", "baseswap", "alien-base", "swapbased"):
         path = [token_in_cs, token_out_cs]
         return router_address, UNISWAP_V2_ROUTER_ABI, "swapExactTokensForTokens", (
             amount_in, min_amount_out, path, recipient_cs, deadline,
@@ -237,10 +239,97 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
     raise TradingRefused(f"Exécution non implémentée pour le DEX '{dex}' (voir EXECUTABLE_DEXES).")
 
 
+def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) -> float | None:
+    """Lit le prix de `token_address` (exprimé en `quote_address` puis converti
+    en $) DIRECTEMENT depuis le pool on-chain réellement utilisé par
+    `_build_swap_call` pour `dex` — lecture seule (aucune transaction), aucun
+    risque. Supporté uniquement pour "aerodrome" et "uniswap" : ce sont les
+    deux DEX pour lesquels DexScreener a démontré exposer plusieurs pools
+    distincts sous le même dex_id (stable/volatile pour Aerodrome, plusieurs
+    fee tiers pour Uniswap v3) — voir le fix `InsufficientOutputAmount`. Pour
+    les forks V2 classiques (une seule pool canonique par paire par factory),
+    la revérification DexScreener de `_refresh_price_usd` suffit déjà.
+
+    Retourne None si le DEX n'est pas supporté ici, ou si la lecture échoue
+    pour n'importe quelle raison (RPC injoignable, pool inexistante...) — dans
+    ce cas l'appelant retombe sur DexScreener plutôt que d'échouer."""
+    if dex not in ("aerodrome", "uniswap"):
+        return None
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 10}))
+        if not w3.is_connected():
+            return None
+
+        token_cs = Web3.to_checksum_address(token_address)
+        quote_cs = Web3.to_checksum_address(quote_address)
+
+        if dex == "aerodrome":
+            router = w3.eth.contract(
+                address=Web3.to_checksum_address(ROUTER_ADDRESSES["aerodrome"]), abi=AERODROME_ROUTER_ABI
+            )
+            default_factory = router.functions.defaultFactory().call()
+            pool_address = router.functions.poolFor(token_cs, quote_cs, False, default_factory).call()
+            if int(pool_address, 16) == 0:
+                return None
+            pool = w3.eth.contract(address=Web3.to_checksum_address(pool_address), abi=AERODROME_POOL_ABI)
+            token0 = pool.functions.token0().call()
+            reserve0, reserve1, _ = pool.functions.getReserves().call()
+            if reserve0 == 0 or reserve1 == 0:
+                return None
+            decimals_token = _get_decimals(w3, token_address)
+            decimals_quote = _get_decimals(w3, quote_address)
+            token_is_token0 = token0.lower() == token_cs.lower()
+            if token_is_token0:
+                # prix de token0 (notre token) exprimé en token1 (quote), ajusté décimales
+                price_in_quote = (reserve1 / (10 ** decimals_quote)) / (reserve0 / (10 ** decimals_token))
+            else:
+                price_in_quote = (reserve0 / (10 ** decimals_quote)) / (reserve1 / (10 ** decimals_token))
+        else:  # uniswap (V3)
+            factory = w3.eth.contract(
+                address=Web3.to_checksum_address(UNISWAP_V3_FACTORY_ADDRESS), abi=UNISWAP_V3_FACTORY_ABI
+            )
+            fee_tier = _find_uniswap_v3_fee_tier(w3, token_address, quote_address)
+            pool_address = factory.functions.getPool(token_cs, quote_cs, fee_tier).call()
+            if int(pool_address, 16) == 0:
+                return None
+            pool = w3.eth.contract(address=Web3.to_checksum_address(pool_address), abi=UNISWAP_V3_POOL_ABI)
+            token0 = pool.functions.token0().call()
+            sqrt_price_x96 = pool.functions.slot0().call()[0]
+            if sqrt_price_x96 == 0:
+                return None
+            token_is_token0 = token0.lower() == token_cs.lower()
+            decimals0 = _get_decimals(w3, token_address if token_is_token0 else quote_address)
+            decimals1 = _get_decimals(w3, quote_address if token_is_token0 else token_address)
+            # prix brut (non ajusté décimales) de token1 par token0 : (sqrtP/2^96)^2
+            raw_price_1_per_0 = (sqrt_price_x96 / (2 ** 96)) ** 2
+            human_price_1_per_0 = raw_price_1_per_0 * (10 ** (decimals0 - decimals1))
+            if human_price_1_per_0 <= 0:
+                return None
+            # prix de token0 en token1, ou son inverse selon quel token est notre `token_address`
+            price_in_quote = human_price_1_per_0 if token_is_token0 else (1.0 / human_price_1_per_0)
+
+        if price_in_quote <= 0:
+            return None
+        quote_price_usd = _quote_token_usd_price(quote_address)
+        if quote_price_usd is None:
+            return None
+        return price_in_quote * quote_price_usd
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Lecture on-chain du prix échouée pour %s/%s sur %s: %s", token_address, quote_address, dex, exc)
+        return None
+
+
 def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, dex: str) -> float | None:
     """Revérifie le prix courant sur `dex` juste avant d'agir (mitigation du
     risque non-atomique documenté en tête de fichier). Retourne None si
     indisponible (dans ce cas l'appelant doit refuser, pas supposer).
+
+    Essaie d'abord une lecture ON-CHAIN directe du pool exact utilisé par
+    `_build_swap_call` (voir `_onchain_pool_price_usd`) pour aerodrome/uniswap
+    — plus fiable que DexScreener car elle cible précisément LE pool qui sera
+    routé, sans ambiguïté. Si indisponible (DEX non supporté par cette lecture,
+    RPC injoignable...), retombe sur DexScreener ci-dessous.
 
     Parmi tous les pools DexScreener partageant ce `dex_id` (un même DEX peut
     exposer plusieurs pools distincts pour la même paire — Aerodrome
@@ -249,6 +338,9 @@ def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, de
     ailleurs (voir `app.trading.arbitrage._collect_pairs`) pour approximer le
     pool réellement routable par `_build_swap_call`, et rester cohérent avec
     le prix qui a servi à dimensionner le signal."""
+    onchain_price = _onchain_pool_price_usd(dex, token_address, quote_address)
+    if onchain_price is not None:
+        return onchain_price
     try:
         pairs = dex_sources.fetch_token_pairs(chain_id, token_address)
     except Exception as exc:  # noqa: BLE001

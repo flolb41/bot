@@ -41,7 +41,7 @@ dashboard:
 trading:
   enabled: true
   chain: base
-  dex_whitelist: [uniswap, aerodrome, sushiswap, pancakeswap, baseswap, alien-base]
+  dex_whitelist: [uniswap, aerodrome, sushiswap, pancakeswap, baseswap, alien-base, swapbased]
   # Tokens de départ pour la recherche de paires inter-DEX (adresses Base
   # vérifiées via DEUX sources indépendantes — DEX Screener + CoinGecko — avant
   # ajout ici : ne jamais ajouter une adresse non recoupée de cette façon).
@@ -58,6 +58,17 @@ trading:
     - symbol: cbETH
       address: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"
       coingecko_id: coinbase-wrapped-staked-eth
+    # DEGEN et BRETT ajoutés le 2026-10-08 : tokens natifs Base très liquides
+    # (rank CoinGecko ~600/~450), adresses vérifiées via DEUX sources
+    # indépendantes (API CoinGecko officielle + pools listées dans la doc
+    # SwapBased, recoupées avec DexScreener). Volatilité plus forte que les
+    # seed tokens existants -> spreads inter-DEX potentiellement plus larges.
+    - symbol: DEGEN
+      address: "0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed"
+      coingecko_id: degen-base
+    - symbol: BRETT
+      address: "0x532f27101965dd16442e59d40670faf5ebb142e4"
+      coingecko_id: based-brett
     # cbBTC retiré le 2026-10-08 : sur 505 signaux observés en 24h, 1 seul
     # jugé rentable (spread moyen 0,41 %, systématiquement mangé par les
     # frais DEX ~0,6 % aller-retour) — consomme un appel DexScreener par scan

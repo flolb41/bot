@@ -22,6 +22,7 @@ DEX_FEE_PCT = {
     "pancakeswap": 0.25,
     "baseswap": 0.30,     # fork UniswapV2 classique, fee standard 0.3%
     "alien-base": 0.30,   # fork UniswapV2 classique, fee standard 0.3%
+    "swapbased": 0.30,    # fork UniswapV2 classique, fee standard 0.3%
 }
 _DEFAULT_DEX_FEE_PCT = 0.30
 
@@ -33,7 +34,15 @@ ESTIMATED_GAS_UNITS_ROUNDTRIP = 300_000
 # Tampon de slippage : sécurité supplémentaire au-delà du spread affiché,
 # pour couvrir le mouvement de prix entre détection et exécution ainsi que
 # l'impact de prix de notre propre trade sur des pools à faible liquidité.
-DEFAULT_SLIPPAGE_BUFFER_PCT = 0.15
+# Relevé de 0.15% à 0.20% le 2026-10-08 (recalibrage prudent et conservateur,
+# pas une tentative agressive de rogner la marge basée sur peu de données) :
+# juste après le fix du bug multi-pool, on ne dispose que de quelques minutes
+# de données d'exécution "propres" — pas assez pour tuner finement. Ce petit
+# relèvement rend simplement `would_execute` légèrement plus prudent (moins
+# de signaux à marge trop fine marqués rentables), sans toucher à la
+# tolérance d'exécution réelle (`TRADING_SLIPPAGE_PCT`, toujours 0.5% par
+# défaut) : ne peut donc jamais augmenter le risque, seulement le réduire.
+DEFAULT_SLIPPAGE_BUFFER_PCT = 0.20
 
 
 def dex_fee_pct(dex_id: str) -> float:

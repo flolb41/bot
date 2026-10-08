@@ -18,6 +18,13 @@ utilisé ici, encodage multi-route trop complexe/risqué) :
   (PancakeRouter.sol, "Periphery" Base) + étiquette "PancakeSwap: Router v2.0"
   vérifiée sur BaseScan (contrat à 265k+ tx).
 
+SwapBased Router (fork UniswapV2Router02 classique, même ABI que
+sushiswap/pancakeswap/baseswap/alien-base) vérifié via TROIS sources
+concordantes :
+- docs.swapbased.finance/informational/contract-adresses (adresse officielle)
+- BaseScan : étiquette "SwapBased : Uniswap V2 Router 02" vérifiée (332k+ tx)
+- DexScreener API : dexId "swapbased" confirmé sur une pool SwapBased connue
+
 Ne JAMAIS ajouter une adresse ici sans la vérifier via au moins deux sources
 indépendantes (cf. pratique établie dans app/trading/arbitrage.py pour les
 seed_tokens) : une adresse de router erronée ferait perdre les fonds envoyés.
@@ -35,7 +42,9 @@ CHAIN_ID = 8453  # Base mainnet
 # officiel du projet, cf. historique de session) le 2026-10-07. Tous deux sont
 # des forks classiques Uniswap V2 (`swapExactTokensForTokens`), même ABI que
 # sushiswap/pancakeswap ci-dessous (voir `_build_swap_call` dans executor.py).
-EXECUTABLE_DEXES = frozenset({"uniswap", "aerodrome", "sushiswap", "pancakeswap", "baseswap", "alien-base"})
+EXECUTABLE_DEXES = frozenset({
+    "uniswap", "aerodrome", "sushiswap", "pancakeswap", "baseswap", "alien-base", "swapbased",
+})
 
 ROUTER_ADDRESSES: dict[str, str] = {
     "uniswap": "0x2626664c2603336E57B271c5C0b26F421741e481",     # SwapRouter02
@@ -44,6 +53,7 @@ ROUTER_ADDRESSES: dict[str, str] = {
     "pancakeswap": "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb",  # PancakeRouter.sol v2 (UniswapV2Router02-style)
     "baseswap": "0x327Df1E6de05895d2ab08513aaDD9313Fe505d86",     # BaseSwap Router (UniswapV2Router02-style)
     "alien-base": "0x8c1A3cF8f83074169FE5D7aD50B978e1cD6b37c7",   # AlienBase Router (UniswapV2Router02-style)
+    "swapbased": "0xaaa3b1F1bd7BCc97fD1917c18ADE665C5D31F066",    # SwapBased Router (UniswapV2Router02-style)
 }
 
 UNISWAP_V3_FACTORY_ADDRESS = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
@@ -93,6 +103,12 @@ UNISWAP_V3_ROUTER_ABI = [
 AERODROME_ROUTER_ABI = [
     {"inputs": [], "name": "defaultFactory", "outputs": [{"name": "", "type": "address"}],
      "stateMutability": "view", "type": "function"},
+    {"inputs": [
+        {"name": "tokenA", "type": "address"}, {"name": "tokenB", "type": "address"},
+        {"name": "stable", "type": "bool"}, {"name": "_factory", "type": "address"},
+     ],
+     "name": "poolFor", "outputs": [{"name": "pool", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
     {
         "inputs": [
             {"name": "amountIn", "type": "uint256"},
@@ -129,4 +145,35 @@ UNISWAP_V2_ROUTER_ABI = [
         "outputs": [{"name": "amounts", "type": "uint256[]"}],
         "stateMutability": "nonpayable", "type": "function",
     },
+]
+
+# ABIs minimales de POOL (lecture seule, aucune fonction d'écriture) utilisées
+# par `executor._onchain_pool_price_usd` pour lire le prix directement depuis
+# le pool exact qui sera routé par `_build_swap_call` — en complément de la
+# revérification DexScreener (`_refresh_price_usd`), pour les deux DEX où
+# l'ambiguïté multi-pool par dex_id a été démontrée (voir historique du fix
+# `InsufficientOutputAmount` : plusieurs pools Aerodrome/Uniswap partagent le
+# même dex_id sur DexScreener alors qu'un seul est réellement utilisé ici).
+AERODROME_POOL_ABI = [
+    {"inputs": [], "name": "token0", "outputs": [{"name": "", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "getReserves", "outputs": [
+        {"name": "_reserve0", "type": "uint256"},
+        {"name": "_reserve1", "type": "uint256"},
+        {"name": "_blockTimestampLast", "type": "uint256"},
+     ], "stateMutability": "view", "type": "function"},
+]
+
+UNISWAP_V3_POOL_ABI = [
+    {"inputs": [], "name": "token0", "outputs": [{"name": "", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "slot0", "outputs": [
+        {"name": "sqrtPriceX96", "type": "uint160"},
+        {"name": "tick", "type": "int24"},
+        {"name": "observationIndex", "type": "uint16"},
+        {"name": "observationCardinality", "type": "uint16"},
+        {"name": "observationCardinalityNext", "type": "uint16"},
+        {"name": "feeProtocol", "type": "uint8"},
+        {"name": "unlocked", "type": "bool"},
+     ], "stateMutability": "view", "type": "function"},
 ]
