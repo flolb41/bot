@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 from app.database import Database
@@ -35,6 +36,44 @@ logger = logging.getLogger("app.trading.guardrails")
 
 DEFAULT_TRADING_KEYSTORE_PATH = "data/trading_wallet_keystore.json"
 LIVE_CONFIRMATION_PHRASE = "JE CONFIRME LE TRADING REEL AVEC MON WALLET PRINCIPAL"
+
+# Nombre de tentatives + délai entre tentatives en cas de 429 (rate-limit) du
+# RPC public gratuit (https://mainnet.base.org) lors de la simulation d'une
+# transaction. Sans ce retry, un simple rate-limit transitoire est confondu
+# avec un VRAI revert (manque de rentabilité), ce qui déclenche à tort le
+# disjoncteur de sécurité (`app.trading.pair_health`, 3 échecs consécutifs →
+# pause de 2h) alors que rien n'indique que le trade n'était pas rentable.
+_RATE_LIMIT_MAX_ATTEMPTS = 3
+_RATE_LIMIT_RETRY_DELAY_SECONDS = 2.0
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Détecte un 429 Too Many Requests (ou équivalent) renvoyé par le RPC,
+    par opposition à un VRAI revert de simulation (manque de rentabilité,
+    slippage, etc.) — seule l'erreur réseau transitoire doit être retentée."""
+    message = str(exc)
+    return "429" in message or "too many requests" in message.lower()
+
+
+def _call_with_rate_limit_retry(fn_call):
+    """Exécute `fn_call` (ex. `fn.call(...)` ou `fn.estimate_gas(...)`) en
+    retentant jusqu'à `_RATE_LIMIT_MAX_ATTEMPTS` fois UNIQUEMENT si l'échec
+    est un rate-limit RPC (429) — toute autre exception (revert réel) est
+    immédiatement propagée sans retry."""
+    last_exc: Exception | None = None
+    for attempt in range(1, _RATE_LIMIT_MAX_ATTEMPTS + 1):
+        try:
+            return fn_call()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if not _is_rate_limit_error(exc) or attempt == _RATE_LIMIT_MAX_ATTEMPTS:
+                raise
+            logger.warning(
+                "RPC rate-limited (429), nouvelle tentative %d/%d dans %.1fs : %s",
+                attempt + 1, _RATE_LIMIT_MAX_ATTEMPTS, _RATE_LIMIT_RETRY_DELAY_SECONDS, exc,
+            )
+            time.sleep(_RATE_LIMIT_RETRY_DELAY_SECONDS)
+    raise last_exc  # pragma: no cover - inatteignable (la boucle raise ou return toujours)
 
 
 class TradingRefused(Exception):
@@ -177,7 +216,7 @@ def send_trading_transaction(
     if count_against_daily_limit and max_tx_per_day() > 0 and db.today_executed_trades_count() >= max_tx_per_day():
         raise TradingRefused(f"Limite quotidienne de trades atteinte (TRADING_MAX_TX_PER_DAY={max_tx_per_day()}).")
 
-    gas_price_wei = w3.eth.gas_price
+    gas_price_wei = _call_with_rate_limit_retry(lambda: w3.eth.gas_price)
     gas_price_gwei = float(Web3.from_wei(gas_price_wei, "gwei"))
     if gas_price_gwei > max_gas_price_gwei():
         raise TradingRefused(
@@ -188,9 +227,15 @@ def send_trading_transaction(
     fn = getattr(contract.functions, function_name)(*args)
 
     # --- Simulation obligatoire avant tout envoi -----------------------------
+    # Retry automatique UNIQUEMENT sur rate-limit RPC (429, voir
+    # `_call_with_rate_limit_retry`) : le RPC public gratuit
+    # (https://mainnet.base.org par défaut) renvoie parfois des 429 sous
+    # charge, ce qui serait sinon confondu avec un vrai revert et déclencherait
+    # à tort le disjoncteur de sécurité (pair_health) alors que la rentabilité
+    # du trade n'a jamais été réellement testée.
     try:
-        fn.call({"from": wallet_address})
-        estimated_gas = fn.estimate_gas({"from": wallet_address})
+        _call_with_rate_limit_retry(lambda: fn.call({"from": wallet_address}))
+        estimated_gas = _call_with_rate_limit_retry(lambda: fn.estimate_gas({"from": wallet_address}))
     except Exception as exc:  # noqa: BLE001
         return {"sent": False, "tx_hash": None,
                 "error": f"Simulation échouée pour {action_label or function_name} : {exc}"}
