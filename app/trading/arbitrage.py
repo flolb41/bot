@@ -180,10 +180,38 @@ def _refine_spread_with_onchain_price(spread: dict, token_address: str, quote_ad
     WETH/AERO : spread à 10^44 %). Comme ces paires ne sont de toute façon
     jamais exécutables (quote non supporté), on retombe simplement sur le
     spread DexScreener d'origine sans tenter de lecture on-chain."""
-    from app.trading.executor import EXECUTABLE_QUOTE_TOKENS, _onchain_pool_price_usd, _onchain_price_is_plausible
+    from app.trading.executor import (
+        EXECUTABLE_QUOTE_TOKENS, UNISWAP_V2_FORK_DEXES, _onchain_pool_price_usd, _onchain_price_is_plausible,
+        _resolve_rpc_url, _v2_fork_pool_confirmed_absent,
+    )
 
     if quote_address.lower() not in EXECUTABLE_QUOTE_TOKENS:
         return spread
+
+    # Garde-fou dédié aux forks UniswapV2 "simples" (sushiswap/baseswap/
+    # alien-base/swapbased) : si la factory de `buy_dex`/`sell_dex` n'a tout
+    # simplement AUCUN pool direct pour ce couple de tokens, le signal ne
+    # pourra JAMAIS s'exécuter (peu importe le prix) — mieux vaut l'écarter
+    # ici (spread ramené à 0, donc filtré par le seuil `min_spread_pct_to_log`
+    # juste après l'appel) que de le laisser déclencher un flashloan voué à
+    # un revert `('execution reverted', 'no data')`. Bug confirmé en
+    # production le 2026-10-08 : AlienBase listé par DexScreener comme
+    # "buy_dex" pour EURC/WETH alors que `factory.getPair` renvoie l'adresse
+    # zéro sur la factory réellement utilisée par `app.trading.routers`
+    # (DexScreener agrège parfois des pools indirectes/d'autres factories).
+    for dex_side in ("buy_dex", "sell_dex"):
+        dex = spread[dex_side]
+        if dex in UNISWAP_V2_FORK_DEXES and dex not in ("aerodrome", "pancakeswap"):
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 10}))
+            if w3.is_connected() and _v2_fork_pool_confirmed_absent(w3, dex, token_address, quote_address):
+                logger.warning(
+                    "Signal écarté : aucune pool %s confirmée on-chain pour %s/%s (%s).",
+                    dex, token_address, quote_address, dex_side,
+                )
+                refined = dict(spread)
+                refined["spread_pct"] = 0.0
+                return refined
 
     buy_price = _onchain_pool_price_usd(spread["buy_dex"], token_address, quote_address)
     sell_price = _onchain_pool_price_usd(spread["sell_dex"], token_address, quote_address)

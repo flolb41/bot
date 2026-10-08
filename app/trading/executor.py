@@ -626,6 +626,49 @@ def _resolve_pancakeswap_route(w3, token_in: str, token_out: str) -> dict | None
     return result
 
 
+def _v2_fork_pool_confirmed_absent(w3, dex: str, token_in: str, token_out: str) -> bool:
+    """Pour un fork UniswapV2 "simple" (sushiswap/baseswap/alien-base/
+    swapbased, PAS aerodrome/pancakeswap qui ont leur propre résolution
+    classique-vs-V3 ci-dessus) : `True` si on a pu interroger la factory de
+    `dex` et confirmer qu'AUCUN pool direct `token_in`/`token_out` n'existe
+    (`getPair` répond l'adresse zéro). `False` sinon (pool trouvé OU panne
+    RPC/lecture impossible — comportement permissif existant ailleurs dans ce
+    module : on ne bloque que sur une absence CONFIRMÉE, jamais sur un doute).
+
+    Bug corrigé le 2026-10-08 : sans cette vérification, `_build_swap_call`
+    et `flashloan._build_leg` construisaient aveuglément un appel
+    `swapExactTokensForTokens` vers le router de `dex` en supposant qu'une
+    paire directe existe — si ce n'est pas le cas (ex. AlienBase sans pool
+    WETH/EURC, confirmé on-chain : `factory.getPair` renvoie l'adresse zéro),
+    l'appel revert systématiquement avec `('execution reverted', 'no data')`
+    (le call bas niveau vers une adresse sans bytecode ne renvoie aucune
+    donnée décodable). Ce cas touchait TOUS les signaux où le DEX indiqué par
+    DexScreener (prix utilisé pour chiffrer le signal, voir
+    `app.trading.arbitrage._refine_spread_with_onchain_price`) n'a en réalité
+    aucune pool directe exécutable sur CE DEX précis."""
+    from web3 import Web3
+
+    cache_key = ("v2_fork_pool_absent", dex, token_in.lower(), token_out.lower())
+    cached = _route_cache_get(cache_key)
+    if cached is not _ROUTE_CACHE_MISSING:
+        return bool(cached)
+
+    try:
+        router = w3.eth.contract(
+            address=Web3.to_checksum_address(ROUTER_ADDRESSES[dex]), abi=UNISWAP_V2_ROUTER_FACTORY_ABI
+        )
+        factory_address = router.functions.factory().call()
+        factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=UNISWAP_V2_FACTORY_ABI)
+        pool_address = factory.functions.getPair(
+            Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out)
+        ).call()
+        confirmed_absent = int(pool_address, 16) == 0
+    except Exception:  # noqa: BLE001
+        confirmed_absent = False
+    _route_cache_set(cache_key, confirmed_absent)
+    return confirmed_absent
+
+
 def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: int,
                       min_amount_out: int, recipient: str, deadline: int) -> tuple[str, list[dict], str, tuple]:
     """Construit (contract_address, abi, function_name, args) pour le DEX demandé.
@@ -663,7 +706,10 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
         if route is None:
             raise TradingRefused(f"Aucune pool PancakeSwap (v2 ou v3) trouvée pour {token_in}/{token_out}.")
         if route["is_v3"]:
-            params = (token_in_cs, token_out_cs, route["fee"], recipient_cs, amount_in, min_amount_out, 0)
+            params = (
+                token_in_cs, token_out_cs, route["fee"], recipient_cs, deadline,
+                amount_in, min_amount_out, 0,
+            )
             return route["router"], PANCAKESWAP_V3_ROUTER_ABI, "exactInputSingle", (params,)
         path = [token_in_cs, token_out_cs]
         return route["router"], UNISWAP_V2_ROUTER_ABI, "swapExactTokensForTokens", (
@@ -675,6 +721,8 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
     # pancakeswap géré au-dessus, bien qu'également membre de
     # UNISWAP_V2_FORK_DEXES pour les autres usages de cette constante).
     if dex in UNISWAP_V2_FORK_DEXES:
+        if _v2_fork_pool_confirmed_absent(w3, dex, token_in, token_out):
+            raise TradingRefused(f"Aucune pool {dex} trouvée pour {token_in}/{token_out}.")
         path = [token_in_cs, token_out_cs]
         return router_address, UNISWAP_V2_ROUTER_ABI, "swapExactTokensForTokens", (
             amount_in, min_amount_out, path, recipient_cs, deadline,

@@ -49,6 +49,7 @@ from app.trading.executor import (
     _resolve_aerodrome_route,
     _resolve_pancakeswap_route,
     _resolve_rpc_url,
+    _v2_fork_pool_confirmed_absent,
 )
 from app.trading.fees import DEFAULT_SLIPPAGE_BUFFER_PCT, dex_fee_pct, estimate_gas_cost_usd
 from app.trading.guardrails import TradingRefused, is_trading_live, send_trading_transaction
@@ -187,13 +188,18 @@ def _build_leg(dex: str, w3, *, token_in: str, token_out: str) -> tuple:
     aerodromeFactory, fee)` — ordre EXACT de la struct `FlashArbitrage.Leg`
     (voir contracts/FlashArbitrage.sol). `kind=0` pour un fork UniswapV2
     classique, `kind=1` pour Aerodrome classique (nécessite sa
-    `defaultFactory` on-chain), `kind=2` pour Uniswap V3 OU PancakeSwap V3
-    single-hop (`exactInputSingle`, ABI identique — nécessite le fee tier de
-    la pool concernée), `kind=3` pour Aerodrome Slipstream single-hop
-    (`exactInputSingle` avec `tickSpacing` au lieu de `fee`, voir
+    `defaultFactory` on-chain), `kind=2` pour Uniswap V3 UNIQUEMENT
+    (`exactInputSingle`, ABI SwapRouter02 — PAS de `deadline` — nécessite le
+    fee tier de la pool concernée), `kind=3` pour Aerodrome Slipstream
+    single-hop (`exactInputSingle` avec `tickSpacing` au lieu de `fee`, voir
     `contracts/FlashArbitrage.sol::ISlipstreamSwapRouter` — le champ `fee`
     (uint24) de la struct Leg est réutilisé pour stocker le tickSpacing,
-    toujours positif et petit, aucun changement de struct nécessaire).
+    toujours positif et petit, aucun changement de struct nécessaire),
+    `kind=4` pour PancakeSwap V3 (`exactInputSingle`, ABI `IV3SwapRouter`
+    officielle de PancakeSwap — AVEC `deadline`, contrairement à kind=2 malgré
+    l'apparence similaire — voir `contracts/FlashArbitrage.sol::IPancakeV3SwapRouter`
+    et son commentaire pour le détail du bug "no data" universel que cette
+    distinction corrige).
 
     Pour "aerodrome"/"pancakeswap", le kind/router/fee sont déterminés par
     `executor._resolve_aerodrome_route`/`_resolve_pancakeswap_route` — LES
@@ -221,11 +227,13 @@ def _build_leg(dex: str, w3, *, token_in: str, token_out: str) -> tuple:
             raise TradingRefused(f"Aucune pool PancakeSwap (v2 ou v3) trouvée pour {token_in}/{token_out}.")
         if route["is_v3"]:
             router_v3 = Web3.to_checksum_address(route["router"])
-            return (2, router_v3, token_in_cs, token_out_cs, False, _ZERO_ADDRESS, route["fee"])
+            return (4, router_v3, token_in_cs, token_out_cs, False, _ZERO_ADDRESS, route["fee"])
         return (0, router_cs, token_in_cs, token_out_cs, False, _ZERO_ADDRESS, 0)
     if dex == "uniswap":
         fee_tier = _find_uniswap_v3_fee_tier(w3, token_in, token_out)
         return (2, router_cs, token_in_cs, token_out_cs, False, _ZERO_ADDRESS, fee_tier)
+    if _v2_fork_pool_confirmed_absent(w3, dex, token_in, token_out):
+        raise TradingRefused(f"Aucune pool {dex} trouvée pour {token_in}/{token_out}.")
     return (0, router_cs, token_in_cs, token_out_cs, False, _ZERO_ADDRESS, 0)
 
 

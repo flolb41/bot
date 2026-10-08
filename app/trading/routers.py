@@ -29,7 +29,8 @@ Ne JAMAIS ajouter une adresse ici sans la vérifier via au moins deux sources
 indépendantes (cf. pratique établie dans app/trading/arbitrage.py pour les
 seed_tokens) : une adresse de router erronée ferait perdre les fonds envoyés.
 
-PancakeSwap V3 (SwapRouter, ABI `IV3SwapRouter`, pas de `deadline`) et
+PancakeSwap V3 (SwapRouter, ABI `IV3SwapRouter`, AVEC `deadline` — confirmé
+on-chain le 2026-XX, cf. correctif "no data" universel PancakeSwap V3) et
 Aerodrome Slipstream (CL, 3 factories concurrentes) ajoutés le 2026-10-08 :
 adresses vérifiées via developer.pancakeswap.finance/contracts/v3/addresses
 (table officielle) + BaseScan (étiquette "PancakeSwap V3: Swap Router",
@@ -116,7 +117,7 @@ AERODROME_SLIPSTREAM_FACTORIES: tuple[tuple[str, str, str], ...] = (
 #   ajoute kind=3 (Aerodrome Slipstream, single-hop exactInputSingle avec
 #   tickSpacing) ; kind=2 est aussi réutilisé pour PancakeSwap V3 (même ABI
 #   SwapRouter02, aucun changement Solidity nécessaire pour ce DEX).
-FLASH_ARBITRAGE_ADDRESS = "0x8B1815a311B580AdD95d00B23B6A90bd7eE777aD"
+FLASH_ARBITRAGE_ADDRESS = "0x70d9A2920fFc3eE2CC24F379Cb6483dfde2D790C"  # v4 : corrige l'ABI PancakeSwap V3 (deadline)
 FLASHLOAN_CONTRACT_ADDRESSES = frozenset({FLASH_ARBITRAGE_ADDRESS})
 
 ERC20_ABI = [
@@ -278,7 +279,36 @@ PANCAKESWAP_V3_FACTORY_ABI = UNISWAP_V3_FACTORY_ABI
 # aussi pour PancakeSwap V3 — fork quasi-identique).
 PANCAKESWAP_V3_POOL_ABI = UNISWAP_V3_POOL_ABI
 
-PANCAKESWAP_V3_ROUTER_ABI = UNISWAP_V3_ROUTER_ABI
+# PancakeSwap V3 ("IV3SwapRouter" officiel de PancakeSwap, PAS SwapRouter02
+# d'Uniswap) : struct ExactInputSingleParams AVEC un champ `deadline`, ABI
+# DIFFÉRENTE de UNISWAP_V3_ROUTER_ABI malgré l'apparence similaire — confirmé
+# on-chain (appel direct au router avec/sans `deadline` : la variante SANS
+# `deadline` revert en "no data" même sur WETH/USDC, paire de contrôle
+# ultra-liquide ; la variante AVEC `deadline` est bien reconnue par le
+# contrat). C'était la cause racine du "no data" universel sur TOUTES les
+# jambes PancakeSwap V3 (BRETT, AERO, et même les paires de contrôle les plus
+# liquides) — voir kind=4 dans contracts/FlashArbitrage.sol
+# (`IPancakeV3SwapRouter`).
+PANCAKESWAP_V3_ROUTER_ABI = [
+    {
+        "inputs": [{
+            "components": [
+                {"name": "tokenIn", "type": "address"},
+                {"name": "tokenOut", "type": "address"},
+                {"name": "fee", "type": "uint24"},
+                {"name": "recipient", "type": "address"},
+                {"name": "deadline", "type": "uint256"},
+                {"name": "amountIn", "type": "uint256"},
+                {"name": "amountOutMinimum", "type": "uint256"},
+                {"name": "sqrtPriceLimitX96", "type": "uint160"},
+            ],
+            "name": "params", "type": "tuple",
+        }],
+        "name": "exactInputSingle",
+        "outputs": [{"name": "amountOut", "type": "uint256"}],
+        "stateMutability": "payable", "type": "function",
+    },
+]
 
 # Aerodrome Slipstream (CL) : factory `getPool(tokenA, tokenB, tickSpacing)` +
 # `tickSpacings()` (liste des tick spacings activés, utilisée pour ne pas

@@ -206,13 +206,28 @@ class _FakeW3:
         self.eth = _FakeEth(return_value)
 
 
-def test_build_leg_v2_fork():
-    # kind=0, pas d'appel RPC nécessaire : w3 n'est jamais utilisé.
+def test_build_leg_v2_fork(monkeypatch):
+    # kind=0 ; la vérification d'existence du pool (voir
+    # `executor._v2_fork_pool_confirmed_absent`) est monkeypatchée pour
+    # confirmer le pool présent, sans appel RPC réel.
+    monkeypatch.setattr(flashloan, "_v2_fork_pool_confirmed_absent", lambda w3, dex, token_in, token_out: False)
     leg = flashloan._build_leg("sushiswap", _FakeW3(None), token_in=USDC, token_out=WETH)
     assert leg[0] == 0
     assert leg[2] == USDC and leg[3] == WETH
     assert leg[4] is False
     assert leg[6] == 0  # fee tier non pertinent pour un fork V2
+
+
+def test_build_leg_v2_fork_refused_when_no_pool(monkeypatch):
+    # Bug confirmé en prod le 2026-10-08 (AlienBase sans pool WETH/EURC) :
+    # `_build_leg` doit refuser clairement plutôt que de construire une jambe
+    # qui reverterait à l'exécution avec `('execution reverted', 'no data')`.
+    monkeypatch.setattr(flashloan, "_v2_fork_pool_confirmed_absent", lambda w3, dex, token_in, token_out: True)
+    try:
+        flashloan._build_leg("alien-base", _FakeW3(None), token_in=USDC, token_out=WETH)
+        assert False, "TradingRefused attendu"
+    except flashloan.TradingRefused:
+        pass
 
 
 def test_build_leg_aerodrome_classic(monkeypatch):
@@ -278,7 +293,7 @@ def test_build_leg_pancakeswap_v3(monkeypatch):
         },
     )
     leg = flashloan._build_leg("pancakeswap", _FakeW3(None), token_in=USDC, token_out=WETH)
-    assert leg[0] == 2
+    assert leg[0] == 4
     assert leg[1] == pcs_v3_router
     assert leg[6] == 500
 

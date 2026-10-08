@@ -105,15 +105,42 @@ interface ISlipstreamSwapRouter {
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 }
 
+/// @notice Router PancakeSwap V3 (`IV3SwapRouter` officiel de PancakeSwap,
+///         PAS SwapRouter02 d'Uniswap) : struct ExactInputSingleParams AVEC
+///         un champ `deadline` explicite, confirme on-chain le 2026 (appel
+///         direct au router avec/sans `deadline` : la variante SANS
+///         `deadline` revert en "no data" -- mauvais selecteur/layout --
+///         alors que la variante AVEC `deadline` est bien reconnue, cf.
+///         tmp_check29.py). Bug racine du "no data" universel sur TOUTES
+///         les jambes PancakeSwap V3 (meme sur WETH/USDC, paire de controle
+///         ultra-liquide) -- rien a voir avec BRETT/AERO specifiquement.
+interface IPancakeV3SwapRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
 contract FlashArbitrage {
     /// @notice Jambe generique du cycle d'arbitrage. kind=0 -> router V2 classique,
     ///         kind=1 -> router Aerodrome (necessite stable + factory),
-    ///         kind=2 -> router Uniswap V3 (ou PancakeSwap V3 -- meme ABI
-    ///         SwapRouter02) un seul hop (necessite `fee`, le fee tier de la
+    ///         kind=2 -> router Uniswap V3 uniquement (SwapRouter02, pas de
+    ///         `deadline`) un seul hop (necessite `fee`, le fee tier de la
     ///         pool V3 concernee), kind=3 -> router Aerodrome Slipstream un
     ///         seul hop (le champ `fee` (uint24) est reutilise pour stocker
     ///         le `tickSpacing` (int24), toujours petit et positif, caste
-    ///         explicitement dans `_executeLeg` -- aucun champ Leg additionnel).
+    ///         explicitement dans `_executeLeg` -- aucun champ Leg additionnel),
+    ///         kind=4 -> router PancakeSwap V3 (`IV3SwapRouter`, AVEC
+    ///         `deadline`, ABI differente de kind=2 malgre l'apparence
+    ///         similaire -- voir IPancakeV3SwapRouter ci-dessus).
     struct Leg {
         uint8 kind;
         address router;
@@ -230,6 +257,21 @@ contract FlashArbitrage {
                     tokenIn: leg.tokenIn,
                     tokenOut: leg.tokenOut,
                     tickSpacing: int24(leg.fee),
+                    recipient: address(this),
+                    deadline: block.timestamp,
+                    amountIn: amountIn,
+                    amountOutMinimum: 0,
+                    sqrtPriceLimitX96: 0
+                })
+            );
+        }
+
+        if (leg.kind == 4) {
+            return IPancakeV3SwapRouter(leg.router).exactInputSingle(
+                IPancakeV3SwapRouter.ExactInputSingleParams({
+                    tokenIn: leg.tokenIn,
+                    tokenOut: leg.tokenOut,
+                    fee: leg.fee,
                     recipient: address(this),
                     deadline: block.timestamp,
                     amountIn: amountIn,

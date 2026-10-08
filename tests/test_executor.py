@@ -185,3 +185,34 @@ def test_resolve_aerodrome_route_prefers_classic_when_more_liquid(monkeypatch):
     })
     route = executor._resolve_aerodrome_route(w3, USDC, WETH)
     assert route == {"is_slipstream": False, "router": router_addr, "default_factory": default_factory, "pool": POOL_A}
+
+
+def test_v2_fork_pool_confirmed_absent_when_no_pair(monkeypatch):
+    # Bug reproduit en prod le 2026-10-08 : AlienBase n'a AUCUNE pool directe
+    # WETH/EURC (`getPair` renvoie l'adresse zéro) alors que DexScreener
+    # indiquait ce DEX comme rentable — ce garde-fou doit le détecter.
+    factory_addr = "0x" + "6" * 40
+    router_addr = executor.ROUTER_ADDRESSES["alien-base"]
+    w3 = _FakeW3({
+        router_addr: _FakeContract({"factory": factory_addr}),
+        factory_addr: _FakeContract({"getPair": lambda *_: ZERO_POOL}),
+    })
+    assert executor._v2_fork_pool_confirmed_absent(w3, "alien-base", USDC, WETH) is True
+
+
+def test_v2_fork_pool_confirmed_absent_false_when_pair_exists():
+    factory_addr = "0x" + "7" * 40
+    router_addr = executor.ROUTER_ADDRESSES["alien-base"]
+    w3 = _FakeW3({
+        router_addr: _FakeContract({"factory": factory_addr}),
+        factory_addr: _FakeContract({"getPair": lambda *_: POOL_A}),
+    })
+    assert executor._v2_fork_pool_confirmed_absent(w3, "alien-base", USDC, WETH) is False
+
+
+def test_v2_fork_pool_confirmed_absent_false_on_rpc_error():
+    # Panne RPC : on ne peut pas CONFIRMER l'absence, donc comportement
+    # permissif (pas de blocage) — voir docstring de la fonction.
+    router_addr = executor.ROUTER_ADDRESSES["alien-base"]
+    w3 = _FakeW3({router_addr: _FakeContract({"factory": RuntimeError("rpc down")})})
+    assert executor._v2_fork_pool_confirmed_absent(w3, "alien-base", USDC, WETH) is False
