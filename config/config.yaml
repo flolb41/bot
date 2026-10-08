@@ -101,6 +101,22 @@ trading:
     # jugé rentable (spread moyen 0,41 %, systématiquement mangé par les
     # frais DEX ~0,6 % aller-retour) — consomme un appel DexScreener par scan
     # pour quasiment aucune opportunité exploitable.
+    # VIRTUAL et TOSHI ajoutés le 2026-10-08 : adresses vérifiées via DEUX
+    # sources indépendantes (API DexScreener + API CoinGecko officielle,
+    # adresses Base concordantes). VIRTUAL dispose d'une liquidité et d'un
+    # volume très supérieurs aux seed tokens volatils existants (DEGEN/BRETT) :
+    # ~585k$ (uniswap/WETH) + ~352k$ et ~237k$ (aerodrome/WETH, 2 pools) +
+    # ~191k$ (pancakeswap/USDC), pour >1M$/j de volume rien que sur la paire
+    # aerodrome — sur 3 DEX déjà whitelistés, largement au-dessus de
+    # `min_liquidity_usd: 10000`. TOSHI a une présence multi-DEX plus modeste
+    # (uniswap ~1.1M$ + aerodrome ~31k$, les deux contre WETH, volume
+    # ~90k$/j) mais reste au-dessus du plancher de liquidité sur 2 DEX whitelistés.
+    - symbol: VIRTUAL
+      address: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b"
+      coingecko_id: virtual-protocol
+    - symbol: TOSHI
+      address: "0xAC1Bd2486aAf3B5C0fc3Fd868558b082a531B2B4"
+      coingecko_id: toshi
   min_liquidity_usd: 10000        # ignore les pools trop fines (risque de prix manipulé/non réaliste)
   max_trade_size_usd: 3           # plafond de secours si le solde réel est illisible (RPC down, etc.)
   # Dimensionnement dynamique : taille de trade = cette fraction du solde
