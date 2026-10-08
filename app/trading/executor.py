@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from app.database import Database
 from app.trading import dex_sources, fees
@@ -350,7 +351,13 @@ def _best_v3_style_pool(w3, factory_address: str, factory_abi: list[dict], fee_t
     cette recherche coûte jusqu'à 2 appels RPC par fee tier testé, et est
     appelée plusieurs fois pour LA MÊME paire au sein d'un même cycle de scan
     (affinage de prix des deux côtés du spread, puis construction du swap en
-    cas de tentative d'exécution) — voir commentaire sur `_ROUTE_CACHE_TTL_SECONDS`."""
+    cas de tentative d'exécution) — voir commentaire sur `_ROUTE_CACHE_TTL_SECONDS`.
+    Les `fee_tiers` étant indépendants les uns des autres, ils sont testés EN
+    PARALLÈLE (`ThreadPoolExecutor`) plutôt que séquentiellement : sur un
+    cycle de scan portant sur ~14 tokens seed (donc autant de résolutions
+    différentes, non couvertes par le cache ci-dessus), la latence RPC
+    (Infura, depuis un Pi3) dominait largement le temps de cycle (confirmé en
+    production : ~116s pour un intervalle configuré de 60s)."""
     cache_key = (
         "v3_style_pool", factory_address.lower(), fee_tiers, token_address.lower(), quote_address.lower(),
     )
@@ -362,20 +369,30 @@ def _best_v3_style_pool(w3, factory_address: str, factory_abi: list[dict], fee_t
     factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=factory_abi)
     token_cs = Web3.to_checksum_address(token_address)
     quote_cs = Web3.to_checksum_address(quote_address)
-    best: tuple[int, str] | None = None
-    best_reserve = -1
-    for fee_tier in fee_tiers:
+
+    def _check_fee_tier(fee_tier: int) -> tuple[int, str, int] | None:
         try:
             pool_address = factory.functions.getPool(token_cs, quote_cs, fee_tier).call()
         except Exception:  # noqa: BLE001
-            continue
+            return None
         if int(pool_address, 16) == 0:
-            continue
+            return None
         reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
-        if reserve is None or reserve <= best_reserve:
-            continue
-        best_reserve = reserve
-        best = (fee_tier, pool_address)
+        if reserve is None:
+            return None
+        return (fee_tier, pool_address, reserve)
+
+    best: tuple[int, str] | None = None
+    best_reserve = -1
+    with ThreadPoolExecutor(max_workers=len(fee_tiers)) as executor_pool:
+        for result in executor_pool.map(_check_fee_tier, fee_tiers):
+            if result is None:
+                continue
+            fee_tier, pool_address, reserve = result
+            if reserve <= best_reserve:
+                continue
+            best_reserve = reserve
+            best = (fee_tier, pool_address)
     _route_cache_set(cache_key, best)
     return best
 
@@ -402,7 +419,8 @@ def _best_aerodrome_slipstream_pool(w3, token_address: str, quote_address: str) 
 
     Résultat mis en cache (`_route_cache`, voir `_best_v3_style_pool`) : coût
     RPC similaire (jusqu'à 2 appels par tick spacing, sur 3 factories), rappelé
-    plusieurs fois par cycle pour la même paire."""
+    plusieurs fois par cycle pour la même paire. Les 3 factories sont testées
+    EN PARALLÈLE (même raison que `_best_v3_style_pool`)."""
     cache_key = ("aerodrome_slipstream_pool", token_address.lower(), quote_address.lower())
     cached = _route_cache_get(cache_key)
     if cached is not _ROUTE_CACHE_MISSING:
@@ -411,16 +429,18 @@ def _best_aerodrome_slipstream_pool(w3, token_address: str, quote_address: str) 
     from web3 import Web3
     token_cs = Web3.to_checksum_address(token_address)
     quote_cs = Web3.to_checksum_address(quote_address)
-    best: tuple[str, int, str] | None = None
-    best_reserve = -1
-    for _name, factory_address, router_address in AERODROME_SLIPSTREAM_FACTORIES:
+
+    def _check_factory(entry: tuple[str, str, str]) -> tuple[str, int, str] | None:
+        _name, factory_address, router_address = entry
         try:
             factory = w3.eth.contract(
                 address=Web3.to_checksum_address(factory_address), abi=AERODROME_SLIPSTREAM_FACTORY_ABI
             )
             tick_spacings = factory.functions.tickSpacings().call()
         except Exception:  # noqa: BLE001
-            continue
+            return None
+        local_best: tuple[str, int, str] | None = None
+        local_best_reserve = -1
         for tick_spacing in tick_spacings:
             try:
                 pool_address = factory.functions.getPool(token_cs, quote_cs, tick_spacing).call()
@@ -429,7 +449,20 @@ def _best_aerodrome_slipstream_pool(w3, token_address: str, quote_address: str) 
             if int(pool_address, 16) == 0:
                 continue
             reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
-            if reserve is None or reserve <= best_reserve:
+            if reserve is None or reserve <= local_best_reserve:
+                continue
+            local_best_reserve = reserve
+            local_best = (router_address, tick_spacing, pool_address, reserve)
+        return local_best
+
+    best: tuple[str, int, str] | None = None
+    best_reserve = -1
+    with ThreadPoolExecutor(max_workers=len(AERODROME_SLIPSTREAM_FACTORIES)) as executor_pool:
+        for result in executor_pool.map(_check_factory, AERODROME_SLIPSTREAM_FACTORIES):
+            if result is None:
+                continue
+            router_address, tick_spacing, pool_address, reserve = result
+            if reserve <= best_reserve:
                 continue
             best_reserve = reserve
             best = (router_address, tick_spacing, pool_address)
@@ -453,7 +486,9 @@ def _resolve_aerodrome_route(w3, token_in: str, token_out: str) -> dict | None:
     Résultat mis en cache (`_route_cache`, voir `_best_v3_style_pool`) : en
     plus de `_best_aerodrome_slipstream_pool` (déjà caché), les lectures
     "classic pool" ci-dessous (`defaultFactory`/`poolFor`/`balanceOf`) sont
-    elles aussi rappelées plusieurs fois par cycle pour la même paire."""
+    elles aussi rappelées plusieurs fois par cycle pour la même paire. Les
+    deux branches (pool classique / `_best_aerodrome_slipstream_pool`) sont
+    résolues EN PARALLÈLE (indépendantes l'une de l'autre)."""
     cache_key = ("aerodrome_route", token_in.lower(), token_out.lower())
     cached = _route_cache_get(cache_key)
     if cached is not _ROUTE_CACHE_MISSING:
@@ -467,23 +502,36 @@ def _resolve_aerodrome_route(w3, token_in: str, token_out: str) -> dict | None:
     else:
         quote_address, other_token = token_out, token_in
 
+    def _check_classic() -> tuple[str, int] | None:
+        try:
+            classic_router = w3.eth.contract(
+                address=Web3.to_checksum_address(ROUTER_ADDRESSES["aerodrome"]), abi=AERODROME_ROUTER_ABI
+            )
+            factory_addr = classic_router.functions.defaultFactory().call()
+            pool_address = classic_router.functions.poolFor(token_in_cs, token_out_cs, False, factory_addr).call()
+            if int(pool_address, 16) == 0:
+                return None
+            reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
+            if reserve is None:
+                return None
+            return (factory_addr, pool_address, reserve)
+        except Exception:  # noqa: BLE001
+            return None
+
+    # Pool classique et meilleure pool Slipstream sont indépendantes l'une de
+    # l'autre : résolues EN PARALLÈLE (même raison que `_best_v3_style_pool`).
+    with ThreadPoolExecutor(max_workers=2) as executor_pool:
+        classic_future = executor_pool.submit(_check_classic)
+        slipstream_future = executor_pool.submit(_best_aerodrome_slipstream_pool, w3, other_token, quote_address)
+        classic_result = classic_future.result()
+        slipstream = slipstream_future.result()
+
     classic_pool = None
     default_factory = None
     classic_reserve = -1
-    try:
-        classic_router = w3.eth.contract(
-            address=Web3.to_checksum_address(ROUTER_ADDRESSES["aerodrome"]), abi=AERODROME_ROUTER_ABI
-        )
-        default_factory = classic_router.functions.defaultFactory().call()
-        pool_address = classic_router.functions.poolFor(token_in_cs, token_out_cs, False, default_factory).call()
-        if int(pool_address, 16) != 0:
-            reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
-            if reserve is not None:
-                classic_pool, classic_reserve = pool_address, reserve
-    except Exception:  # noqa: BLE001
-        pass
+    if classic_result is not None:
+        default_factory, classic_pool, classic_reserve = classic_result
 
-    slipstream = _best_aerodrome_slipstream_pool(w3, other_token, quote_address)
     slipstream_reserve = -1
     if slipstream is not None:
         reserve = _quote_reserve_in_pool(w3, slipstream[2], quote_address)
@@ -514,7 +562,8 @@ def _resolve_pancakeswap_route(w3, token_in: str, token_out: str) -> dict | None
     dict (`is_v3`, `router`, `pool`, + `fee` si v3), ou `None` si aucune pool
     n'existe nulle part pour cette paire.
 
-    Résultat mis en cache (`_route_cache`, voir `_resolve_aerodrome_route`)."""
+    Résultat mis en cache (`_route_cache`, voir `_resolve_aerodrome_route`),
+    même parallélisation des deux branches (classique / V3)."""
     cache_key = ("pancakeswap_route", token_in.lower(), token_out.lower())
     cached = _route_cache_get(cache_key)
     if cached is not _ROUTE_CACHE_MISSING:
@@ -530,21 +579,34 @@ def _resolve_pancakeswap_route(w3, token_in: str, token_out: str) -> dict | None
 
     classic_pool = None
     classic_reserve = -1
-    try:
-        classic_router = w3.eth.contract(
-            address=Web3.to_checksum_address(ROUTER_ADDRESSES["pancakeswap"]), abi=UNISWAP_V2_ROUTER_FACTORY_ABI
-        )
-        factory_address = classic_router.functions.factory().call()
-        factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=UNISWAP_V2_FACTORY_ABI)
-        pool_address = factory.functions.getPair(token_in_cs, token_out_cs).call()
-        if int(pool_address, 16) != 0:
-            reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
-            if reserve is not None:
-                classic_pool, classic_reserve = pool_address, reserve
-    except Exception:  # noqa: BLE001
-        pass
 
-    v3 = _best_pancakeswap_v3_pool(w3, other_token, quote_address)
+    def _check_classic() -> tuple[str, int] | None:
+        try:
+            classic_router = w3.eth.contract(
+                address=Web3.to_checksum_address(ROUTER_ADDRESSES["pancakeswap"]), abi=UNISWAP_V2_ROUTER_FACTORY_ABI
+            )
+            factory_addr = classic_router.functions.factory().call()
+            factory = w3.eth.contract(address=Web3.to_checksum_address(factory_addr), abi=UNISWAP_V2_FACTORY_ABI)
+            pool_address = factory.functions.getPair(token_in_cs, token_out_cs).call()
+            if int(pool_address, 16) == 0:
+                return None
+            reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
+            if reserve is None:
+                return None
+            return (pool_address, reserve)
+        except Exception:  # noqa: BLE001
+            return None
+
+    # Pool classique et meilleure pool V3 sont indépendantes l'une de l'autre :
+    # résolues EN PARALLÈLE (même raison que `_best_v3_style_pool`).
+    with ThreadPoolExecutor(max_workers=2) as executor_pool:
+        classic_future = executor_pool.submit(_check_classic)
+        v3_future = executor_pool.submit(_best_pancakeswap_v3_pool, w3, other_token, quote_address)
+        classic_result = classic_future.result()
+        v3 = v3_future.result()
+    if classic_result is not None:
+        classic_pool, classic_reserve = classic_result
+
     v3_reserve = -1
     if v3 is not None:
         reserve = _quote_reserve_in_pool(w3, v3[1], quote_address)
