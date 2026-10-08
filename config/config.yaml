@@ -99,15 +99,15 @@ trading:
   # réel du wallet (le montant emprunté n'est JAMAIS le capital du wallet —
   # seul le gas de la tentative est en jeu : la transaction revert ENTIÈREMENT
   # si le profit net minimum n'est pas couvert, voir
-  # contracts/FlashArbitrage.sol::executeOperation). Désactivé par défaut :
-  # décision explicite requise avant la première utilisation réelle, EN PLUS
-  # de `enabled`/`TRADING_ENABLED`/`TRADING_LIVE_CONFIRMED` ci-dessus (voir
+  # contracts/FlashArbitrage.sol::executeOperation). ACTIVÉ le 2026-10-08
+  # (décision explicite de l'utilisateur), EN PLUS de
+  # `enabled`/`TRADING_ENABLED`/`TRADING_LIVE_CONFIRMED` ci-dessus (voir
   # app/trading/guardrails.py::is_trading_live, toujours requis en plus).
   # Uniswap V3 n'est jamais utilisé par cette voie (contrat non compatible
   # avec son interface) : seuls aerodrome/sushiswap/pancakeswap/baseswap/
   # alien-base/swapbased sont éligibles (voir
   # app/trading/flashloan.py::FLASHLOAN_CAPABLE_DEXES).
-  flashloan_enabled: false
+  flashloan_enabled: true
   # Montant notionnel emprunté par flashloan, en $ (indépendant du solde réel
   # du wallet). Toujours borné par `liquidity_safety_fraction` ci-dessus (2%
   # de la plus petite liquidité de pool parmi les jambes du cycle).
