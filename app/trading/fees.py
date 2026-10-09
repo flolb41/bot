@@ -76,10 +76,9 @@ def estimate_base_gas_price_gwei() -> float | None:
 
     rpc_url = os.environ.get("RPC_BASE") or "https://mainnet.base.org"
     try:
-        from web3 import Web3  # import local : dépendance lourde, chargée à la demande
-        from app.trading.guardrails import call_with_rate_limit_retry
+        from app.trading.rpc import call_with_rate_limit_retry, make_w3
 
-        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+        w3 = make_w3(timeout=10)
         gas_price_wei = call_with_rate_limit_retry(lambda: w3.eth.gas_price)
         gas_price_gwei = gas_price_wei / 1e9
         _gas_price_cache = (now + _GAS_PRICE_CACHE_TTL_SECONDS, gas_price_gwei)

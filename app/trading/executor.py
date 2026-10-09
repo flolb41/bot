@@ -51,11 +51,11 @@ from app.database import Database
 from app.trading import dex_sources, fees
 from app.trading.guardrails import (
     TradingRefused,
-    call_with_rate_limit_retry,
     is_trading_live,
     send_trading_transaction,
     slippage_pct,
 )
+from app.trading.rpc import call_with_rate_limit_retry, is_connected_with_retry, make_w3, rpc_urls
 from app.trading.routers import (
     AERODROME_POOL_ABI,
     AERODROME_ROUTER_ABI,
@@ -114,14 +114,20 @@ _DECIMALS_CACHE: dict[str, int] = {}
 # `_find_uniswap_v3_fee_tier`). Sans cache, LA MÊME paire était re-résolue
 # plusieurs fois par cycle de scan (une fois par `_refine_spread_with_onchain_price`
 # pour chaque côté du spread, puis à nouveau lors de la construction réelle du
-# swap en cas de tentative d'exécution) — confirmé responsable de l'essentiel
-# du dépassement d'un cycle de scan au-delà de l'intervalle configuré (passage
-# de ~70s à ~116s après ce correctif). La liquidité d'une pool ne varie pas
-# assez en quelques dizaines de secondes pour justifier une relecture RPC à
-# chaque appel ; un TTL court (très inférieur à la durée d'un cycle de scan)
-# élimine la redondance intra-cycle sans risquer de route obsolète d'un cycle
-# à l'autre.
-_ROUTE_CACHE_TTL_SECONDS = 20.0
+# swap en cas de tentative d'exécution).
+#
+# Porté de 20s à 300s le 09/10 : avec un scan toutes les 60s, un TTL de 20s
+# forçait une re-résolution COMPLÈTE à chaque cycle, soit des centaines
+# d'appels RPC par minute — volume qui saturait les quotas des endpoints
+# gratuits (429 en continu) et, via l'ancienne sémantique "erreur RPC = pool
+# absente", corrompait le choix de pool (voir `_quote_reserve_in_pool`). La
+# pool la plus profonde d'une paire ne change pas en 5 minutes.
+_ROUTE_CACHE_TTL_SECONDS = 300.0
+# Faits on-chain IMMUABLES (adresse d'une pool pour (factory, tokens, fee),
+# adresse de factory d'un router, tick spacings d'une factory) : cachés bien
+# plus longtemps. Seule une pool nouvellement créée pourrait être manquée
+# pendant ce délai — négligeable pour les tokens seed suivis.
+_IMMUTABLE_CACHE_TTL_SECONDS = 6 * 3600.0
 _ROUTE_CACHE_MISSING = object()
 _route_cache: dict[tuple, tuple[float, object]] = {}
 
@@ -137,25 +143,39 @@ def _route_cache_get(key: tuple) -> object:
     return value
 
 
-def _route_cache_set(key: tuple, value: object) -> None:
-    _route_cache[key] = (time.monotonic() + _ROUTE_CACHE_TTL_SECONDS, value)
+def _route_cache_set(key: tuple, value: object, ttl: float | None = None) -> None:
+    _route_cache[key] = (time.monotonic() + (_ROUTE_CACHE_TTL_SECONDS if ttl is None else ttl), value)
+
+
+def _cached_rpc_value(key: tuple, fn_call, ttl: float):
+    """Lecture RPC mise en cache `ttl` secondes, avec retry sur 429. Une
+    erreur RPC est PROPAGÉE (jamais cachée, jamais convertie en valeur par
+    défaut) : voir `_quote_reserve_in_pool` pour la raison."""
+    cached = _route_cache_get(key)
+    if cached is not _ROUTE_CACHE_MISSING:
+        return cached
+    value = call_with_rate_limit_retry(fn_call)
+    _route_cache_set(key, value, ttl=ttl)
+    return value
+
+
+def _pair_key(token_a: str, token_b: str) -> tuple[str, str]:
+    """Clé de cache SYMÉTRIQUE pour une paire : la pool d'une paire ne dépend
+    pas du sens du swap, inutile de la résoudre deux fois (achat puis vente)."""
+    return tuple(sorted((token_a.lower(), token_b.lower())))  # type: ignore[return-value]
 
 
 def _resolve_rpc_url() -> str:
-    return os.environ.get("RPC_BASE") or "https://mainnet.base.org"
+    """Premier endpoint RPC configuré (voir `app.trading.rpc.rpc_urls`) —
+    conservé pour les appelants qui attendent UNE URL (`send_trading_transaction`,
+    logs) ; les connexions réelles passent par `make_w3` (rotation)."""
+    return rpc_urls()[0]
 
 
 def _is_connected_with_retry(w3) -> bool:
-    """`w3.is_connected()` avec retry sur rate-limit RPC (429) — voir
-    `call_with_rate_limit_retry`. Sans ce retry, un simple 429 transitoire du
-    RPC (ex: Infura free tier sous charge) est confondu avec une VRAIE panne
-    réseau ("RPC Base injoignable"), ce qui faisait échouer QUASI-SYSTÉMATIQUEMENT
-    chaque tentative d'exécution réelle malgré des signaux rentables (confirmé
-    en conditions réelles, 100% des tentatives sur plusieurs heures)."""
-    try:
-        return bool(call_with_rate_limit_retry(lambda: w3.is_connected()))
-    except Exception:  # noqa: BLE001 - un échec réseau persistant reste traité comme "injoignable"
-        return False
+    """Alias de `app.trading.rpc.is_connected_with_retry` (conservé pour les
+    imports existants, ex. `app.trading.flashloan`)."""
+    return is_connected_with_retry(w3)
 
 
 def _balance_of_with_retry(contract, address: str) -> int:
@@ -283,7 +303,7 @@ def get_quote_trading_balance_usd(quote_address: str, config: dict) -> float | N
         return None
     try:
         from web3 import Web3
-        w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
+        w3 = make_w3(timeout=15)
         if not _is_connected_with_retry(w3):
             return None
 
@@ -347,18 +367,63 @@ def _find_uniswap_v3_fee_tier(w3, token_in: str, token_out: str) -> int:
     return fee_tier
 
 
-def _quote_reserve_in_pool(w3, pool_address: str, quote_address: str) -> int | None:
+def _quote_reserve_in_pool(w3, pool_address: str, quote_address: str) -> int:
     """Solde de `quote_address` détenu par `pool_address` -- métrique de
-    liquidité comparable directement entre pools de TYPES différents (AMM
-    classique vs concentrated-liquidity) pour un même `quote_address` : pas
-    besoin de connaître le prix, juste une mesure RELATIVE pour choisir la
-    pool la plus profonde. Retourne None si la lecture échoue."""
+    profondeur pour une pool AMM CLASSIQUE (x*y=k : toute la réserve est
+    active). Pour une pool à liquidité concentrée, utiliser
+    `_v3_style_quote_depth` (le solde du contrat n'y mesure RIEN d'utile).
+
+    Une erreur RPC est PROPAGÉE (après retry sur 429), jamais convertie en
+    `None`/0. Bug corrigé le 09/10/2026 : l'ancienne version renvoyait `None`
+    sur n'importe quelle exception, et les appelants écartaient alors la pool
+    comme si elle n'existait pas — sous un RPC rate-limité (429 en continu),
+    un 429 sur la lecture de la GROSSE pool faisait gagner une pool quasi vide,
+    route ensuite mise en cache. Mieux vaut refuser la tentative (retentée au
+    cycle suivant) que router sur une information fausse."""
     from web3 import Web3
-    try:
-        token = w3.eth.contract(address=Web3.to_checksum_address(quote_address), abi=ERC20_ABI)
-        return int(token.functions.balanceOf(Web3.to_checksum_address(pool_address)).call())
-    except Exception:  # noqa: BLE001
-        return None
+    token = w3.eth.contract(address=Web3.to_checksum_address(quote_address), abi=ERC20_ABI)
+    return int(call_with_rate_limit_retry(
+        lambda: token.functions.balanceOf(Web3.to_checksum_address(pool_address)).call()
+    ))
+
+
+# Sélecteurs `slot0()` / `liquidity()` — communs à Uniswap V3, PancakeSwap V3
+# et Aerodrome Slipstream (dont les `slot0` diffèrent par le NOMBRE de champs
+# retournés : on ne décode que le premier mot, `sqrtPriceX96`, via un appel
+# brut plutôt qu'un ABI par variante).
+_SLOT0_SELECTOR = "0x3850c7bd"
+_LIQUIDITY_SELECTOR = "0x1a686502"
+_Q96 = 1 << 96
+
+
+def _v3_style_quote_depth(w3, pool_address: str, token_address: str, quote_address: str) -> int:
+    """Réserve VIRTUELLE de `quote_address` au prix courant d'une pool à
+    liquidité concentrée (Uniswap V3 / PancakeSwap V3 / Aerodrome Slipstream) :
+    `L·√P` si le quote est token1, `L/√P` sinon (avec L = `liquidity()`, la
+    liquidité ACTIVE dans le tick courant, et √P = `slot0().sqrtPriceX96`).
+    Par construction (x·y = L²), c'est exactement la réserve qu'aurait une
+    pool V2 de même profondeur marginale : directement comparable à
+    `_quote_reserve_in_pool` d'une pool classique, et nulle si aucune
+    liquidité n'est en range.
+
+    Bug corrigé le 09/10/2026 : la profondeur des pools V3 était mesurée par
+    `balanceOf(pool)`, qui compte aussi les positions HORS range (et les
+    tokens orphelins) — une pool PancakeSwap V3 BRETT/WETH au gros solde WETH
+    mais ~sans liquidité active était ainsi préférée, et chaque simulation de
+    flashloan y perdait 40 à 90 % (bloquée par `InsufficientProfit`, aucun
+    fonds engagé, mais aucun trade possible)."""
+    from web3 import Web3
+    pool_cs = Web3.to_checksum_address(pool_address)
+    raw_slot0 = call_with_rate_limit_retry(lambda: w3.eth.call({"to": pool_cs, "data": _SLOT0_SELECTOR}))
+    raw_liquidity = call_with_rate_limit_retry(lambda: w3.eth.call({"to": pool_cs, "data": _LIQUIDITY_SELECTOR}))
+    sqrt_price_x96 = int.from_bytes(bytes(raw_slot0)[:32], "big")
+    liquidity = int.from_bytes(bytes(raw_liquidity)[:32], "big")
+    if sqrt_price_x96 == 0 or liquidity == 0:
+        return 0
+    quote_is_token1 = int(quote_address, 16) > int(token_address, 16)
+    if quote_is_token1:
+        return liquidity * sqrt_price_x96 // _Q96
+    return liquidity * _Q96 // sqrt_price_x96
 
 
 def _best_v3_style_pool(w3, factory_address: str, factory_abi: list[dict], fee_tiers: tuple[int, ...],
@@ -371,22 +436,17 @@ def _best_v3_style_pool(w3, factory_address: str, factory_abi: list[dict], fee_t
     l'exécution vers une pool différente de celle utilisée pour chiffrer le
     signal, confirmé par un revert `InsufficientProfit` sur DEGEN/WETH en
     flashloan). Retourne (fee_tier, pool_address) ou None si aucune pool
-    n'existe.
+    n'existe (adresse zéro CONFIRMÉE pour chaque fee tier). Une erreur RPC est
+    propagée (voir `_quote_reserve_in_pool`).
 
-    Résultat mis en cache (`_route_cache`, TTL `_ROUTE_CACHE_TTL_SECONDS`) :
-    cette recherche coûte jusqu'à 2 appels RPC par fee tier testé, et est
-    appelée plusieurs fois pour LA MÊME paire au sein d'un même cycle de scan
-    (affinage de prix des deux côtés du spread, puis construction du swap en
-    cas de tentative d'exécution) — voir commentaire sur `_ROUTE_CACHE_TTL_SECONDS`.
-    Les `fee_tiers` étant indépendants les uns des autres, ils sont testés EN
-    PARALLÈLE (`ThreadPoolExecutor`) plutôt que séquentiellement : sur un
-    cycle de scan portant sur ~14 tokens seed (donc autant de résolutions
-    différentes, non couvertes par le cache ci-dessus), la latence RPC
-    (Infura, depuis un Pi3) dominait largement le temps de cycle (confirmé en
-    production : ~116s pour un intervalle configuré de 60s)."""
-    cache_key = (
-        "v3_style_pool", factory_address.lower(), fee_tiers, token_address.lower(), quote_address.lower(),
-    )
+    Résultat mis en cache (`_route_cache`, TTL `_ROUTE_CACHE_TTL_SECONDS`) ;
+    les adresses de pool (`getPool`, immuables) sont cachées séparément et bien
+    plus longtemps (`_IMMUTABLE_CACHE_TTL_SECONDS`) : une re-résolution ne
+    coûte alors qu'UNE lecture de réserve par pool existante. Les `fee_tiers`
+    étant indépendants les uns des autres, ils sont testés EN PARALLÈLE
+    (`ThreadPoolExecutor`) — la rotation d'endpoints de `make_w3` répartit la
+    rafale entre plusieurs RPC."""
+    cache_key = ("v3_style_pool", factory_address.lower(), fee_tiers) + _pair_key(token_address, quote_address)
     cached = _route_cache_get(cache_key)
     if cached is not _ROUTE_CACHE_MISSING:
         return cached  # type: ignore[return-value]
@@ -397,16 +457,14 @@ def _best_v3_style_pool(w3, factory_address: str, factory_abi: list[dict], fee_t
     quote_cs = Web3.to_checksum_address(quote_address)
 
     def _check_fee_tier(fee_tier: int) -> tuple[int, str, int] | None:
-        try:
-            pool_address = factory.functions.getPool(token_cs, quote_cs, fee_tier).call()
-        except Exception:  # noqa: BLE001
-            return None
+        pool_address = _cached_rpc_value(
+            ("getPool", factory_address.lower(), fee_tier) + _pair_key(token_address, quote_address),
+            lambda: factory.functions.getPool(token_cs, quote_cs, fee_tier).call(),
+            _IMMUTABLE_CACHE_TTL_SECONDS,
+        )
         if int(pool_address, 16) == 0:
             return None
-        reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
-        if reserve is None:
-            return None
-        return (fee_tier, pool_address, reserve)
+        return (fee_tier, pool_address, _v3_style_quote_depth(w3, pool_address, token_address, quote_address))
 
     best: tuple[int, str] | None = None
     best_reserve = -1
@@ -447,7 +505,7 @@ def _best_aerodrome_slipstream_pool(w3, token_address: str, quote_address: str) 
     RPC similaire (jusqu'à 2 appels par tick spacing, sur 3 factories), rappelé
     plusieurs fois par cycle pour la même paire. Les 3 factories sont testées
     EN PARALLÈLE (même raison que `_best_v3_style_pool`)."""
-    cache_key = ("aerodrome_slipstream_pool", token_address.lower(), quote_address.lower())
+    cache_key = ("aerodrome_slipstream_pool",) + _pair_key(token_address, quote_address)
     cached = _route_cache_get(cache_key)
     if cached is not _ROUTE_CACHE_MISSING:
         return cached  # type: ignore[return-value]
@@ -456,26 +514,28 @@ def _best_aerodrome_slipstream_pool(w3, token_address: str, quote_address: str) 
     token_cs = Web3.to_checksum_address(token_address)
     quote_cs = Web3.to_checksum_address(quote_address)
 
-    def _check_factory(entry: tuple[str, str, str]) -> tuple[str, int, str] | None:
+    def _check_factory(entry: tuple[str, str, str]) -> tuple[str, int, str, int] | None:
         _name, factory_address, router_address = entry
-        try:
-            factory = w3.eth.contract(
-                address=Web3.to_checksum_address(factory_address), abi=AERODROME_SLIPSTREAM_FACTORY_ABI
-            )
-            tick_spacings = factory.functions.tickSpacings().call()
-        except Exception:  # noqa: BLE001
-            return None
-        local_best: tuple[str, int, str] | None = None
+        factory = w3.eth.contract(
+            address=Web3.to_checksum_address(factory_address), abi=AERODROME_SLIPSTREAM_FACTORY_ABI
+        )
+        tick_spacings = _cached_rpc_value(
+            ("slipstream_tick_spacings", factory_address.lower()),
+            lambda: list(factory.functions.tickSpacings().call()),
+            _IMMUTABLE_CACHE_TTL_SECONDS,
+        )
+        local_best: tuple[str, int, str, int] | None = None
         local_best_reserve = -1
         for tick_spacing in tick_spacings:
-            try:
-                pool_address = factory.functions.getPool(token_cs, quote_cs, tick_spacing).call()
-            except Exception:  # noqa: BLE001
-                continue
+            pool_address = _cached_rpc_value(
+                ("slipstream_getPool", factory_address.lower(), tick_spacing) + _pair_key(token_address, quote_address),
+                lambda ts=tick_spacing: factory.functions.getPool(token_cs, quote_cs, ts).call(),
+                _IMMUTABLE_CACHE_TTL_SECONDS,
+            )
             if int(pool_address, 16) == 0:
                 continue
-            reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
-            if reserve is None or reserve <= local_best_reserve:
+            reserve = _v3_style_quote_depth(w3, pool_address, token_address, quote_address)
+            if reserve <= local_best_reserve:
                 continue
             local_best_reserve = reserve
             local_best = (router_address, tick_spacing, pool_address, reserve)
@@ -515,7 +575,7 @@ def _resolve_aerodrome_route(w3, token_in: str, token_out: str) -> dict | None:
     elles aussi rappelées plusieurs fois par cycle pour la même paire. Les
     deux branches (pool classique / `_best_aerodrome_slipstream_pool`) sont
     résolues EN PARALLÈLE (indépendantes l'une de l'autre)."""
-    cache_key = ("aerodrome_route", token_in.lower(), token_out.lower())
+    cache_key = ("aerodrome_route",) + _pair_key(token_in, token_out)
     cached = _route_cache_get(cache_key)
     if cached is not _ROUTE_CACHE_MISSING:
         return cached  # type: ignore[return-value]
@@ -528,24 +588,27 @@ def _resolve_aerodrome_route(w3, token_in: str, token_out: str) -> dict | None:
     else:
         quote_address, other_token = token_out, token_in
 
-    def _check_classic() -> tuple[str, int] | None:
-        try:
-            classic_router = w3.eth.contract(
-                address=Web3.to_checksum_address(ROUTER_ADDRESSES["aerodrome"]), abi=AERODROME_ROUTER_ABI
-            )
-            factory_addr = classic_router.functions.defaultFactory().call()
-            pool_address = classic_router.functions.poolFor(token_in_cs, token_out_cs, False, factory_addr).call()
-            if int(pool_address, 16) == 0:
-                return None
-            reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
-            if reserve is None:
-                return None
-            return (factory_addr, pool_address, reserve)
-        except Exception:  # noqa: BLE001
+    def _check_classic() -> tuple[str, str, int] | None:
+        classic_router = w3.eth.contract(
+            address=Web3.to_checksum_address(ROUTER_ADDRESSES["aerodrome"]), abi=AERODROME_ROUTER_ABI
+        )
+        factory_addr = _cached_rpc_value(
+            ("aerodrome_default_factory",), lambda: classic_router.functions.defaultFactory().call(),
+            _IMMUTABLE_CACHE_TTL_SECONDS,
+        )
+        pool_address = _cached_rpc_value(
+            ("aerodrome_poolFor", factory_addr.lower()) + _pair_key(token_in, token_out),
+            lambda: classic_router.functions.poolFor(token_in_cs, token_out_cs, False, factory_addr).call(),
+            _IMMUTABLE_CACHE_TTL_SECONDS,
+        )
+        if int(pool_address, 16) == 0:
             return None
+        return (factory_addr, pool_address, _quote_reserve_in_pool(w3, pool_address, quote_address))
 
     # Pool classique et meilleure pool Slipstream sont indépendantes l'une de
     # l'autre : résolues EN PARALLÈLE (même raison que `_best_v3_style_pool`).
+    # Une erreur RPC dans l'une ou l'autre est propagée (`.result()` relance
+    # l'exception) : jamais de choix de pool sur information partielle.
     with ThreadPoolExecutor(max_workers=2) as executor_pool:
         classic_future = executor_pool.submit(_check_classic)
         slipstream_future = executor_pool.submit(_best_aerodrome_slipstream_pool, w3, other_token, quote_address)
@@ -560,11 +623,7 @@ def _resolve_aerodrome_route(w3, token_in: str, token_out: str) -> dict | None:
 
     slipstream_reserve = -1
     if slipstream is not None:
-        reserve = _quote_reserve_in_pool(w3, slipstream[2], quote_address)
-        if reserve is not None:
-            slipstream_reserve = reserve
-        else:
-            slipstream = None
+        slipstream_reserve = _v3_style_quote_depth(w3, slipstream[2], other_token, quote_address)
 
     if slipstream is not None and slipstream_reserve > classic_reserve:
         router_address, tick_spacing, pool_address = slipstream
@@ -590,7 +649,7 @@ def _resolve_pancakeswap_route(w3, token_in: str, token_out: str) -> dict | None
 
     Résultat mis en cache (`_route_cache`, voir `_resolve_aerodrome_route`),
     même parallélisation des deux branches (classique / V3)."""
-    cache_key = ("pancakeswap_route", token_in.lower(), token_out.lower())
+    cache_key = ("pancakeswap_route",) + _pair_key(token_in, token_out)
     cached = _route_cache_get(cache_key)
     if cached is not _ROUTE_CACHE_MISSING:
         return cached  # type: ignore[return-value]
@@ -607,24 +666,26 @@ def _resolve_pancakeswap_route(w3, token_in: str, token_out: str) -> dict | None
     classic_reserve = -1
 
     def _check_classic() -> tuple[str, int] | None:
-        try:
-            classic_router = w3.eth.contract(
-                address=Web3.to_checksum_address(ROUTER_ADDRESSES["pancakeswap"]), abi=UNISWAP_V2_ROUTER_FACTORY_ABI
-            )
-            factory_addr = classic_router.functions.factory().call()
-            factory = w3.eth.contract(address=Web3.to_checksum_address(factory_addr), abi=UNISWAP_V2_FACTORY_ABI)
-            pool_address = factory.functions.getPair(token_in_cs, token_out_cs).call()
-            if int(pool_address, 16) == 0:
-                return None
-            reserve = _quote_reserve_in_pool(w3, pool_address, quote_address)
-            if reserve is None:
-                return None
-            return (pool_address, reserve)
-        except Exception:  # noqa: BLE001
+        classic_router = w3.eth.contract(
+            address=Web3.to_checksum_address(ROUTER_ADDRESSES["pancakeswap"]), abi=UNISWAP_V2_ROUTER_FACTORY_ABI
+        )
+        factory_addr = _cached_rpc_value(
+            ("v2_factory", "pancakeswap"), lambda: classic_router.functions.factory().call(),
+            _IMMUTABLE_CACHE_TTL_SECONDS,
+        )
+        factory = w3.eth.contract(address=Web3.to_checksum_address(factory_addr), abi=UNISWAP_V2_FACTORY_ABI)
+        pool_address = _cached_rpc_value(
+            ("v2_getPair", factory_addr.lower()) + _pair_key(token_in, token_out),
+            lambda: factory.functions.getPair(token_in_cs, token_out_cs).call(),
+            _IMMUTABLE_CACHE_TTL_SECONDS,
+        )
+        if int(pool_address, 16) == 0:
             return None
+        return (pool_address, _quote_reserve_in_pool(w3, pool_address, quote_address))
 
     # Pool classique et meilleure pool V3 sont indépendantes l'une de l'autre :
-    # résolues EN PARALLÈLE (même raison que `_best_v3_style_pool`).
+    # résolues EN PARALLÈLE (même raison que `_best_v3_style_pool`). Une erreur
+    # RPC est propagée (voir `_resolve_aerodrome_route`).
     with ThreadPoolExecutor(max_workers=2) as executor_pool:
         classic_future = executor_pool.submit(_check_classic)
         v3_future = executor_pool.submit(_best_pancakeswap_v3_pool, w3, other_token, quote_address)
@@ -635,11 +696,7 @@ def _resolve_pancakeswap_route(w3, token_in: str, token_out: str) -> dict | None
 
     v3_reserve = -1
     if v3 is not None:
-        reserve = _quote_reserve_in_pool(w3, v3[1], quote_address)
-        if reserve is not None:
-            v3_reserve = reserve
-        else:
-            v3 = None
+        v3_reserve = _v3_style_quote_depth(w3, v3[1], other_token, quote_address)
 
     if v3 is not None and v3_reserve > classic_reserve:
         fee_tier, pool_address = v3
@@ -674,25 +731,25 @@ def _v2_fork_pool_confirmed_absent(w3, dex: str, token_in: str, token_out: str) 
     aucune pool directe exécutable sur CE DEX précis."""
     from web3 import Web3
 
-    cache_key = ("v2_fork_pool_absent", dex, token_in.lower(), token_out.lower())
-    cached = _route_cache_get(cache_key)
-    if cached is not _ROUTE_CACHE_MISSING:
-        return bool(cached)
-
     try:
         router = w3.eth.contract(
             address=Web3.to_checksum_address(ROUTER_ADDRESSES[dex]), abi=UNISWAP_V2_ROUTER_FACTORY_ABI
         )
-        factory_address = router.functions.factory().call()
+        factory_address = _cached_rpc_value(
+            ("v2_factory", dex), lambda: router.functions.factory().call(), _IMMUTABLE_CACHE_TTL_SECONDS,
+        )
         factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=UNISWAP_V2_FACTORY_ABI)
-        pool_address = factory.functions.getPair(
-            Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out)
-        ).call()
-        confirmed_absent = int(pool_address, 16) == 0
-    except Exception:  # noqa: BLE001
-        confirmed_absent = False
-    _route_cache_set(cache_key, confirmed_absent)
-    return confirmed_absent
+        pool_address = _cached_rpc_value(
+            ("v2_getPair", factory_address.lower()) + _pair_key(token_in, token_out),
+            lambda: factory.functions.getPair(
+                Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out)
+            ).call(),
+            _IMMUTABLE_CACHE_TTL_SECONDS,
+        )
+        return int(pool_address, 16) == 0
+    except Exception as exc:  # noqa: BLE001 - doute (panne RPC) : permissif, et surtout JAMAIS mis en cache
+        logger.warning("Impossible de vérifier l'existence de la pool %s %s/%s : %s", dex, token_in, token_out, exc)
+        return False
 
 
 def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: int,
@@ -845,7 +902,7 @@ def execute_triangular_signal(db: Database, config: dict, signal: dict) -> dict:
 
     try:
         from web3 import Web3
-        w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
+        w3 = make_w3(timeout=15)
         if not _is_connected_with_retry(w3):
             result["error"] = "RPC Base injoignable."
             return result
@@ -972,7 +1029,7 @@ def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) ->
         return None
     try:
         from web3 import Web3
-        w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 10}))
+        w3 = make_w3(timeout=10)
         if not _is_connected_with_retry(w3):
             return None
 
@@ -1102,6 +1159,75 @@ def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) ->
         return None
 
 
+def _onchain_quote_depth_usd(dex: str, token_address: str, quote_address: str) -> float | None:
+    """Profondeur RÉELLE (en USD) côté quote token de la pool que `dex`
+    utiliserait pour `token_address`/`quote_address` — la même pool que celle
+    choisie par `_build_swap_call`/`flashloan._build_leg` (résolutions de
+    route cachées, donc coût RPC marginal) : réserve réelle pour une pool AMM
+    classique (`_quote_reserve_in_pool`), réserve VIRTUELLE au prix courant
+    pour une pool à liquidité concentrée (`_v3_style_quote_depth`).
+
+    Sert au détecteur (`app.trading.arbitrage._refine_spread_with_onchain_price`)
+    à écarter les signaux fantômes : DexScreener affiche pour une pool V3 une
+    "liquidité" égale à la valeur de TOUS ses tokens (positions hors range
+    comprises) et un prix qui n'est plus rafraîchi faute de trades — une pool
+    PancakeSwap V3 BRETT/WETH ainsi listée à >10k$ n'avait en réalité presque
+    aucune liquidité active : spread "rentable" permanent de plusieurs %,
+    simulations à -40/-90 %, aucune transaction jamais possible (09/10/2026).
+
+    Retourne None si indéterminable (DEX non supporté, RPC...) : l'appelant ne
+    doit alors PAS écarter le signal sur ce seul critère."""
+    try:
+        from web3 import Web3
+        w3 = make_w3(timeout=10)
+        if dex == "aerodrome":
+            route = _resolve_aerodrome_route(w3, token_address, quote_address)
+            if route is None:
+                return 0.0
+            depth_units = (_v3_style_quote_depth(w3, route["pool"], token_address, quote_address)
+                           if route["is_slipstream"] else _quote_reserve_in_pool(w3, route["pool"], quote_address))
+        elif dex == "pancakeswap":
+            route = _resolve_pancakeswap_route(w3, token_address, quote_address)
+            if route is None:
+                return 0.0
+            depth_units = (_v3_style_quote_depth(w3, route["pool"], token_address, quote_address)
+                           if route["is_v3"] else _quote_reserve_in_pool(w3, route["pool"], quote_address))
+        elif dex == "uniswap":
+            best = _best_v3_style_pool(
+                w3, UNISWAP_V3_FACTORY_ADDRESS, UNISWAP_V3_FACTORY_ABI, UNISWAP_V3_FEE_TIERS, token_address, quote_address
+            )
+            if best is None:
+                return 0.0
+            depth_units = _v3_style_quote_depth(w3, best[1], token_address, quote_address)
+        elif dex in UNISWAP_V2_FORK_DEXES:
+            router = w3.eth.contract(
+                address=Web3.to_checksum_address(ROUTER_ADDRESSES[dex]), abi=UNISWAP_V2_ROUTER_FACTORY_ABI
+            )
+            factory_address = _cached_rpc_value(
+                ("v2_factory", dex), lambda: router.functions.factory().call(), _IMMUTABLE_CACHE_TTL_SECONDS,
+            )
+            factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=UNISWAP_V2_FACTORY_ABI)
+            pool_address = _cached_rpc_value(
+                ("v2_getPair", factory_address.lower()) + _pair_key(token_address, quote_address),
+                lambda: factory.functions.getPair(
+                    Web3.to_checksum_address(token_address), Web3.to_checksum_address(quote_address)
+                ).call(),
+                _IMMUTABLE_CACHE_TTL_SECONDS,
+            )
+            if int(pool_address, 16) == 0:
+                return 0.0
+            depth_units = _quote_reserve_in_pool(w3, pool_address, quote_address)
+        else:
+            return None
+        quote_price_usd = _quote_token_usd_price(quote_address)
+        if quote_price_usd is None:
+            return None
+        return depth_units / (10 ** _get_decimals(w3, quote_address)) * quote_price_usd
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Profondeur on-chain indéterminable pour %s/%s sur %s: %s", token_address, quote_address, dex, exc)
+        return None
+
+
 def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, dex: str,
                         reference_price_usd: float | None = None) -> float | None:
     """Revérifie le prix courant sur `dex` juste avant d'agir (mitigation du
@@ -1215,7 +1341,7 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
 
     try:
         from web3 import Web3
-        w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
+        w3 = make_w3(timeout=15)
         if not _is_connected_with_retry(w3):
             result["error"] = "RPC Base injoignable."
             return result
@@ -1424,7 +1550,7 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
 
     try:
         from web3 import Web3
-        w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
+        w3 = make_w3(timeout=15)
         if not _is_connected_with_retry(w3):
             return results
 

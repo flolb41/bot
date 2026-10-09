@@ -155,7 +155,8 @@ def _best_spread(pairs: list[dict], token_address: str) -> dict | None:
     return best
 
 
-def _refine_spread_with_onchain_price(spread: dict, token_address: str, quote_address: str) -> dict:
+def _refine_spread_with_onchain_price(spread: dict, token_address: str, quote_address: str,
+                                      min_quote_depth_usd: float | None = None) -> dict:
     """Affine `spread` (prix DexScreener, potentiellement périmés de quelques
     secondes à quelques minutes pour une paire peu liquide) avec le prix
     on-chain RÉEL de chaque pool concernée — la MÊME lecture que celle faite
@@ -179,11 +180,20 @@ def _refine_spread_with_onchain_price(spread: dict, token_address: str, quote_ad
     spreads/prix totalement aberrants (observé en prod le 2026-10-08 sur
     WETH/AERO : spread à 10^44 %). Comme ces paires ne sont de toute façon
     jamais exécutables (quote non supporté), on retombe simplement sur le
-    spread DexScreener d'origine sans tenter de lecture on-chain."""
+    spread DexScreener d'origine sans tenter de lecture on-chain.
+
+    `min_quote_depth_usd` (optionnel) : profondeur on-chain minimale, côté
+    quote token, de la pool RÉELLEMENT routée sur chaque DEX (voir
+    `executor._onchain_quote_depth_usd`). En dessous, le signal est écarté
+    (spread ramené à 0) : la "liquidité" DexScreener d'une pool concentrée
+    compte les positions hors range, et son prix n'est plus rafraîchi faute de
+    trades — source de spreads "rentables" permanents mais fictifs
+    (PancakeSwap V3 BRETT/WETH, 09/10/2026 : simulations à -40/-90 %)."""
     from app.trading.executor import (
         EXECUTABLE_QUOTE_TOKENS, UNISWAP_V2_FORK_DEXES, _onchain_pool_price_usd, _onchain_price_is_plausible,
-        _resolve_rpc_url, _v2_fork_pool_confirmed_absent,
+        _onchain_quote_depth_usd, _v2_fork_pool_confirmed_absent,
     )
+    from app.trading.rpc import make_w3
 
     if quote_address.lower() not in EXECUTABLE_QUOTE_TOKENS:
         return spread
@@ -202,12 +212,26 @@ def _refine_spread_with_onchain_price(spread: dict, token_address: str, quote_ad
     for dex_side in ("buy_dex", "sell_dex"):
         dex = spread[dex_side]
         if dex in UNISWAP_V2_FORK_DEXES and dex not in ("aerodrome", "pancakeswap"):
-            from web3 import Web3
-            w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 10}))
-            if w3.is_connected() and _v2_fork_pool_confirmed_absent(w3, dex, token_address, quote_address):
+            # `_v2_fork_pool_confirmed_absent` est déjà permissif sur panne RPC :
+            # pas de test de connexion préalable (un appel RPC de moins par signal).
+            if _v2_fork_pool_confirmed_absent(make_w3(timeout=10), dex, token_address, quote_address):
                 logger.warning(
                     "Signal écarté : aucune pool %s confirmée on-chain pour %s/%s (%s).",
                     dex, token_address, quote_address, dex_side,
+                )
+                refined = dict(spread)
+                refined["spread_pct"] = 0.0
+                return refined
+
+    if min_quote_depth_usd is not None and min_quote_depth_usd > 0:
+        for dex_side in ("buy_dex", "sell_dex"):
+            dex = spread[dex_side]
+            depth_usd = _onchain_quote_depth_usd(dex, token_address, quote_address)
+            if depth_usd is not None and depth_usd < min_quote_depth_usd:
+                logger.warning(
+                    "Signal écarté : pool %s réellement routée pour %s/%s trop peu profonde on-chain "
+                    "(≈%.0f$ côté quote < %.0f$ requis) — liquidité DexScreener non exploitable (%s).",
+                    dex, token_address, quote_address, depth_usd, min_quote_depth_usd, dex_side,
                 )
                 refined = dict(spread)
                 refined["spread_pct"] = 0.0
@@ -369,7 +393,12 @@ def run_arbitrage_scan(
             # rentable, pas par pool. Un signal dont l'écart s'évapore une fois
             # vérifié on-chain est reclassé immédiatement (voir docstring de
             # `_refine_spread_with_onchain_price`).
-            spread = _refine_spread_with_onchain_price(spread, token_address, other_address)
+            spread = _refine_spread_with_onchain_price(
+                spread, token_address, other_address,
+                # Côté quote d'une pool V2 de `min_liquidity_usd` ≈ la moitié ;
+                # même exigence appliquée à la profondeur RÉELLE on-chain.
+                min_quote_depth_usd=min_liquidity_usd / 2,
+            )
             if spread["spread_pct"] < min_spread_pct_to_log:
                 continue
 

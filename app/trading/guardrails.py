@@ -24,75 +24,20 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from datetime import datetime, timezone
 
 from app.database import Database
 from app.killswitch import is_stopped, stop as killswitch_stop
 from app.trading.routers import FLASHLOAN_CONTRACT_ADDRESSES, ROUTER_ADDRESSES
+# Ré-exportés d'ici pour compatibilité (anciennement définis dans ce module) :
+# la résilience RPC (rotation d'endpoints + retry 429) vit dans `app.trading.rpc`.
+from app.trading.rpc import call_with_rate_limit_retry, is_connected_with_retry, is_rate_limit_error, make_w3  # noqa: F401
 from app.wallet.signer import DEFAULT_KEYSTORE_PATH, load_signer
 
 logger = logging.getLogger("app.trading.guardrails")
 
 DEFAULT_TRADING_KEYSTORE_PATH = "data/trading_wallet_keystore.json"
 LIVE_CONFIRMATION_PHRASE = "JE CONFIRME LE TRADING REEL AVEC MON WALLET PRINCIPAL"
-
-# Nombre de tentatives + délai entre tentatives en cas de 429 (rate-limit) du
-# RPC public gratuit (https://mainnet.base.org) lors de la simulation d'une
-# transaction. Sans ce retry, un simple rate-limit transitoire est confondu
-# avec un VRAI revert (manque de rentabilité), ce qui déclenche à tort le
-# disjoncteur de sécurité (`app.trading.pair_health`, 3 échecs consécutifs →
-# pause de 2h) alors que rien n'indique que le trade n'était pas rentable.
-#
-# Relevé en conditions réelles (endpoint Infura configuré) : les 429 ne sont
-# PAS rares/isolés mais quasi-CONTINUS sous la charge actuelle (plusieurs par
-# minute, sur des appels complètement différents — gas price, decimals, solde,
-# connexion). 3 tentatives à 2s fixes (≈4s de patience totale) s'épuisaient
-# avant la fin du rate-limit et laissaient échouer la tentative d'exécution
-# quand même. Backoff exponentiel (2s, 4s, 8s, 16s, 32s) sur 6 tentatives
-# (≈62s de patience totale) pour survivre aux rafales observées.
-_RATE_LIMIT_MAX_ATTEMPTS = 6
-_RATE_LIMIT_RETRY_DELAY_SECONDS = 2.0
-
-
-def is_rate_limit_error(exc: Exception) -> bool:
-    """Détecte un 429 Too Many Requests (ou équivalent) renvoyé par le RPC,
-    par opposition à un VRAI revert de simulation (manque de rentabilité,
-    slippage, etc.) — seule l'erreur réseau transitoire doit être retentée."""
-    message = str(exc)
-    return "429" in message or "too many requests" in message.lower()
-
-
-def call_with_rate_limit_retry(fn_call):
-    """Exécute `fn_call` (ex. `fn.call(...)`, `fn.estimate_gas(...)` ou
-    `w3.is_connected()`) en retentant jusqu'à `_RATE_LIMIT_MAX_ATTEMPTS` fois
-    avec un délai qui DOUBLE à chaque tentative (2s, 4s, 8s, ...) UNIQUEMENT si
-    l'échec est un rate-limit RPC (429) — toute autre exception (revert réel)
-    est immédiatement propagée sans retry.
-
-    Nom PUBLIC (pas de préfixe `_`) : réutilisé par `app.trading.executor`
-    (voir `execute_signal`/`execute_triangular_signal`), dont les vérifications
-    de solde/connexion RPC avant envoi d'une transaction réelle subissaient le
-    même 429 transitoire d'un RPC gratuit/limité (ex: Infura free tier) sans
-    aucun retry — confirmé en conditions réelles responsable d'un échec
-    QUASI-SYSTÉMATIQUE ("RPC Base injoignable" / "Erreur inattendue : 429 ...")
-    de chaque tentative d'exécution réelle malgré des signaux rentables."""
-    last_exc: Exception | None = None
-    delay = _RATE_LIMIT_RETRY_DELAY_SECONDS
-    for attempt in range(1, _RATE_LIMIT_MAX_ATTEMPTS + 1):
-        try:
-            return fn_call()
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if not is_rate_limit_error(exc) or attempt == _RATE_LIMIT_MAX_ATTEMPTS:
-                raise
-            logger.warning(
-                "RPC rate-limited (429), nouvelle tentative %d/%d dans %.1fs : %s",
-                attempt + 1, _RATE_LIMIT_MAX_ATTEMPTS, delay, exc,
-            )
-            time.sleep(delay)
-            delay *= 2
-    raise last_exc  # pragma: no cover - inatteignable (la boucle raise ou return toujours)
 
 
 class TradingRefused(Exception):
@@ -222,12 +167,10 @@ def send_trading_transaction(
 
     from web3 import Web3
 
-    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 15}))
-    try:
-        connected = call_with_rate_limit_retry(lambda: w3.is_connected())
-    except Exception:  # noqa: BLE001 - un vrai échec réseau persistant reste traité comme "injoignable"
-        connected = False
-    if not connected:
+    # `rpc_url` est conservé pour compatibilité d'appel : la connexion passe
+    # désormais par `make_w3` (rotation multi-endpoints, voir app.trading.rpc).
+    w3 = make_w3(timeout=15)
+    if not is_connected_with_retry(w3):
         return {"sent": False, "tx_hash": None, "error": "RPC injoignable"}
 
     signer_account = load_signer(

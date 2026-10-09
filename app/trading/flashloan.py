@@ -55,6 +55,7 @@ from app.trading.executor import (
 from app.trading.fees import DEFAULT_SLIPPAGE_BUFFER_PCT, dex_fee_pct, estimate_gas_cost_usd
 from app.trading.guardrails import TradingRefused, is_trading_live, send_trading_transaction
 from app.trading.routers import EXECUTABLE_DEXES, FLASH_ARBITRAGE_ADDRESS, ROUTER_ADDRESSES
+from app.trading.rpc import make_w3
 
 logger = logging.getLogger("app.trading.flashloan")
 
@@ -361,7 +362,7 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
     try:
         from web3 import Web3
 
-        w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
+        w3 = make_w3(timeout=15)
         if not _is_connected_with_retry(w3):
             result["error"] = "RPC Base injoignable."
             return result
@@ -496,7 +497,7 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
     try:
         from web3 import Web3
 
-        w3 = Web3(Web3.HTTPProvider(_resolve_rpc_url(), request_kwargs={"timeout": 15}))
+        w3 = make_w3(timeout=15)
         if not _is_connected_with_retry(w3):
             result["error"] = "RPC Base injoignable."
             return result
