@@ -13,10 +13,12 @@ trade possible non plus).
 Ce module fournit :
 - `rpc_urls()` : liste d'endpoints (`RPC_BASE`, séparés par des virgules, puis
   des endpoints publics par défaut) ;
-- `RotatingHTTPProvider` (via `make_w3`) : provider web3 qui bascule
-  d'endpoint sur 429 / erreur réseau / erreur JSON-RPC de rate-limit, avec
-  mise en quarantaine temporaire de l'endpoint fautif — chaque endpoint public
-  ayant son propre quota, la capacité totale est ~N× celle d'un seul ;
+- `RotatingHTTPProvider` (via `make_w3`) : provider web3 à PRIORITÉ STRICTE
+  (`RPC_BASE` = liste ordonnée, ex. Infura principal puis Alchemy en secours,
+  puis endpoints publics en dernier recours) qui bascule d'endpoint sur 429 /
+  erreur réseau / erreur JSON-RPC de rate-limit, avec mise en quarantaine
+  progressive de l'endpoint fautif — le principal reprend la main dès que sa
+  quarantaine expire ;
 - `call_with_rate_limit_retry` / `is_rate_limit_error` : retry applicatif
   (seconde ligne de défense, si TOUS les endpoints sont rate-limités) ;
 - `is_connected_with_retry` : test de connexion basé sur `eth_chainId`
@@ -26,9 +28,9 @@ Ce module fournit :
 from __future__ import annotations
 
 import functools
-import itertools
 import logging
 import os
+import re
 import threading
 import time
 
@@ -36,13 +38,14 @@ logger = logging.getLogger(__name__)
 
 BASE_CHAIN_ID = 8453
 
-# Endpoints publics gratuits testés depuis le Pi le 08/10/2026 (20 requêtes
-# en rafale chacun, 0 erreur) — l'endpoint Infura free tier précédemment
-# configuré échouait 15/15 sur le même test.
+# Endpoints publics gratuits, ajoutés EN DERNIER RECOURS après ceux de
+# `RPC_BASE` (endpoints dédiés avec clé : Infura, Alchemy...). Testés depuis le
+# Pi le 09/10/2026 (30 requêtes en rafale) : publicnode et mainnet.base.org
+# 30/30, drpc 15/30 (rate-limit public strict, mais utile en dépannage).
 DEFAULT_RPC_URLS: tuple[str, ...] = (
     "https://base-rpc.publicnode.com",
-    "https://base.drpc.org",
     "https://mainnet.base.org",
+    "https://base.drpc.org",
 )
 
 # Retry applicatif (au-dessus de la rotation d'endpoints) : backoff
@@ -52,20 +55,33 @@ _RATE_LIMIT_MAX_ATTEMPTS = 5
 _RATE_LIMIT_RETRY_DELAY_SECONDS = 2.0
 
 # Quarantaine d'un endpoint après un 429 (court : les fenêtres de rate-limit
-# des endpoints publics sont de l'ordre de quelques secondes) ou après une
-# erreur réseau / 5xx (plus long).
+# sont de l'ordre de quelques secondes) ou après une erreur réseau / 5xx (plus
+# long). La durée DOUBLE à chaque échec consécutif du même endpoint (plafond
+# `_MAX_COOLDOWN_SECONDS`) et revient à la base dès qu'il répond à nouveau :
+# un endpoint dont le quota JOURNALIER est épuisé (Infura free tier, vu en
+# prod) n'est ainsi plus re-sollicité toutes les 15s pour rien, sans jamais
+# être abandonné définitivement.
 _RATE_LIMIT_COOLDOWN_SECONDS = 15.0
 _FAILURE_COOLDOWN_SECONDS = 30.0
+_MAX_COOLDOWN_SECONDS = 600.0
 
 # Certains endpoints répondent HTTP 200 avec une erreur JSON-RPC de rate-limit
 # plutôt qu'un HTTP 429 : marqueurs reconnus dans le corps (en minuscules).
 _RATE_LIMIT_BODY_MARKERS = (b"rate limit", b"rate-limit", b"ratelimit", b"too many requests", b"-32005", b"-32016")
 
+_API_KEY_IN_URL = re.compile(r"(/v[23]/)[A-Za-z0-9_-]{6,}")
+
+
+def mask_rpc_url(url: str) -> str:
+    """URL RPC avec la clé API masquée (pour les logs : ne jamais y écrire une
+    clé Infura/Alchemy en clair)."""
+    return _API_KEY_IN_URL.sub(r"\1<clé>", url)
+
 
 def rpc_urls() -> list[str]:
-    """Endpoints RPC Base à utiliser, dans l'ordre de préférence : ceux de
-    `RPC_BASE` (un ou plusieurs, séparés par des virgules) puis
-    `DEFAULT_RPC_URLS`, sans doublon."""
+    """Endpoints RPC Base dans l'ordre de PRIORITÉ : ceux de `RPC_BASE` (un ou
+    plusieurs, séparés par des virgules — ex. Infura principal puis Alchemy en
+    secours) puis `DEFAULT_RPC_URLS` (publics, dernier recours), sans doublon."""
     raw = os.environ.get("RPC_BASE") or ""
     urls: list[str] = []
     for candidate in [part.strip() for part in raw.split(",")] + list(DEFAULT_RPC_URLS):
@@ -121,24 +137,24 @@ def _rotating_provider_class():
     from web3.providers.rpc import HTTPProvider
 
     class RotatingHTTPProvider(HTTPProvider):
-        """`HTTPProvider` web3 multi-endpoints : chaque requête JSON-RPC est
-        envoyée au premier endpoint disponible ; sur 429 / 403 / 5xx / erreur
-        réseau / erreur JSON-RPC de rate-limit, l'endpoint fautif est mis en
-        quarantaine et la requête est rejouée immédiatement sur le suivant.
-        L'ordre de départ tourne (round-robin) d'une instance à l'autre pour
-        répartir la charge entre endpoints même en l'absence d'erreur.
-        La quarantaine est partagée entre toutes les instances du processus."""
+        """`HTTPProvider` web3 multi-endpoints à PRIORITÉ STRICTE : chaque
+        requête JSON-RPC part vers le premier endpoint de la liste qui n'est
+        pas en quarantaine (ex. Infura → Alchemy en secours → publics en
+        dernier recours) ; sur 429 / 403 / 5xx / erreur réseau / erreur
+        JSON-RPC de rate-limit, l'endpoint fautif est mis en quarantaine (durée
+        doublée à chaque échec consécutif, remise à zéro au premier succès) et
+        la requête est rejouée immédiatement sur le suivant. Dès que la
+        quarantaine du principal expire, il reprend la main.
+        État de quarantaine partagé entre toutes les instances du processus."""
 
-        _round_robin = itertools.count()
         _cooldown_until: dict[str, float] = {}
+        _consecutive_failures: dict[str, int] = {}
         _lock = threading.Lock()
 
         def __init__(self, urls, request_kwargs=None):
-            urls = list(urls)
-            if not urls:
+            self._urls = list(urls)
+            if not self._urls:
                 raise ValueError("Aucun endpoint RPC configuré (RPC_BASE vide et aucun défaut).")
-            start = next(self._round_robin) % len(urls)
-            self._urls = urls[start:] + urls[:start]
             super().__init__(endpoint_uri=self._urls[0], request_kwargs=request_kwargs)
 
         def _ordered_candidates(self) -> list[str]:
@@ -150,10 +166,22 @@ def _rotating_provider_class():
                 # Tous en quarantaine : on tente quand même, du moins récemment puni au plus récent.
                 return sorted(self._urls, key=lambda u: self._cooldown_until.get(u, 0.0))
 
-        def _quarantine(self, uri: str, seconds: float, reason: str) -> None:
+        def _quarantine(self, uri: str, base_seconds: float, reason: str) -> None:
             with self._lock:
+                failures = self._consecutive_failures.get(uri, 0) + 1
+                self._consecutive_failures[uri] = failures
+                seconds = min(base_seconds * (2 ** (failures - 1)), _MAX_COOLDOWN_SECONDS)
                 self._cooldown_until[uri] = time.monotonic() + seconds
-            logger.warning("RPC %s mis en quarantaine %.0fs (%s) — bascule sur l'endpoint suivant.", uri, seconds, reason)
+            logger.warning(
+                "RPC %s mis en quarantaine %.0fs (%s, échec consécutif n°%d) — bascule sur l'endpoint suivant.",
+                mask_rpc_url(uri), seconds, reason, failures,
+            )
+
+        def _mark_success(self, uri: str) -> None:
+            if self._consecutive_failures.get(uri):
+                with self._lock:
+                    self._consecutive_failures[uri] = 0
+                logger.info("RPC %s répond à nouveau — redevient prioritaire.", mask_rpc_url(uri))
 
         def _make_request(self, method, request_data):  # noqa: ARG002 - signature imposée par web3
             last_exc: Exception | None = None
@@ -166,7 +194,7 @@ def _rotating_provider_class():
                     status = getattr(exc.response, "status_code", None)
                     if status == 429:
                         self._quarantine(uri, _RATE_LIMIT_COOLDOWN_SECONDS, "HTTP 429")
-                    elif status == 403 or (status is not None and status >= 500):
+                    elif status in (401, 403) or (status is not None and status >= 500):
                         self._quarantine(uri, _FAILURE_COOLDOWN_SECONDS, f"HTTP {status}")
                     else:
                         raise
@@ -178,8 +206,11 @@ def _rotating_provider_class():
                     continue
                 if _looks_rate_limited(raw):
                     self._quarantine(uri, _RATE_LIMIT_COOLDOWN_SECONDS, "rate-limit JSON-RPC")
-                    last_exc = requests.HTTPError(f"429 Too Many Requests (rate-limit JSON-RPC) for url: {uri}")
+                    last_exc = requests.HTTPError(
+                        f"429 Too Many Requests (rate-limit JSON-RPC) for url: {mask_rpc_url(uri)}"
+                    )
                     continue
+                self._mark_success(uri)
                 return raw
             assert last_exc is not None
             raise last_exc
