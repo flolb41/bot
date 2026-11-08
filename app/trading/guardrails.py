@@ -28,7 +28,8 @@ from datetime import datetime, timezone
 
 from app.database import Database
 from app.killswitch import is_stopped, stop as killswitch_stop
-from app.trading.routers import FLASHLOAN_CONTRACT_ADDRESSES, ROUTER_ADDRESSES
+from app.trading.fees import receipt_total_gas_cost_wei
+from app.trading.routers import FLASHLOAN_CONTRACT_ADDRESSES, TRADING_ROUTER_ADDRESSES
 # Ré-exportés d'ici pour compatibilité (anciennement définis dans ce module) :
 # la résilience RPC (rotation d'endpoints + retry 429) vit dans `app.trading.rpc`.
 from app.trading.rpc import call_with_rate_limit_retry, is_connected_with_retry, is_rate_limit_error, make_w3  # noqa: F401
@@ -95,17 +96,27 @@ def is_trading_live(config: dict) -> bool:
        activation accidentelle de (1)+(2) suffise à elle seule)
     4. Le killswitch global n'est pas actif
     """
+    return not trading_live_blockers(config)
+
+
+def trading_live_blockers(config: dict) -> list[str]:
+    """Décrit les prérequis live absents sans révéler les valeurs des secrets."""
     trading_cfg = config.get("trading", {}) if config else {}
+    blockers: list[str] = []
     if not trading_cfg.get("enabled"):
-        return False
+        blockers.append("trading.enabled est désactivé dans la configuration")
     if not _env_bool("TRADING_ENABLED", False):
-        return False
+        blockers.append("TRADING_ENABLED est absent ou désactivé")
     if os.environ.get("TRADING_LIVE_CONFIRMED", "") != LIVE_CONFIRMATION_PHRASE:
-        return False
-    return True
+        blockers.append("TRADING_LIVE_CONFIRMED est absent ou invalide")
+    return blockers
 
 
 def _notify(db: Database, title: str, message: str, level: str = "info") -> None:
+    # Journalisé aussi dans app.log : jusqu'ici une transaction envoyée
+    # n'apparaissait que dans la table `notifications`, invisible en lisant
+    # les logs après coup.
+    logger.log(logging.WARNING if level in ("warning", "alert") else logging.INFO, "%s — %s", title, message)
     db.add_notification(title=title, message=message, level=level)
 
 
@@ -153,7 +164,7 @@ def send_trading_transaction(
     """
     # Whitelist fixe = routers DEX connus + contrat(s) FlashArbitrage déployé(s)
     # (voir app/trading/routers.py) — jamais étendue par variable d'environnement.
-    whitelist = {addr.lower() for addr in ROUTER_ADDRESSES.values()} | {
+    whitelist = {addr.lower() for addr in TRADING_ROUTER_ADDRESSES} | {
         addr.lower() for addr in FLASHLOAN_CONTRACT_ADDRESSES
     }
     if whitelist_target.lower() not in whitelist:
@@ -223,10 +234,18 @@ def send_trading_transaction(
     finally:
         signer_account = None  # noqa: F841 - abandon de la référence à la clé déchiffrée au plus vite
 
+    gas_cost_wei = receipt_total_gas_cost_wei(receipt, gas_price_wei)
     if receipt.get("status") != 1:
         _anomaly_stop(db, f"Transaction {tx_hash} ({action_label or function_name}) a échoué on-chain (status=0).")
-        return {"sent": True, "tx_hash": tx_hash, "error": "Transaction échouée on-chain (status=0)"}
+        return {
+            "sent": True, "tx_hash": tx_hash, "error": "Transaction échouée on-chain (status=0)",
+            "gas_cost_wei": gas_cost_wei,
+            "receipt": receipt,
+        }
 
     _notify(db, "✅ Transaction de trading envoyée",
             f"{action_label or function_name} — tx {tx_hash}", level="info")
-    return {"sent": True, "tx_hash": tx_hash, "error": None}
+    return {
+        "sent": True, "tx_hash": tx_hash, "error": None,
+        "gas_cost_wei": gas_cost_wei, "receipt": receipt,
+    }

@@ -25,20 +25,29 @@ from app.trading import fees
 from app.trading.arbitrage import _DEFAULT_DEX_WHITELIST, _DEFAULT_SEED_TOKENS, _collect_pairs
 from app.trading.flashloan import estimate_triangular_signal_flashloan_preview, flashloan_min_net_profit_usd
 from app.trading.pair_health import triangular_health
+from app.trading.executor import EXECUTABLE_QUOTE_TOKENS, _quote_token_usd_price
+from app.trading.routers import EXECUTABLE_DEXES, TRIANGULAR_V2_EXECUTABLE_DEXES
 from app.wallet.pricing import get_price_usd
 
 logger = logging.getLogger(__name__)
 
-# DEX supportant un multi-hop en UNE SEULE transaction (voir
-# `executor._build_triangular_swap_call`) : tous les forks UniswapV2
-# classiques (path=[A,B,C,A] natif à `swapExactTokensForTokens`) + Aerodrome
-# (tableau `routes` multi-hop natif). Uniswap V3 est volontairement exclu :
-# son encodage multi-hop (`exactInput`, chemin bytes packé avec les fee tiers)
-# est nettement plus complexe à construire correctement — pas fait dans cette
-# phase, risque jugé disproportionné par rapport au gain.
+# DEX dont les pools peuvent être détectées pour des cycles triangulaires.
+# L'exécution live (wallet ou flashloan) est volontairement plus restreinte :
+# `TRIANGULAR_V2_EXECUTABLE_DEXES` ne comprend que les forks V2 dont le routeur
+# et la représentation des pools correspondent exactement au scan. Les cycles
+# Aerodrome/PancakeSwap restent visibles à titre informatif, mais leurs pools
+# stables/concentrées ne sont pas représentables par le chemin V2 multi-hop.
 TRIANGULAR_CAPABLE_DEXES = frozenset({
     "aerodrome", "sushiswap", "pancakeswap", "baseswap", "alien-base", "swapbased",
 })
+
+
+def _is_classic_triangular_route_executable(signal: dict) -> bool:
+    return (
+        signal.get("dex") in TRIANGULAR_V2_EXECUTABLE_DEXES & EXECUTABLE_DEXES
+        and (signal.get("token_a_address") or "").lower() in EXECUTABLE_QUOTE_TOKENS
+    )
+
 
 # Gas un peu plus élevé qu'un aller-retour classique : 3 swaps dans UNE tx
 # (au lieu de 2 swaps dans 2 tx séparées), estimation volontairement prudente
@@ -82,7 +91,7 @@ def run_triangular_scan(
     max_trade_size_usd = float(trading_cfg.get("max_trade_size_usd", 200))
     liquidity_safety_fraction = float(trading_cfg.get("liquidity_safety_fraction", 0.02))
     min_spread_pct_to_log = float(trading_cfg.get("min_spread_pct_to_log", 0.10))
-    min_net_profit_usd = float(trading_cfg.get("min_net_profit_usd", 0.50))
+    min_net_profit_usd = float(trading_cfg.get("min_net_profit_usd", 0.0))
     min_net_profit_pct = float(trading_cfg.get("min_net_profit_pct", 0.0))
 
     if not dex_whitelist:
@@ -195,8 +204,16 @@ def run_triangular_scan(
                     if gas_cost_usd is not None:
                         net_profit_usd = gross_profit_usd - fees_usd - slippage_buffer_usd - gas_cost_usd
                         adaptive_min_net_profit_usd = min_net_profit_usd * health["threshold_multiplier"]
-                        would_execute_classic = not health["disabled"] and net_profit_usd >= max(
-                            adaptive_min_net_profit_usd, trade_size_usd * min_net_profit_pct / 100
+                        would_execute_classic = (
+                            not health["disabled"]
+                            and _is_classic_triangular_route_executable({
+                                "dex": dex,
+                                "token_a_address": token_a_addr,
+                            })
+                            and fees.is_net_profit_above_threshold(
+                                net_profit_usd,
+                                max(adaptive_min_net_profit_usd, trade_size_usd * min_net_profit_pct / 100),
+                            )
                         )
 
                     signal = {
@@ -228,7 +245,12 @@ def run_triangular_scan(
                     would_execute_flashloan = (
                         not health["disabled"]
                         and flashloan_preview is not None
-                        and flashloan_preview["net_profit_usd"] >= flashloan_min_net_profit_usd(config or {})
+                        and fees.is_net_profit_above_threshold(
+                            flashloan_preview["net_profit_usd"],
+                            flashloan_min_net_profit_usd(
+                                config or {}, flashloan_preview["notional_usd"],
+                            ),
+                        )
                     )
                     signal["would_execute"] = would_execute_classic or would_execute_flashloan
                     # Champs distincts consommés par `app.scheduler` pour le
@@ -260,14 +282,11 @@ def run_cross_dex_triangular_scan(
     façon atomique en une transaction — voir `TRIANGULAR_CAPABLE_DEXES`).
 
     Repère donc des opportunités invisibles pour `run_triangular_scan` (ex :
-    A→B mieux coté sur Aerodrome, B→C sur Uniswap V3, C→A sur Baseswap), mais
-    PUREMENT INFORMATIONNEL : aucune exécution atomique en une seule
-    transaction n'est possible sans redévelopper/redéployer
-    `FlashArbitrage.sol` pour router chaque jambe vers un DEX différent (jugé
-    hors scope de ce lot d'améliorations). Les cycles détectés sont
-    journalisés en base (table `cross_dex_triangular_signals`, voir
-    `Database.list_cross_dex_triangular_signals`) pour inspection manuelle —
-    jamais exécutés ni proposés à l'exécution automatique.
+    A→B mieux coté sur Aerodrome, B→C sur Uniswap V3, C→A sur Baseswap).
+    Elles restent informatives par défaut. Une voie flashloan dédiée peut être
+    explicitement activée par `trading.cross_dex_flashloan_enabled`; elle
+    reconstruit les routes et profondeurs on-chain, puis laisse le garde-fou
+    commun simuler le cycle atomique avant toute diffusion.
 
     `groups` : pools déjà récupérées cette cycle avec la MÊME whitelist complète
     (voir `app.trading.arbitrage.collect_pairs_for_config`) — aucun filtrage
@@ -353,6 +372,15 @@ def run_cross_dex_triangular_scan(
                 min_liquidity = min(
                     pair_ab["liquidity_usd"], pair_bc["liquidity_usd"], pair_ca["liquidity_usd"]
                 )
+                token_a_usd_price = _quote_token_usd_price(token_a_addr)
+                token_b_usd_price = (
+                    token_a_usd_price / rate_ab
+                    if token_a_usd_price is not None and rate_ab > 0 else None
+                )
+                token_c_usd_price = (
+                    token_a_usd_price * rate_ca
+                    if token_a_usd_price is not None and rate_ca > 0 else None
+                )
 
                 signal = {
                     "chain": chain_id,
@@ -363,13 +391,12 @@ def run_cross_dex_triangular_scan(
                     "cycle_multiplier": cycle_multiplier,
                     "spread_pct": spread_pct,
                     "min_liquidity_usd": min_liquidity,
+                    "token_b_usd_price": token_b_usd_price,
+                    "token_c_usd_price": token_c_usd_price,
                 }
                 signal["id"] = db.add_cross_dex_triangular_signal(signal)
                 signals.append(signal)
 
     if signals:
-        logger.info(
-            "Cross-DEX triangular scan (informationnel, non exécutable) : %d cycle(s) détecté(s).",
-            len(signals),
-        )
+        logger.info("Cross-DEX triangular scan : %d cycle(s) détecté(s).", len(signals))
     return signals

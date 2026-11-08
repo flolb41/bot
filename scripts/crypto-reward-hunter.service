@@ -1,5 +1,5 @@
 [Unit]
-Description=Crypto Reward Hunter - veille airdrops/testnets/quetes
+Description=Crypto Reward Hunter - bot d'arbitrage inter-DEX (Base)
 After=network-online.target
 Wants=network-online.target
 
@@ -8,12 +8,21 @@ Type=simple
 User=florian
 WorkingDirectory=/home/florian/bot
 ExecStart=/home/florian/bot/.venv/bin/python /home/florian/bot/main.py run
-Restart=on-failure
-RestartSec=10
-# Durcissement minimal (lecture seule hors data/logs, pas de nouveaux privilèges).
+Restart=always
+RestartSec=15
+StartLimitBurst=5
+StartLimitIntervalSec=60
+# Durcissement (lecture seule hors data/logs, pas de nouveaux privilèges).
 NoNewPrivileges=true
 ProtectSystem=full
 ReadWritePaths=/home/florian/bot/data /home/florian/bot/logs
+# Variables d'environnement pour réduire l'empreinte mémoire et l'usure SD.
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+# Empêche le noyau Linux de tuer le processus Python en priorité en cas de
+# pression mémoire (OOM) — laisse le killswitch système_health gérer l'arrêt
+# propre plutôt qu'un kill brutal du noyau.
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target

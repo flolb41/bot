@@ -46,6 +46,10 @@ DEFAULT_RPC_URLS: tuple[str, ...] = (
     "https://base-rpc.publicnode.com",
     "https://mainnet.base.org",
     "https://base.drpc.org",
+    "https://rpc.ankr.com/base",
+    "https://base.blockpi.network/v1/rpc/public",
+    "https://1rpc.io/base",
+    "https://base.public.blastapi.io",
 )
 
 # Retry applicatif (au-dessus de la rotation d'endpoints) : backoff

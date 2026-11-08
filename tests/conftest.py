@@ -17,3 +17,13 @@ def _clear_executor_route_cache():
     executor._route_cache.clear()
     yield
     executor._route_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_shallow_pool_rejections():
+    """Même principe pour la mémoire des pools écartées pour profondeur
+    insuffisante (`app.trading.arbitrage._shallow_pool_rejections`)."""
+    from app.trading import arbitrage
+    arbitrage._shallow_pool_rejections.clear()
+    yield
+    arbitrage._shallow_pool_rejections.clear()

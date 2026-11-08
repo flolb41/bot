@@ -5,6 +5,7 @@ Tables : system_state (killswitch), notifications (alertes), arbitrage_signals
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -106,10 +107,8 @@ CREATE INDEX IF NOT EXISTS idx_triangular_would_execute ON triangular_signals(wo
 
 -- Cycles triangulaires détectés à CHEVAL sur plusieurs DEX (chaque jambe
 -- potentiellement sur un DEX différent, voir app.trading.triangular.
--- run_cross_dex_triangular_scan) : purement INFORMATIONNEL, jamais exécuté
--- automatiquement (`would_execute` toujours 0) car aucune exécution atomique
--- en une seule transaction n'est possible sans redéployer FlashArbitrage.sol
--- pour router vers 3 DEX distincts dans la même tx.
+-- run_cross_dex_triangular_scan). Leur exécution flashloan reste désactivée
+-- par défaut et possède un historique séparé des signaux mono-DEX.
 CREATE TABLE IF NOT EXISTS cross_dex_triangular_signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     detected_at REAL DEFAULT (strftime('%s','now')),
@@ -123,12 +122,125 @@ CREATE TABLE IF NOT EXISTS cross_dex_triangular_signals (
     dex_ab TEXT NOT NULL,
     dex_bc TEXT NOT NULL,
     dex_ca TEXT NOT NULL,
+    token_b_usd_price REAL,
+    token_c_usd_price REAL,
     cycle_multiplier REAL NOT NULL,
     spread_pct REAL NOT NULL,
-    min_liquidity_usd REAL
+    min_liquidity_usd REAL,
+    flashloan_notional_usd REAL,
+    flashloan_net_profit_usd REAL,
+    execution_status TEXT NOT NULL DEFAULT 'detected',
+    execution_attempted_at REAL,
+    execution_tx_hash TEXT,
+    execution_error TEXT,
+    realized_pnl_usd REAL,
+    actual_profit_quote REAL,
+    actual_gas_cost_wei INTEGER,
+    actual_gas_cost_usd REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_cross_dex_triangular_detected ON cross_dex_triangular_signals(detected_at DESC);
+
+-- OpportunitÃ©s d'arbitrage dÃ©tectÃ©es mais NON exÃ©cutables (filtrÃ©es avant
+-- journalisation dans arbitrage_signals) : quote non exÃ©cutable, spread sous
+-- le seuil de log, taille de trade nulle, profit net nÃ©gatifâ€¦ Permet de
+-- mesurer ce que le bot "rate" et d'ajuster les seuils de rentabilitÃ©.
+CREATE TABLE IF NOT EXISTS missed_opportunities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    detected_at REAL DEFAULT (strftime('%s','now')),
+    chain TEXT NOT NULL,
+    token_symbol TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    quote_symbol TEXT NOT NULL,
+    quote_address TEXT NOT NULL,
+    buy_dex TEXT NOT NULL,
+    sell_dex TEXT NOT NULL,
+    spread_pct REAL NOT NULL,
+    trade_size_usd REAL NOT NULL,
+    net_profit_usd REAL,
+    reason TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_missed_detected ON missed_opportunities(detected_at DESC);
+
+CREATE TABLE IF NOT EXISTS paper_market_observations (
+    strategy TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    token_symbol TEXT NOT NULL,
+    quote_address TEXT NOT NULL,
+    dex TEXT NOT NULL,
+    price_usd REAL NOT NULL,
+    liquidity_usd REAL NOT NULL,
+    volume_24h_usd REAL NOT NULL,
+    fdv_usd REAL,
+    observed_at REAL NOT NULL,
+    minute_bucket INTEGER NOT NULL,
+    PRIMARY KEY (strategy, token_address, quote_address, minute_bucket)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_observations_history
+ON paper_market_observations(strategy, token_address, quote_address, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS paper_strategy_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    token_symbol TEXT NOT NULL,
+    quote_address TEXT NOT NULL,
+    dex TEXT NOT NULL,
+    entry_at REAL NOT NULL,
+    entry_price_usd REAL NOT NULL,
+    stake_usd REAL NOT NULL,
+    fee_pct REAL NOT NULL,
+    slippage_pct REAL NOT NULL,
+    roundtrip_gas_usd REAL NOT NULL,
+    entry_liquidity_usd REAL NOT NULL,
+    entry_volume_24h_usd REAL NOT NULL,
+    fdv_usd REAL,
+    status TEXT NOT NULL DEFAULT 'open',
+    exit_at REAL,
+    exit_price_usd REAL,
+    net_pnl_usd REAL,
+    exit_reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_trades_recent
+ON paper_strategy_trades(strategy, entry_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_one_open_trade
+ON paper_strategy_trades(strategy, token_address, quote_address)
+WHERE status = 'open';
+
+CREATE TABLE IF NOT EXISTS directional_live_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    token_symbol TEXT NOT NULL,
+    quote_address TEXT NOT NULL,
+    dex TEXT NOT NULL,
+    entry_at REAL NOT NULL,
+    entry_price_usd REAL NOT NULL,
+    stake_usd REAL NOT NULL,
+    token_amount INTEGER NOT NULL DEFAULT 0,
+    token_amount_raw TEXT,
+    entry_tx_hash TEXT,
+    attempt_tx_hash TEXT,
+    entry_gas_cost_usd REAL,
+    status TEXT NOT NULL,
+    exit_at REAL,
+    exit_price_usd REAL,
+    exit_tx_hash TEXT,
+    exit_gas_cost_usd REAL,
+    net_pnl_usd REAL,
+    exit_reason TEXT,
+    execution_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_directional_live_trades_entry
+ON directional_live_trades(entry_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_directional_single_open_trade
+ON directional_live_trades((1))
+WHERE status IN ('pending', 'open', 'unresolved');
 """
 
 
@@ -163,6 +275,27 @@ class Database:
             "ALTER TABLE arbitrage_signals ADD COLUMN flashloan_net_profit_usd REAL",
             "ALTER TABLE triangular_signals ADD COLUMN flashloan_notional_usd REAL",
             "ALTER TABLE triangular_signals ADD COLUMN flashloan_net_profit_usd REAL",
+            "ALTER TABLE arbitrage_signals ADD COLUMN realized_pnl_usd REAL",
+            "ALTER TABLE arbitrage_signals ADD COLUMN actual_profit_quote REAL",
+            "ALTER TABLE arbitrage_signals ADD COLUMN actual_gas_cost_wei INTEGER",
+            "ALTER TABLE arbitrage_signals ADD COLUMN actual_gas_cost_usd REAL",
+            "ALTER TABLE triangular_signals ADD COLUMN realized_pnl_usd REAL",
+            "ALTER TABLE triangular_signals ADD COLUMN actual_profit_quote REAL",
+            "ALTER TABLE triangular_signals ADD COLUMN actual_gas_cost_wei INTEGER",
+            "ALTER TABLE triangular_signals ADD COLUMN actual_gas_cost_usd REAL",
+            "ALTER TABLE directional_live_trades ADD COLUMN token_amount_raw TEXT",
+            "ALTER TABLE cross_dex_triangular_signals ADD COLUMN execution_status TEXT NOT NULL DEFAULT 'detected'",
+            "ALTER TABLE cross_dex_triangular_signals ADD COLUMN token_b_usd_price REAL",
+            "ALTER TABLE cross_dex_triangular_signals ADD COLUMN token_c_usd_price REAL",
+            "ALTER TABLE cross_dex_triangular_signals ADD COLUMN flashloan_notional_usd REAL",
+            "ALTER TABLE cross_dex_triangular_signals ADD COLUMN flashloan_net_profit_usd REAL",
+            "ALTER TABLE cross_dex_triangular_signals ADD COLUMN execution_attempted_at REAL",
+            "ALTER TABLE cross_dex_triangular_signals ADD COLUMN execution_tx_hash TEXT",
+            "ALTER TABLE cross_dex_triangular_signals ADD COLUMN execution_error TEXT",
+            "ALTER TABLE cross_dex_triangular_signals ADD COLUMN realized_pnl_usd REAL",
+            "ALTER TABLE cross_dex_triangular_signals ADD COLUMN actual_profit_quote REAL",
+            "ALTER TABLE cross_dex_triangular_signals ADD COLUMN actual_gas_cost_wei INTEGER",
+            "ALTER TABLE cross_dex_triangular_signals ADD COLUMN actual_gas_cost_usd REAL",
         ]
         for stmt in migrations:
             try:
@@ -207,6 +340,17 @@ class Database:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+    def dashboard_stats_reset_at(self) -> float:
+        """Début de la période visible dans les agrégats du dashboard."""
+        value = self.get_state("dashboard_stats_reset_at", "0")
+        try:
+            reset_at = float(value or 0)
+        except ValueError as exc:
+            raise ValueError("Invalid dashboard statistics reset timestamp.") from exc
+        if not math.isfinite(reset_at) or reset_at < 0:
+            raise ValueError("Invalid dashboard statistics reset timestamp.")
+        return reset_at
 
     # --- notifications (alternative/complément web au Telegram) --------
     def add_notification(self, title: str, message: str = "", level: str = "info",
@@ -276,15 +420,25 @@ class Database:
 
     def mark_arbitrage_signal_executed(self, signal_id: int, *, tx_hash_buy: str | None = None,
                                         tx_hash_sell: str | None = None,
-                                        execution_error: str | None = None) -> None:
+                                        execution_error: str | None = None,
+                                        realized_pnl_usd: float | None = None,
+                                        actual_profit_quote: float | None = None,
+                                        actual_gas_cost_wei: int | None = None,
+                                        actual_gas_cost_usd: float | None = None) -> None:
         """Enregistre le résultat réel (Phase 2) d'une tentative d'exécution d'un
         signal d'arbitrage. `execution_error` non-null signifie un round-trip
         incomplet/échoué (voir app/trading/executor.py pour la gestion du risque
         non-atomique : tx_hash_buy peut être renseigné seul si la 2e jambe échoue)."""
         self.execute(
             "UPDATE arbitrage_signals SET executed = 1, tx_hash_buy = ?, tx_hash_sell = ?, "
-            "execution_error = ?, mode = 'live' WHERE id = ?",
-            (tx_hash_buy, tx_hash_sell, execution_error, signal_id),
+            "execution_error = ?, mode = 'live', realized_pnl_usd = COALESCE(?, realized_pnl_usd), "
+            "actual_profit_quote = COALESCE(?, actual_profit_quote), "
+            "actual_gas_cost_wei = COALESCE(?, actual_gas_cost_wei), "
+            "actual_gas_cost_usd = COALESCE(?, actual_gas_cost_usd) WHERE id = ?",
+            (
+                tx_hash_buy, tx_hash_sell, execution_error, realized_pnl_usd,
+                actual_profit_quote, actual_gas_cost_wei, actual_gas_cost_usd, signal_id,
+            ),
         )
 
 
@@ -304,53 +458,188 @@ class Database:
         )
 
     def today_executed_trades_count(self) -> int:
-        """Nombre de round-trips d'arbitrage réellement exécutés depuis minuit UTC
-        (garde-fou de plafond quotidien, voir app/trading/guardrails.py).
-        Compte à la fois les round-trips classiques (2 jambes) ET les cycles
-        triangulaires (1 transaction) : le plafond TRADING_MAX_TX_PER_DAY
-        s'applique globalement, pas par type de stratégie."""
+        """Nombre de signaux de trading ayant diffusé au moins une transaction
+        depuis minuit UTC (garde-fou de plafond quotidien, voir guardrails.py).
+        Les refus de prévalidation sans hash de transaction ne consomment pas
+        le plafond ; les transactions diffusées qui revertent le consomment.
+        Compte les arbitrages classiques, les cycles triangulaires et les
+        entrées directionnelles : le plafond TRADING_MAX_TX_PER_DAY s'applique
+        globalement, pas par type de stratégie."""
         start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         row = self.fetch_one(
             "SELECT "
-            "(SELECT COUNT(*) FROM arbitrage_signals WHERE executed = 1 AND detected_at >= ?) + "
-            "(SELECT COUNT(*) FROM triangular_signals WHERE executed = 1 AND detected_at >= ?) AS n",
-            (start_of_day, start_of_day),
+            "(SELECT COUNT(*) FROM arbitrage_signals "
+            " WHERE mode = 'live' AND (tx_hash_buy IS NOT NULL OR tx_hash_sell IS NOT NULL) "
+            " AND detected_at >= ?) + "
+            "(SELECT COUNT(*) FROM triangular_signals "
+            " WHERE mode = 'live' AND tx_hash IS NOT NULL AND detected_at >= ?) + "
+            "(SELECT COUNT(*) FROM cross_dex_triangular_signals "
+            " WHERE execution_tx_hash IS NOT NULL AND execution_attempted_at >= ?) + "
+            "(SELECT COUNT(*) FROM directional_live_trades "
+            " WHERE attempt_tx_hash IS NOT NULL AND entry_at >= ?) AS n",
+            (start_of_day, start_of_day, start_of_day, start_of_day),
         )
         return int(row["n"]) if row else 0
+
+    def directional_open_trade(self) -> dict[str, Any] | None:
+        return self.fetch_one(
+            "SELECT * FROM directional_live_trades "
+            "WHERE status IN ('pending', 'open', 'unresolved') ORDER BY entry_at LIMIT 1"
+        )
+
+    def directional_unresolved_positions_count(self) -> int:
+        row = self.fetch_one(
+            "SELECT COUNT(*) AS n FROM directional_live_trades WHERE status='unresolved'"
+        )
+        return int(row["n"]) if row else 0
+
+    def archive_expired_scan_data(
+        self, retention_days: int = 90, *, now: float | None = None,
+    ) -> dict[str, int]:
+        """Archive and remove old scan telemetry; preserve execution and trade history."""
+        if isinstance(retention_days, bool) or not isinstance(retention_days, int) or retention_days < 1:
+            raise ValueError("retention_days must be a positive integer.")
+        current_time = time.time() if now is None else float(now)
+        if not math.isfinite(current_time) or current_time < 0:
+            raise ValueError("now must be a finite non-negative timestamp.")
+        cutoff = current_time - retention_days * 24 * 60 * 60
+        archive_path = self.db_path.with_name("reward_hunter_archive.db").resolve()
+        if archive_path == self.db_path.resolve():
+            raise ValueError("Archive database must differ from the live database.")
+
+        retention_tables = (
+            ("arbitrage_signals", "detected_at",
+             "mode != 'live' AND executed = 0 AND tx_hash IS NULL "
+             "AND tx_hash_buy IS NULL AND tx_hash_sell IS NULL"),
+            ("triangular_signals", "detected_at",
+             "mode != 'live' AND executed = 0 AND tx_hash IS NULL"),
+            ("cross_dex_triangular_signals", "detected_at",
+             "execution_status = 'detected' AND execution_attempted_at IS NULL "
+             "AND execution_tx_hash IS NULL"),
+            ("missed_opportunities", "detected_at", "1 = 1"),
+            ("paper_market_observations", "observed_at", "1 = 1"),
+            ("notifications", "created_at", "is_read = 1"),
+        )
+        archived: dict[str, int] = {}
+        with self.connection() as conn:
+            conn.execute("ATTACH DATABASE ? AS retention_archive", (str(archive_path),))
+            for table, timestamp_column, row_filter in retention_tables:
+                conn.execute(
+                    f'CREATE TABLE IF NOT EXISTS retention_archive."{table}" '
+                    f'AS SELECT * FROM main."{table}" WHERE 0'
+                )
+                predicate = f'"{timestamp_column}" < ? AND ({row_filter})'
+                cursor = conn.execute(
+                    f'INSERT INTO retention_archive."{table}" '
+                    f'SELECT * FROM main."{table}" WHERE {predicate}',
+                    (cutoff,),
+                )
+                archived[table] = max(0, cursor.rowcount)
+                conn.execute(
+                    f'DELETE FROM main."{table}" WHERE {predicate}',
+                    (cutoff,),
+                )
+        return archived
+
+    def directional_daily_pnl_state(self, start_of_day: float) -> dict[str, Any]:
+        row = self.fetch_one(
+            "SELECT "
+            "(SELECT COALESCE(SUM(realized_pnl_usd), 0) FROM arbitrage_signals "
+            " WHERE mode='live' AND detected_at >= ?) + "
+            "(SELECT COALESCE(SUM(realized_pnl_usd), 0) FROM triangular_signals "
+            " WHERE mode='live' AND detected_at >= ?) + "
+            "(SELECT COALESCE(SUM(realized_pnl_usd), 0) FROM cross_dex_triangular_signals "
+            " WHERE execution_attempted_at >= ?) + "
+            "(SELECT COALESCE(SUM(net_pnl_usd), 0) FROM directional_live_trades "
+            " WHERE status='closed' AND exit_at >= ?) AS pnl, "
+            "(SELECT COUNT(*) FROM arbitrage_signals "
+            " WHERE mode='live' AND executed=1 AND detected_at >= ? AND realized_pnl_usd IS NULL) + "
+            "(SELECT COUNT(*) FROM triangular_signals "
+            " WHERE mode='live' AND executed=1 AND detected_at >= ? AND realized_pnl_usd IS NULL) + "
+            "(SELECT COUNT(*) FROM cross_dex_triangular_signals "
+            " WHERE execution_status='executed' AND execution_attempted_at >= ? AND realized_pnl_usd IS NULL) + "
+            "(SELECT COUNT(*) FROM directional_live_trades "
+            " WHERE status='closed' AND exit_at >= ? AND net_pnl_usd IS NULL) AS unmeasured",
+            (
+                start_of_day, start_of_day, start_of_day, start_of_day,
+                start_of_day, start_of_day, start_of_day, start_of_day,
+            ),
+        )
+        return row or {"pnl": 0.0, "unmeasured": 0}
+
+    def directional_live_stats(self) -> dict[str, Any]:
+        row = self.fetch_one(
+            "SELECT COUNT(*) AS total, "
+            "COALESCE(SUM(CASE WHEN status='closed' THEN 1 ELSE 0 END), 0) AS completed, "
+            "COALESCE(SUM(CASE WHEN status IN ('pending', 'open', 'unresolved') THEN 1 ELSE 0 END), 0) AS open_count, "
+            "COALESCE(SUM(CASE WHEN status='closed' THEN net_pnl_usd ELSE 0 END), 0) AS realized_pnl_usd, "
+            "COALESCE(SUM(CASE WHEN status='closed' AND net_pnl_usd IS NULL THEN 1 ELSE 0 END), 0) AS unmeasured_closed "
+            "FROM directional_live_trades"
+        )
+        return row or {
+            "total": 0, "completed": 0, "open_count": 0,
+            "realized_pnl_usd": 0.0, "unmeasured_closed": 0,
+        }
 
     def arbitrage_stats_summary(self) -> dict[str, Any]:
         """Agrégat utile pour le dashboard : nombre de signaux, nombre de signaux
         jugés rentables (would_execute), P&L cumulé hypothétique (simulation)."""
         row = self.fetch_one(
             "SELECT COUNT(*) AS total, "
-            "SUM(would_execute) AS would_execute_count, "
+            "COALESCE(SUM(would_execute), 0) AS would_execute_count, "
             # Un signal peut être rentable via le capital propre (`net_profit_usd`)
             # OU via flashloan (`flashloan_net_profit_usd`), voir
             # app.trading.arbitrage.would_execute_classic/would_execute_flashloan.
             # On retient le meilleur des deux comme estimation du P&L réalisé
             # si exécuté (le scheduler privilégie le flashloan quand les deux
             # sont rentables, voir app/scheduler.py).
-            "SUM(CASE WHEN would_execute = 1 "
+            "COALESCE(SUM(CASE WHEN would_execute = 1 "
             "THEN COALESCE(MAX(net_profit_usd, flashloan_net_profit_usd), net_profit_usd, flashloan_net_profit_usd, 0) "
-            "ELSE 0 END) AS cumulative_net_profit_usd, "
+            "ELSE 0 END), 0) AS cumulative_net_profit_usd, "
             "MAX(detected_at) AS last_scan_at "
-            "FROM arbitrage_signals"
+            "FROM arbitrage_signals WHERE detected_at >= ?",
+            (self.dashboard_stats_reset_at(),),
         )
         return row if row else {
             "total": 0, "would_execute_count": 0, "cumulative_net_profit_usd": 0.0, "last_scan_at": None,
         }
 
     def live_trading_stats(self) -> dict[str, Any]:
-        """Agrégat des round-trips RÉELS (mode='live', tx_hash_buy renseigné) :
-        combien complétés (tx_hash_sell renseigné) vs encore ouverts (position
-        résiduelle en attente de clôture, voir `list_open_positions`)."""
+        """Agrégat des tentatives réelles et du P&L seulement quand il a été mesuré."""
         row = self.fetch_one(
-            "SELECT COUNT(*) AS total_live, "
-            "SUM(CASE WHEN tx_hash_sell IS NOT NULL THEN 1 ELSE 0 END) AS completed, "
-            "SUM(CASE WHEN tx_hash_sell IS NULL THEN 1 ELSE 0 END) AS open_count "
-            "FROM arbitrage_signals WHERE mode = 'live' AND tx_hash_buy IS NOT NULL"
+            "WITH arb AS (SELECT * FROM arbitrage_signals WHERE detected_at >= ?), "
+            "tri AS (SELECT * FROM triangular_signals WHERE detected_at >= ?), "
+            "cross AS (SELECT * FROM cross_dex_triangular_signals WHERE detected_at >= ?) "
+            "SELECT "
+            "(SELECT COUNT(*) FROM arb WHERE mode = 'live' AND executed = 1) + "
+            "(SELECT COUNT(*) FROM tri WHERE mode = 'live' AND executed = 1) + "
+            "(SELECT COUNT(*) FROM cross WHERE execution_tx_hash IS NOT NULL) AS total_live, "
+            "(SELECT COUNT(*) FROM arb WHERE mode = 'live' AND tx_hash_buy IS NOT NULL "
+            " AND tx_hash_sell IS NOT NULL AND execution_error IS NULL) + "
+            "(SELECT COUNT(*) FROM tri WHERE mode = 'live' AND tx_hash IS NOT NULL "
+            " AND execution_error IS NULL) + "
+            "(SELECT COUNT(*) FROM cross WHERE execution_status = 'executed') AS completed, "
+            "(SELECT COUNT(*) FROM arbitrage_signals WHERE mode = 'live' AND tx_hash_buy IS NOT NULL "
+            " AND tx_hash_sell IS NULL) AS open_count, "
+            "(SELECT COUNT(*) FROM arb WHERE realized_pnl_usd IS NOT NULL) + "
+            "(SELECT COUNT(*) FROM tri WHERE realized_pnl_usd IS NOT NULL) + "
+            "(SELECT COUNT(*) FROM cross WHERE realized_pnl_usd IS NOT NULL) AS measured_trades, "
+            "COALESCE((SELECT SUM(realized_pnl_usd) FROM arb), 0) + "
+            "COALESCE((SELECT SUM(realized_pnl_usd) FROM tri), 0) + "
+            "COALESCE((SELECT SUM(realized_pnl_usd) FROM cross), 0) AS realized_pnl_usd, "
+            "COALESCE((SELECT SUM(actual_gas_cost_usd) FROM arb), 0) + "
+            "COALESCE((SELECT SUM(actual_gas_cost_usd) FROM tri), 0) + "
+            "COALESCE((SELECT SUM(actual_gas_cost_usd) FROM cross), 0) AS actual_gas_cost_usd",
+            (
+                self.dashboard_stats_reset_at(),
+                self.dashboard_stats_reset_at(),
+                self.dashboard_stats_reset_at(),
+            ),
         )
-        return row if row else {"total_live": 0, "completed": 0, "open_count": 0}
+        return row if row else {
+            "total_live": 0, "completed": 0, "open_count": 0, "measured_trades": 0,
+            "realized_pnl_usd": 0.0, "actual_gas_cost_usd": 0.0,
+        }
 
     # --- bot de trading : signaux d'arbitrage TRIANGULAIRE (1 seul DEX, 1 seule tx) ---
     def add_triangular_signal(self, signal: dict[str, Any]) -> int:
@@ -386,15 +675,13 @@ class Database:
 
     def add_cross_dex_triangular_signal(self, signal: dict[str, Any]) -> int:
         """Journalise un cycle triangulaire détecté à cheval sur plusieurs DEX —
-        voir `app.trading.triangular.run_cross_dex_triangular_scan`. Purement
-        informationnel (pas de colonnes would_execute/executed : jamais
-        exécuté automatiquement, voir docstring du schéma)."""
+        voir `app.trading.triangular.run_cross_dex_triangular_scan`."""
         return self.execute(
             "INSERT INTO cross_dex_triangular_signals ("
             "chain, token_a_symbol, token_a_address, token_b_symbol, token_b_address, "
             "token_c_symbol, token_c_address, dex_ab, dex_bc, dex_ca, "
-            "cycle_multiplier, spread_pct, min_liquidity_usd"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "cycle_multiplier, spread_pct, min_liquidity_usd, token_b_usd_price, token_c_usd_price"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 signal["chain"],
                 signal["token_a_symbol"], signal["token_a_address"],
@@ -402,7 +689,47 @@ class Database:
                 signal["token_c_symbol"], signal["token_c_address"],
                 signal["dex_ab"], signal["dex_bc"], signal["dex_ca"],
                 signal["cycle_multiplier"], signal["spread_pct"], signal.get("min_liquidity_usd"),
+                signal.get("token_b_usd_price"), signal.get("token_c_usd_price"),
             ),
+        )
+
+    def mark_cross_dex_signal_executed(
+        self,
+        signal_id: int,
+        *,
+        executed: bool,
+        tx_hash: str | None,
+        execution_error: str | None,
+        realized_pnl_usd: float | None = None,
+        actual_profit_quote: float | None = None,
+        actual_gas_cost_wei: int | None = None,
+        actual_gas_cost_usd: float | None = None,
+    ) -> None:
+        self.execute(
+            "UPDATE cross_dex_triangular_signals SET "
+            "execution_status = ?, execution_attempted_at = ?, execution_tx_hash = ?, "
+            "execution_error = ?, realized_pnl_usd = ?, actual_profit_quote = ?, "
+            "actual_gas_cost_wei = ?, actual_gas_cost_usd = ? WHERE id = ?",
+            (
+                "executed" if executed else "failed",
+                time.time(),
+                tx_hash,
+                execution_error,
+                realized_pnl_usd,
+                actual_profit_quote,
+                actual_gas_cost_wei,
+                actual_gas_cost_usd,
+                signal_id,
+            ),
+        )
+
+    def update_cross_dex_signal_preview(
+        self, signal_id: int, *, notional_usd: float | None, net_profit_usd: float | None,
+    ) -> None:
+        self.execute(
+            "UPDATE cross_dex_triangular_signals SET "
+            "flashloan_notional_usd = ?, flashloan_net_profit_usd = ? WHERE id = ?",
+            (notional_usd, net_profit_usd, signal_id),
         )
 
     def list_cross_dex_triangular_signals(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -410,6 +737,50 @@ class Database:
             "SELECT * FROM cross_dex_triangular_signals ORDER BY detected_at DESC LIMIT ?",
             (limit,),
         )
+
+    # --- opportunitÃ©s manquÃ©es (filtrÃ©es avant exÃ©cution) ----------------
+    def record_missed_opportunity(self, opportunity: dict[str, Any]) -> int:
+        """Enregistre une opportunitÃ© d'arbitrage dÃ©tectÃ©e mais jugÃ©e
+        non exÃ©cutable (avant inscription dans arbitrage_signals)."""
+        return self.execute(
+            "INSERT INTO missed_opportunities ("
+            "chain, token_symbol, token_address, quote_symbol, quote_address, "
+            "buy_dex, sell_dex, spread_pct, trade_size_usd, net_profit_usd, reason"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                opportunity["chain"], opportunity["token_symbol"], opportunity["token_address"],
+                opportunity["quote_symbol"], opportunity["quote_address"],
+                opportunity["buy_dex"], opportunity["sell_dex"],
+                opportunity["spread_pct"], opportunity["trade_size_usd"],
+                opportunity.get("net_profit_usd"), opportunity["reason"],
+            ),
+        )
+
+    def list_missed_opportunities(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self.fetch_all(
+            "SELECT * FROM missed_opportunities ORDER BY detected_at DESC LIMIT ?",
+            (limit,),
+        )
+
+    # --- projets / tÃ¢ches (dashboard rÃ©compenses) -------------------------
+    def list_projects(self, limit: int | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM projects ORDER BY score DESC, name ASC"
+        if limit is not None:
+            query += " LIMIT ?"
+            return self.fetch_all(query, (limit,))
+        return self.fetch_all(query)
+
+    def list_tasks(self, *, status: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM tasks"
+        params: list[Any] = []
+        if status is not None:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        return self.fetch_all(query, tuple(params))
 
     def triangular_execution_history(self, *, dex: str, token_a_symbol: str, token_b_symbol: str,
                                       token_c_symbol: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -422,8 +793,12 @@ class Database:
             (dex, token_a_symbol, token_b_symbol, token_c_symbol, limit),
         )
 
-    def mark_triangular_signal_executed(self, signal_id: int, *, tx_hash: str | None = None,
-                                         execution_error: str | None = None) -> None:
+    def mark_triangular_signal_executed(
+        self, signal_id: int, *, tx_hash: str | None = None,
+        execution_error: str | None = None, realized_pnl_usd: float | None = None,
+        actual_profit_quote: float | None = None, actual_gas_cost_wei: int | None = None,
+        actual_gas_cost_usd: float | None = None,
+    ) -> None:
         """Enregistre le résultat réel d'une tentative d'exécution d'un cycle
         triangulaire. Contrairement à `mark_arbitrage_signal_executed`, une
         seule transaction (atomique) : soit elle passe entièrement (tx_hash
@@ -431,8 +806,14 @@ class Database:
         (execution_error renseigné, tx_hash=None) — jamais d'état intermédiaire."""
         self.execute(
             "UPDATE triangular_signals SET executed = 1, tx_hash = ?, execution_error = ?, "
-            "mode = 'live' WHERE id = ?",
-            (tx_hash, execution_error, signal_id),
+            "mode = 'live', realized_pnl_usd = COALESCE(?, realized_pnl_usd), "
+            "actual_profit_quote = COALESCE(?, actual_profit_quote), "
+            "actual_gas_cost_wei = COALESCE(?, actual_gas_cost_wei), "
+            "actual_gas_cost_usd = COALESCE(?, actual_gas_cost_usd) WHERE id = ?",
+            (
+                tx_hash, execution_error, realized_pnl_usd, actual_profit_quote,
+                actual_gas_cost_wei, actual_gas_cost_usd, signal_id,
+            ),
         )
 
     def triangular_stats_summary(self) -> dict[str, Any]:
@@ -440,12 +821,13 @@ class Database:
         pour les cycles triangulaires."""
         row = self.fetch_one(
             "SELECT COUNT(*) AS total, "
-            "SUM(would_execute) AS would_execute_count, "
-            "SUM(CASE WHEN would_execute = 1 "
+            "COALESCE(SUM(would_execute), 0) AS would_execute_count, "
+            "COALESCE(SUM(CASE WHEN would_execute = 1 "
             "THEN COALESCE(MAX(net_profit_usd, flashloan_net_profit_usd), net_profit_usd, flashloan_net_profit_usd, 0) "
-            "ELSE 0 END) AS cumulative_net_profit_usd, "
+            "ELSE 0 END), 0) AS cumulative_net_profit_usd, "
             "MAX(detected_at) AS last_scan_at "
-            "FROM triangular_signals"
+            "FROM triangular_signals WHERE detected_at >= ?",
+            (self.dashboard_stats_reset_at(),),
         )
         return row if row else {
             "total": 0, "would_execute_count": 0, "cumulative_net_profit_usd": 0.0, "last_scan_at": None,

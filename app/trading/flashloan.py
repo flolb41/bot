@@ -37,14 +37,17 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
 
 from app.database import Database
 from app.trading.executor import (
     EXECUTABLE_QUOTE_TOKENS,
+    _actual_execution_metrics,
     _find_uniswap_v3_fee_tier,
     _get_decimals,
     _is_connected_with_retry,
+    _onchain_quote_depth_usd,
     _quote_token_usd_price,
     _refresh_price_usd,
     _resolve_aerodrome_route,
@@ -52,12 +55,48 @@ from app.trading.executor import (
     _resolve_rpc_url,
     _v2_fork_pool_confirmed_absent,
 )
-from app.trading.fees import DEFAULT_SLIPPAGE_BUFFER_PCT, dex_fee_pct, estimate_gas_cost_usd
+from app.trading.fees import (
+    DEFAULT_SLIPPAGE_BUFFER_PCT,
+    dex_fee_pct,
+    estimate_gas_cost_usd,
+    is_net_profit_above_threshold,
+)
 from app.trading.guardrails import TradingRefused, is_trading_live, send_trading_transaction
-from app.trading.routers import EXECUTABLE_DEXES, FLASH_ARBITRAGE_ADDRESS, ROUTER_ADDRESSES
+from app.trading.routers import (
+    EXECUTABLE_DEXES,
+    FLASH_ARBITRAGE_ADDRESS,
+    ROUTER_ADDRESSES,
+    TRIANGULAR_V2_EXECUTABLE_DEXES,
+)
 from app.trading.rpc import make_w3
+from app.trading.token_risk import (
+    notional_under_slippage,
+    quote_depth_floor,
+    token_flashloan_allowed,
+    token_slippage_pct,
+    token_trade_cap,
+)
 
 logger = logging.getLogger("app.trading.flashloan")
+
+
+def _flashloan_actual_profit_quote(w3, send_result: dict, asset: str, decimals: int) -> float | None:
+    receipt = send_result.get("receipt")
+    if receipt is None:
+        return None
+    if int(receipt.get("status", 0)) != 1:
+        return 0.0
+    try:
+        contract = w3.eth.contract(address=FLASH_ARBITRAGE_ADDRESS, abi=_flash_arbitrage_abi())
+        events = contract.events.ArbitrageExecuted().process_receipt(receipt)
+        for event in events:
+            args = event["args"]
+            if args["asset"].lower() == asset.lower():
+                return int(args["profit"]) / (10 ** decimals)
+        logger.warning("Receipt %s confirmé mais sans événement ArbitrageExecuted pour l'actif.", send_result.get("tx_hash"))
+    except Exception:
+        logger.exception("Impossible de mesurer le profit flashloan du reçu %s.", send_result.get("tx_hash"))
+    return None
 
 # Forks UniswapV2 classiques + Aerodrome + Uniswap V3 (single-hop, voir
 # docstring ci-dessus) — par contraste, `triangular.TRIANGULAR_CAPABLE_DEXES`
@@ -81,6 +120,8 @@ AAVE_V3_FLASHLOAN_PREMIUM_PCT = 0.05
 # `fees.ESTIMATED_GAS_UNITS_ROUNDTRIP`).
 ESTIMATED_GAS_UNITS_FLASHLOAN_PAIR = 550_000
 ESTIMATED_GAS_UNITS_FLASHLOAN_TRIANGULAR = 700_000
+ESTIMATED_GAS_UNITS_FLASHLOAN_CROSS_DEX = 1_000_000
+_CROSS_DEX_GAS_SAFETY_MULTIPLIER = 1.5
 
 _ABI_CACHE: list[dict] | None = None
 
@@ -98,12 +139,25 @@ def flashloan_enabled(config: dict) -> bool:
     return bool(((config or {}).get("trading") or {}).get("flashloan_enabled", False))
 
 
+def cross_dex_flashloan_enabled(config: dict) -> bool:
+    return bool(((config or {}).get("trading") or {}).get("cross_dex_flashloan_enabled", False))
+
+
 def flashloan_notional_usd(config: dict) -> float:
     return float(((config or {}).get("trading") or {}).get("flashloan_notional_usd", 1000))
 
 
-def flashloan_min_net_profit_usd(config: dict) -> float:
-    return float(((config or {}).get("trading") or {}).get("flashloan_min_net_profit_usd", 1.0))
+def flashloan_min_net_profit_usd(config: dict, notional_usd: float | None = None) -> float:
+    trading = (config or {}).get("trading") or {}
+    minimum_usd = float(trading.get("flashloan_min_net_profit_usd", 0.0))
+    minimum_pct = float(trading.get("min_net_profit_pct", 0.0))
+    if notional_usd is None or not math.isfinite(notional_usd) or notional_usd <= 0:
+        return minimum_usd
+    return max(minimum_usd, notional_usd * minimum_pct / 100)
+
+
+def _minimum_profit_units(minimum_profit_usd: float, asset_usd_price: float, decimals: int) -> int:
+    return max(1, int((minimum_profit_usd / asset_usd_price) * (10 ** decimals)))
 
 
 def flashloan_liquidity_safety_fraction(config: dict) -> float:
@@ -118,6 +172,9 @@ def pair_signal_is_flashloan_eligible(config: dict, signal: dict) -> bool:
     attendue par le contrat, avec un quote token exécutable."""
     return (
         flashloan_enabled(config)
+        and token_flashloan_allowed(
+            config, signal.get("token_address", ""), signal.get("quote_address", ""),
+        )
         and signal.get("buy_dex") in FLASHLOAN_CAPABLE_DEXES
         and signal.get("sell_dex") in FLASHLOAN_CAPABLE_DEXES
         and (signal.get("quote_address") or "").lower() in EXECUTABLE_QUOTE_TOKENS
@@ -125,11 +182,49 @@ def pair_signal_is_flashloan_eligible(config: dict, signal: dict) -> bool:
 
 
 def triangular_signal_is_flashloan_eligible(config: dict, signal: dict) -> bool:
-    """Décision de ROUTAGE pour le scheduler, même principe que ci-dessus."""
+    """Routage conservateur : les routes d'exécution doivent correspondre aux pools du scan."""
     return (
         flashloan_enabled(config)
+        and signal.get("dex") in TRIANGULAR_V2_EXECUTABLE_DEXES
         and signal.get("dex") in FLASHLOAN_CAPABLE_DEXES
         and (signal.get("token_a_address") or "").lower() in EXECUTABLE_QUOTE_TOKENS
+    )
+
+
+def cross_dex_triangular_signal_is_flashloan_eligible(config: dict, signal: dict) -> bool:
+    """Garde-fou de routage dédié aux cycles flashloan réellement hétérogènes.
+
+    Le scanner reste informatif tant que ce commutateur distinct n'est pas
+    activé. Chaque route et chaque pool sont encore reconstruites et simulées
+    on-chain par l'exécuteur avant toute diffusion.
+    """
+    tokens = [
+        signal.get("token_a_address", ""),
+        signal.get("token_b_address", ""),
+        signal.get("token_c_address", ""),
+    ]
+    dexes = [signal.get("dex_ab"), signal.get("dex_bc"), signal.get("dex_ca")]
+    valid_tokens = all(
+        isinstance(token, str)
+        and len(token) == 42
+        and token[:2].lower() == "0x"
+        and all(character in "0123456789abcdefABCDEF" for character in token[2:])
+        and int(token[2:], 16) != 0
+        for token in tokens
+    )
+    return (
+        cross_dex_flashloan_enabled(config)
+        and flashloan_enabled(config)
+        and str(signal.get("chain", "")).lower() == "base"
+        and valid_tokens
+        and len({token.lower() for token in tokens}) == 3
+        and len(set(dexes)) > 1
+        and tokens[0].lower() in EXECUTABLE_QUOTE_TOKENS
+        and all(dex in FLASHLOAN_CAPABLE_DEXES and dex in EXECUTABLE_DEXES for dex in dexes)
+        and all(
+            token_flashloan_allowed(config, token, tokens[0])
+            for token in tokens[1:]
+        )
     )
 
 
@@ -147,13 +242,44 @@ def estimate_pair_signal_flashloan_preview(config: dict, signal: dict) -> dict |
     if not pair_signal_is_flashloan_eligible(config, signal):
         return None
     safety_fraction = flashloan_liquidity_safety_fraction(config)
-    min_liquidity_usd = min(signal.get("buy_liquidity_usd") or 0.0, signal.get("sell_liquidity_usd") or 0.0)
+    # Profondeur on-chain réelle quand les adresses sont disponibles (production).
+    # Sinon (tests, signaux sans adresse) on retombe sur la liquidité DexScreener.
+    token_address = signal.get("token_address")
+    quote_address = signal.get("quote_address")
+    if token_address and quote_address:
+        buy_depth_usd = _onchain_quote_depth_usd(signal["buy_dex"], token_address, quote_address)
+        sell_depth_usd = _onchain_quote_depth_usd(signal["sell_dex"], token_address, quote_address)
+        low_liquidity_policy = token_slippage_pct(config, token_address, quote_address) is not None
+        if low_liquidity_policy and (buy_depth_usd is None or sell_depth_usd is None):
+            return None
+        minimum_depth = quote_depth_floor(
+            config, token_address, quote_address,
+            float(((config or {}).get("trading") or {}).get("min_liquidity_usd", 10_000)),
+        )
+        if low_liquidity_policy and min(buy_depth_usd, sell_depth_usd) < minimum_depth:
+            return None
+        if buy_depth_usd is None:
+            buy_depth_usd = (signal.get("buy_liquidity_usd") or 0.0) * 0.5
+        if sell_depth_usd is None:
+            sell_depth_usd = (signal.get("sell_liquidity_usd") or 0.0) * 0.5
+        min_liquidity_usd = min(buy_depth_usd, sell_depth_usd)
+    else:
+        min_liquidity_usd = min(signal.get("buy_liquidity_usd") or 0.0, signal.get("sell_liquidity_usd") or 0.0)
     upper_bound_usd = min(flashloan_notional_usd(config), safety_fraction * min_liquidity_usd)
+    if token_address and quote_address:
+        upper_bound_usd = token_trade_cap(config, token_address, quote_address, upper_bound_usd)
+        max_slippage = token_slippage_pct(config, token_address, quote_address)
+        if max_slippage is not None:
+            upper_bound_usd = min(
+                upper_bound_usd,
+                notional_under_slippage(buy_depth_usd, max_slippage),
+                notional_under_slippage(sell_depth_usd, max_slippage),
+            )
     if upper_bound_usd <= 0:
         return None
     profit_fn = lambda n: _pair_profit_before_gas_usd(  # noqa: E731
         n, spread_pct=signal.get("spread_pct") or 0.0, buy_dex=signal["buy_dex"], sell_dex=signal["sell_dex"],
-        buy_liquidity_usd=signal.get("buy_liquidity_usd"), sell_liquidity_usd=signal.get("sell_liquidity_usd"),
+        buy_liquidity_usd=min_liquidity_usd, sell_liquidity_usd=min_liquidity_usd,
     )
     notional_usd = _optimal_flashloan_notional_usd(upper_bound_usd, profit_fn)
     _, gas_cost_usd = _estimate_premium_and_gas_cost_usd(notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_PAIR)
@@ -170,7 +296,20 @@ def estimate_triangular_signal_flashloan_preview(config: dict, signal: dict) -> 
     if not triangular_signal_is_flashloan_eligible(config, signal):
         return None
     safety_fraction = flashloan_liquidity_safety_fraction(config)
-    min_liquidity_usd = signal.get("min_liquidity_usd") or 0.0
+    # Profondeur on-chain réelle pour chaque jambe quand les adresses sont
+    # disponibles (production), fallback sur min_liquidity_usd (tests).
+    ta = signal.get("token_a_address")
+    tb = signal.get("token_b_address")
+    tc = signal.get("token_c_address")
+    dex = signal["dex"]
+    if ta and tb and tc:
+        depth_ab = _onchain_quote_depth_usd(dex, ta, tb)
+        depth_bc = _onchain_quote_depth_usd(dex, tb, tc)
+        depth_ca = _onchain_quote_depth_usd(dex, tc, ta)
+        depths = [d for d in (depth_ab, depth_bc, depth_ca) if d is not None]
+        min_liquidity_usd = min(depths) if depths else (signal.get("min_liquidity_usd") or 0.0)
+    else:
+        min_liquidity_usd = signal.get("min_liquidity_usd") or 0.0
     upper_bound_usd = min(flashloan_notional_usd(config), safety_fraction * min_liquidity_usd)
     if upper_bound_usd <= 0:
         return None
@@ -304,6 +443,79 @@ def _triangular_profit_before_gas_usd(
     return gross_profit_usd - fees_usd - slippage_buffer_usd - premium_usd
 
 
+def _cross_dex_triangular_profit_before_gas_usd(
+    notional_usd: float,
+    *,
+    spread_pct: float,
+    dexes: list[str],
+    depth_usd_by_leg: list[float],
+) -> float:
+    """Profit prudent d'un cycle multi-DEX, avant le gas."""
+    gross_profit_usd = notional_usd * spread_pct / 100
+    fees_usd = notional_usd * sum(dex_fee_pct(dex) for dex in dexes) / 100
+    amm_impact_pct = sum(
+        _amm_price_impact_pct(notional_usd, depth) for depth in depth_usd_by_leg
+    )
+    slippage_buffer_usd = notional_usd * max(DEFAULT_SLIPPAGE_BUFFER_PCT, amm_impact_pct) / 100
+    premium_usd = notional_usd * AAVE_V3_FLASHLOAN_PREMIUM_PCT / 100
+    return gross_profit_usd - fees_usd - slippage_buffer_usd - premium_usd
+
+
+def estimate_cross_dex_triangular_flashloan_preview(config: dict, signal: dict) -> dict | None:
+    """Préfiltre estimatif, jamais une preuve de rentabilité exécutable.
+
+    La détection ne connaît que la liquidité DexScreener : pour ne pas la
+    surestimer, la profondeur minimale détectée est appliquée aux trois jambes.
+    L'exécuteur relit ensuite les profondeurs on-chain et simule le cycle
+    complet sur les routes réellement construites.
+    """
+    if not cross_dex_triangular_signal_is_flashloan_eligible(config, signal):
+        return None
+
+    try:
+        spread_pct = float(signal["spread_pct"])
+        min_liquidity_usd = float(signal["min_liquidity_usd"])
+        safety_fraction = flashloan_liquidity_safety_fraction(config)
+        upper_bound_usd = min(
+            flashloan_notional_usd(config),
+            safety_fraction * min_liquidity_usd,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        not math.isfinite(spread_pct)
+        or spread_pct <= 0
+        or not math.isfinite(min_liquidity_usd)
+        or min_liquidity_usd <= 0
+        or not math.isfinite(safety_fraction)
+        or not 0 < safety_fraction <= 1
+        or not math.isfinite(upper_bound_usd)
+        or upper_bound_usd <= 0
+    ):
+        return None
+
+    dexes = [signal["dex_ab"], signal["dex_bc"], signal["dex_ca"]]
+    conservative_depths = [min_liquidity_usd] * 3
+    profit_fn = lambda amount: _cross_dex_triangular_profit_before_gas_usd(  # noqa: E731
+        amount,
+        spread_pct=spread_pct,
+        dexes=dexes,
+        depth_usd_by_leg=conservative_depths,
+    )
+    notional_usd = _optimal_flashloan_notional_usd(upper_bound_usd, profit_fn)
+    _premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(
+        notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_CROSS_DEX,
+    )
+    if gas_cost_usd is None or not math.isfinite(gas_cost_usd) or gas_cost_usd < 0:
+        return None
+    net_profit_usd = profit_fn(notional_usd) - gas_cost_usd * _CROSS_DEX_GAS_SAFETY_MULTIPLIER
+    return {
+        "notional_usd": notional_usd,
+        "net_profit_usd": net_profit_usd,
+        "estimated_gas_cost_usd": gas_cost_usd * _CROSS_DEX_GAS_SAFETY_MULTIPLIER,
+    }
+
+
 def _optimal_flashloan_notional_usd(upper_bound_usd: float, profit_before_gas_fn) -> float:
     """Trouve, par recherche ternaire, le notionnel dans `[0, upper_bound_usd]`
     qui MAXIMISE `profit_before_gas_fn(notional_usd)`.
@@ -345,6 +557,9 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
     if not flashloan_enabled(config):
         result["error"] = "Flashloan désactivé (trading.flashloan_enabled: false dans config.yaml)."
         return result
+    if not token_flashloan_allowed(config, signal.get("token_address", ""), signal.get("quote_address", "")):
+        result["error"] = "Flashloan non autorisé pour ce token par son profil de risque."
+        return result
     if signal["buy_dex"] not in FLASHLOAN_CAPABLE_DEXES or signal["sell_dex"] not in FLASHLOAN_CAPABLE_DEXES:
         result["error"] = (
             f"DEX non supporté par le contrat flashloan ({signal['buy_dex']}/{signal['sell_dex']}) "
@@ -375,11 +590,44 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
             return result
 
         # Dimensionnement : plafond du notionnel emprunté, INDÉPENDANT du solde
-        # réel du wallet, borné par la liquidité des deux pools (même
-        # garde-fou que la détection classique, voir `liquidity_safety_fraction`).
+        # réel du wallet, borné par la PROFONDEUR ON-CHAIN réelle des deux pools
+        # (la liquidité DexScreener surestime les pools à liquidité concentrée :
+        # positions hors range incluses, prix non rafraîchi — voir correctif
+        # `_onchain_quote_depth_usd` dans executor.py).
         safety_fraction = flashloan_liquidity_safety_fraction(config)
-        min_liquidity_usd = min(signal["buy_liquidity_usd"], signal["sell_liquidity_usd"])
+        buy_depth_usd = _onchain_quote_depth_usd(signal["buy_dex"], signal["token_address"], signal["quote_address"])
+        sell_depth_usd = _onchain_quote_depth_usd(signal["sell_dex"], signal["token_address"], signal["quote_address"])
+        low_liquidity_policy = token_slippage_pct(
+            config, signal["token_address"], signal["quote_address"],
+        ) is not None
+        minimum_depth = quote_depth_floor(
+            config, signal["token_address"], signal["quote_address"],
+            float(((config or {}).get("trading") or {}).get("min_liquidity_usd", 10_000)),
+        )
+        if low_liquidity_policy and (
+            buy_depth_usd is None or sell_depth_usd is None
+            or min(buy_depth_usd, sell_depth_usd) < minimum_depth
+        ):
+            result["error"] = (
+                f"Profondeur on-chain BRETT indisponible ou sous {minimum_depth:.2f}$ — refus."
+            )
+            return result
+        if buy_depth_usd is None:
+            buy_depth_usd = (signal.get("buy_liquidity_usd") or 0.0) * 0.5
+        if sell_depth_usd is None:
+            sell_depth_usd = (signal.get("sell_liquidity_usd") or 0.0) * 0.5
+        min_liquidity_usd = min(buy_depth_usd, sell_depth_usd)
         upper_bound_usd = min(flashloan_notional_usd(config), safety_fraction * min_liquidity_usd)
+        upper_bound_usd = token_trade_cap(
+            config, signal["token_address"], signal["quote_address"], upper_bound_usd,
+        )
+        max_slippage = token_slippage_pct(config, signal["token_address"], signal["quote_address"])
+        if max_slippage is not None:
+            upper_bound_usd = min(
+                upper_bound_usd,
+                notional_under_slippage(buy_depth_usd, max_slippage),
+                notional_under_slippage(sell_depth_usd, max_slippage),
+            )
         if upper_bound_usd <= 0:
             result["error"] = "Liquidité de pool insuffisante pour un notionnel flashloan positif — refus."
             return result
@@ -400,7 +648,7 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
         # au lieu d'un montant figé en config (voir `_optimal_flashloan_notional_usd`).
         profit_fn = lambda n: _pair_profit_before_gas_usd(  # noqa: E731
             n, spread_pct=fresh_spread_pct, buy_dex=signal["buy_dex"], sell_dex=signal["sell_dex"],
-            buy_liquidity_usd=signal["buy_liquidity_usd"], sell_liquidity_usd=signal["sell_liquidity_usd"],
+            buy_liquidity_usd=buy_depth_usd, sell_liquidity_usd=sell_depth_usd,
         )
         notional_usd = _optimal_flashloan_notional_usd(upper_bound_usd, profit_fn)
         premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_PAIR)
@@ -408,8 +656,8 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
             result["error"] = "Coût de gas Base indisponible — refus par prudence."
             return result
         net_profit_usd = profit_fn(notional_usd) - gas_cost_usd
-        min_required_usd = flashloan_min_net_profit_usd(config)
-        if net_profit_usd < min_required_usd:
+        min_required_usd = flashloan_min_net_profit_usd(config, notional_usd)
+        if not is_net_profit_above_threshold(net_profit_usd, min_required_usd):
             result["error"] = (
                 f"Profit net estimé après prime Aave+gas ({net_profit_usd:.4f}$) < seuil flashloan "
                 f"({min_required_usd:.4f}$) — refus par prudence, aucune transaction envoyée."
@@ -417,7 +665,9 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
             return result
 
         amount_units = int((notional_usd / quote_usd_price) * (10 ** quote_decimals))
-        min_profit_units = int((min_required_usd / quote_usd_price) * (10 ** quote_decimals))
+        min_profit_units = _minimum_profit_units(
+            min_required_usd + gas_cost_usd, quote_usd_price, quote_decimals,
+        )
 
         legs = [
             _build_leg(signal["buy_dex"], w3, token_in=quote_address, token_out=token_address),
@@ -438,16 +688,25 @@ def execute_pair_signal_via_flashloan(db: Database, config: dict, signal: dict) 
             ),
         )
         result["tx_hash"] = send_result["tx_hash"]
+        actual_profit_quote = _flashloan_actual_profit_quote(
+            w3, send_result, quote_address, quote_decimals,
+        )
+        actual_metrics = _actual_execution_metrics(
+            actual_profit_quote, quote_usd_price, send_result.get("gas_cost_wei"),
+        )
         if send_result["error"]:
             result["error"] = f"Flashloan échoué (revert complet, aucun fonds déplacé) : {send_result['error']}"
             db.mark_arbitrage_signal_executed(
                 signal["id"], tx_hash_buy=result["tx_hash"], tx_hash_sell=result["tx_hash"],
-                execution_error=result["error"],
+                execution_error=result["error"], **actual_metrics,
             )
             return result
 
         result["executed"] = True
-        db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash"], tx_hash_sell=result["tx_hash"])
+        db.mark_arbitrage_signal_executed(
+            signal["id"], tx_hash_buy=result["tx_hash"], tx_hash_sell=result["tx_hash"],
+            **actual_metrics,
+        )
         db.add_notification(
             title="⚡ Flashloan d'arbitrage exécuté",
             message=(
@@ -486,6 +745,12 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
             f"{sorted(FLASHLOAN_CAPABLE_DEXES)} sont implémentés."
         )
         return result
+    if signal["dex"] not in TRIANGULAR_V2_EXECUTABLE_DEXES:
+        result["error"] = (
+            f"Route triangulaire {signal['dex']} suspendue : les pools évaluées par le scan "
+            "ne sont pas garanties identiques à celles utilisées par le routeur."
+        )
+        return result
     token_a = signal["token_a_address"]
     if token_a.lower() not in EXECUTABLE_QUOTE_TOKENS:
         result["error"] = f"Token de départ {signal['token_a_symbol']} non exécutable — seuls USDC/WETH sont supportés."
@@ -511,7 +776,17 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
             return result
 
         safety_fraction = flashloan_liquidity_safety_fraction(config)
-        upper_bound_usd = min(flashloan_notional_usd(config), safety_fraction * signal["min_liquidity_usd"])
+        # Profondeur on-chain réelle pour chaque jambe du cycle (DexScreener
+        # surestime les pools CL — voir correctif `_onchain_quote_depth_usd`).
+        depth_ab_usd = _onchain_quote_depth_usd(signal["dex"], signal["token_a_address"], signal["token_b_address"])
+        depth_bc_usd = _onchain_quote_depth_usd(signal["dex"], signal["token_b_address"], signal["token_c_address"])
+        depth_ca_usd = _onchain_quote_depth_usd(signal["dex"], signal["token_c_address"], signal["token_a_address"])
+        depths = [d for d in (depth_ab_usd, depth_bc_usd, depth_ca_usd) if d is not None]
+        if not depths:
+            result["error"] = "Profondeur on-chain indisponible pour les jambes du cycle — refus."
+            return result
+        min_liquidity_usd = min(depths)
+        upper_bound_usd = min(flashloan_notional_usd(config), safety_fraction * min_liquidity_usd)
         if upper_bound_usd <= 0:
             result["error"] = "Liquidité de pool insuffisante pour un notionnel flashloan positif — refus."
             return result
@@ -524,7 +799,7 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
         # Notionnel optimisé par recherche ternaire (voir
         # `_optimal_flashloan_notional_usd`) au lieu d'un montant figé en config.
         profit_fn = lambda n: _triangular_profit_before_gas_usd(  # noqa: E731
-            n, spread_pct=signal["spread_pct"], dex=signal["dex"], min_liquidity_usd=signal["min_liquidity_usd"],
+            n, spread_pct=signal["spread_pct"], dex=signal["dex"], min_liquidity_usd=min_liquidity_usd,
         )
         notional_usd = _optimal_flashloan_notional_usd(upper_bound_usd, profit_fn)
         premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(
@@ -534,8 +809,8 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
             result["error"] = "Coût de gas Base indisponible — refus par prudence."
             return result
         net_profit_usd = profit_fn(notional_usd) - gas_cost_usd
-        min_required_usd = flashloan_min_net_profit_usd(config)
-        if net_profit_usd < min_required_usd:
+        min_required_usd = flashloan_min_net_profit_usd(config, notional_usd)
+        if not is_net_profit_above_threshold(net_profit_usd, min_required_usd):
             result["error"] = (
                 f"Profit net estimé après prime Aave+gas ({net_profit_usd:.4f}$) < seuil flashloan "
                 f"({min_required_usd:.4f}$) — refus par prudence, aucune transaction envoyée."
@@ -543,7 +818,9 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
             return result
 
         amount_units = int((notional_usd / quote_usd_price) * (10 ** token_a_decimals))
-        min_profit_units = int((min_required_usd / quote_usd_price) * (10 ** token_a_decimals))
+        min_profit_units = _minimum_profit_units(
+            min_required_usd + gas_cost_usd, quote_usd_price, token_a_decimals,
+        )
 
         legs = [
             _build_leg(signal["dex"], w3, token_in=token_a, token_out=token_b),
@@ -566,13 +843,24 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
             ),
         )
         result["tx_hash"] = send_result["tx_hash"]
+        actual_profit_quote = _flashloan_actual_profit_quote(
+            w3, send_result, token_a, token_a_decimals,
+        )
+        actual_metrics = _actual_execution_metrics(
+            actual_profit_quote, quote_usd_price, send_result.get("gas_cost_wei"),
+        )
         if send_result["error"]:
             result["error"] = f"Flashloan échoué (revert complet, aucun fonds déplacé) : {send_result['error']}"
-            db.mark_triangular_signal_executed(signal["id"], tx_hash=result["tx_hash"], execution_error=result["error"])
+            db.mark_triangular_signal_executed(
+                signal["id"], tx_hash=result["tx_hash"], execution_error=result["error"],
+                **actual_metrics,
+            )
             return result
 
         result["executed"] = True
-        db.mark_triangular_signal_executed(signal["id"], tx_hash=result["tx_hash"])
+        db.mark_triangular_signal_executed(
+            signal["id"], tx_hash=result["tx_hash"], **actual_metrics,
+        )
         db.add_notification(
             title="⚡ Flashloan triangulaire exécuté",
             message=(
@@ -591,3 +879,211 @@ def execute_triangular_signal_via_flashloan(db: Database, config: dict, signal: 
         logger.exception("Erreur inattendue pendant execute_triangular_signal_via_flashloan")
         result["error"] = f"Erreur inattendue : {exc}"
         return result
+
+
+def execute_cross_dex_triangular_signal_via_flashloan(
+    db: Database, config: dict, signal: dict,
+) -> dict:
+    """Exécute un cycle 3-jambes multi-DEX via le contrat atomique existant.
+
+    La voie reste désactivée par défaut (`cross_dex_flashloan_enabled`). Elle
+    exige une profondeur on-chain mesurable pour chaque route, applique un
+    plancher de profit couvrant le gas estimé avec marge, puis laisse
+    `send_trading_transaction` simuler le cycle complet avant toute diffusion.
+    """
+    result: dict = {"executed": False, "tx_hash": None, "error": None}
+    if not is_trading_live(config):
+        result["error"] = "Trading live désactivé — aucune transaction envoyée."
+        return result
+    if not cross_dex_triangular_signal_is_flashloan_eligible(config, signal):
+        result["error"] = "Cycle multi-DEX non autorisé par ses garde-fous dédiés."
+        return result
+    if not signal.get("would_execute_flashloan"):
+        result["error"] = "Cycle multi-DEX non rentable au préfiltre flashloan — refus."
+        return result
+
+    execution_metrics: dict = {}
+    try:
+        from web3 import Web3
+
+        w3 = make_w3(timeout=15)
+        if not _is_connected_with_retry(w3):
+            result["error"] = "RPC Base injoignable."
+            return result
+
+        tokens = [
+            signal["token_a_address"],
+            signal["token_b_address"],
+            signal["token_c_address"],
+        ]
+        dexes = [signal["dex_ab"], signal["dex_bc"], signal["dex_ca"]]
+        legs_tokens = [
+            (tokens[0], tokens[1]),
+            (tokens[1], tokens[2]),
+            (tokens[2], tokens[0]),
+        ]
+        token_a = tokens[0]
+        token_a_decimals = _get_decimals(w3, token_a)
+        quote_usd_price = _quote_token_usd_price(token_a)
+        if quote_usd_price is None or not math.isfinite(quote_usd_price) or quote_usd_price <= 0:
+            result["error"] = f"Prix USD de {signal['token_a_symbol']} indisponible — refus par prudence."
+            return result
+
+        trading_config = (config or {}).get("trading") or {}
+        safety_fraction = flashloan_liquidity_safety_fraction(config)
+        configured_min_liquidity = float(trading_config.get("min_liquidity_usd", 10_000))
+        if (
+            not math.isfinite(safety_fraction)
+            or not 0 < safety_fraction <= 1
+            or not math.isfinite(configured_min_liquidity)
+            or configured_min_liquidity <= 0
+        ):
+            result["error"] = "Paramètres de profondeur flashloan invalides — refus."
+            return result
+
+        from app.trading.token_risk import notional_under_slippage, quote_depth_floor, token_slippage_pct, token_trade_cap
+
+        leg_depths: list[float] = []
+        upper_bound_usd = flashloan_notional_usd(config)
+        for dex, (token_in, token_out) in zip(dexes, legs_tokens, strict=True):
+            if token_out.lower() == token_a.lower():
+                token_out_usd_price = quote_usd_price
+            elif token_out.lower() == tokens[1].lower():
+                token_out_usd_price = signal.get("token_b_usd_price")
+            else:
+                token_out_usd_price = signal.get("token_c_usd_price")
+            if (
+                token_out_usd_price is None
+                or not math.isfinite(float(token_out_usd_price))
+                or float(token_out_usd_price) <= 0
+            ):
+                result["error"] = f"Prix USD fiable indisponible pour la profondeur de {token_out} — refus."
+                return result
+            depth_usd = _onchain_quote_depth_usd(
+                dex, token_in, token_out, float(token_out_usd_price),
+            )
+            if depth_usd is None or not math.isfinite(depth_usd) or depth_usd <= 0:
+                result["error"] = (
+                    f"Profondeur on-chain indisponible pour {token_in}/{token_out} sur {dex} — refus."
+                )
+                return result
+            minimum_depth_usd = quote_depth_floor(
+                config, token_in, token_out, configured_min_liquidity / 2,
+            )
+            if depth_usd < minimum_depth_usd:
+                result["error"] = (
+                    f"Profondeur on-chain {depth_usd:.2f}$ sous le plancher {minimum_depth_usd:.2f}$ "
+                    f"pour {token_in}/{token_out} sur {dex} — refus."
+                )
+                return result
+            leg_depths.append(depth_usd)
+            upper_bound_usd = min(
+                upper_bound_usd,
+                safety_fraction * depth_usd,
+                token_trade_cap(config, token_in, token_out, upper_bound_usd),
+                token_trade_cap(config, token_out, token_in, upper_bound_usd),
+            )
+            max_slippage_pct = token_slippage_pct(config, token_in, token_out)
+            if max_slippage_pct is not None:
+                upper_bound_usd = min(
+                    upper_bound_usd,
+                    notional_under_slippage(depth_usd, max_slippage_pct),
+                )
+
+        if not math.isfinite(upper_bound_usd) or upper_bound_usd <= 0:
+            result["error"] = "Profondeur insuffisante pour un notionnel flashloan positif — refus."
+            return result
+
+        spread_pct = float(signal["spread_pct"])
+        if not math.isfinite(spread_pct) or spread_pct <= 0:
+            result["error"] = "Spread multi-DEX invalide — refus."
+            return result
+        profit_fn = lambda amount: _cross_dex_triangular_profit_before_gas_usd(  # noqa: E731
+            amount,
+            spread_pct=spread_pct,
+            dexes=dexes,
+            depth_usd_by_leg=leg_depths,
+        )
+        notional_usd = _optimal_flashloan_notional_usd(upper_bound_usd, profit_fn)
+        _premium_usd, gas_cost_usd = _estimate_premium_and_gas_cost_usd(
+            notional_usd, ESTIMATED_GAS_UNITS_FLASHLOAN_CROSS_DEX,
+        )
+        if gas_cost_usd is None or not math.isfinite(gas_cost_usd) or gas_cost_usd < 0:
+            result["error"] = "Coût de gas Base indisponible — refus par prudence."
+            return result
+
+        min_required_usd = flashloan_min_net_profit_usd(config, notional_usd)
+        gas_floor_usd = gas_cost_usd * _CROSS_DEX_GAS_SAFETY_MULTIPLIER
+        net_profit_usd = profit_fn(notional_usd) - gas_floor_usd
+        if not is_net_profit_above_threshold(net_profit_usd, min_required_usd):
+            result["error"] = (
+                f"Profit net estimé après prime Aave+gas majoré ({net_profit_usd:.4f}$) "
+                f"< seuil flashloan ({min_required_usd:.4f}$) — refus."
+            )
+            return result
+
+        amount_units = int((notional_usd / quote_usd_price) * (10 ** token_a_decimals))
+        min_profit_units = _minimum_profit_units(
+            min_required_usd + gas_floor_usd, quote_usd_price, token_a_decimals,
+        )
+        if amount_units <= 0:
+            result["error"] = "Notionnel trop faible pour être représenté dans l'actif emprunté — refus."
+            return result
+
+        legs = [
+            _build_leg(dex, w3, token_in=token_in, token_out=token_out)
+            for dex, (token_in, token_out) in zip(dexes, legs_tokens, strict=True)
+        ]
+        send_result = send_trading_transaction(
+            db,
+            rpc_url=_resolve_rpc_url(),
+            contract_address=FLASH_ARBITRAGE_ADDRESS,
+            abi=_flash_arbitrage_abi(),
+            function_name="startArbitrage",
+            args=(Web3.to_checksum_address(token_a), amount_units, legs, min_profit_units),
+            whitelist_target=FLASH_ARBITRAGE_ADDRESS,
+            action_label=(
+                f"flashloan triangulaire multi-DEX {signal['token_a_symbol']}→"
+                f"{signal['token_b_symbol']}→{signal['token_c_symbol']}→{signal['token_a_symbol']} "
+                f"({dexes[0]}→{dexes[1]}→{dexes[2]}, notionnel≈{notional_usd:.2f}$)"
+            ),
+        )
+        result["tx_hash"] = send_result["tx_hash"]
+        actual_profit_quote = _flashloan_actual_profit_quote(
+            w3, send_result, token_a, token_a_decimals,
+        )
+        execution_metrics = _actual_execution_metrics(
+            actual_profit_quote, quote_usd_price, send_result.get("gas_cost_wei"),
+        )
+        if send_result["error"]:
+            result["error"] = f"Simulation ou flashloan refusé : {send_result['error']}"
+            return result
+
+        result["executed"] = True
+        db.add_notification(
+            title="⚡ Flashloan triangulaire multi-DEX exécuté",
+            message=(
+                f"{signal['token_a_symbol']}→{signal['token_b_symbol']}→{signal['token_c_symbol']}→"
+                f"{signal['token_a_symbol']} ({dexes[0]}→{dexes[1]}→{dexes[2]}, "
+                f"notionnel≈{notional_usd:.2f}$, profit net estimé≈{net_profit_usd:.2f}$) — "
+                f"tx {result['tx_hash']}"
+            ),
+            level="info",
+        )
+        return result
+    except TradingRefused as exc:
+        result["error"] = f"Refusé par un garde-fou : {exc}"
+        return result
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Erreur inattendue pendant execute_cross_dex_triangular_signal_via_flashloan")
+        result["error"] = f"Erreur inattendue : {exc}"
+        return result
+    finally:
+        if signal.get("id") is not None:
+            db.mark_cross_dex_signal_executed(
+                signal["id"],
+                executed=result["executed"],
+                tx_hash=result["tx_hash"],
+                execution_error=result["error"],
+                **execution_metrics,
+            )

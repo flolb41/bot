@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .env
 data/*.db
+data/*.db.lock
 data/ohlcv_cache/
 data/*.db-journal
 data/keystore.json
@@ -15,3 +16,9 @@ ohlcv_cache/
 .foundry/
 contracts/build/
 contracts/deployments/*.json
+# Mise à jour automatique sur le Pi (scripts/self_update.sh)
+deploy-backups/
+.self-update/
+.self-update.lock
+.updating
+.allow-cross-dex-live

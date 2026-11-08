@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from app.database import Database
-from app.trading.triangular import run_cross_dex_triangular_scan
+from app.trading.triangular import _is_classic_triangular_route_executable, run_cross_dex_triangular_scan
 
 _USDC = "0x" + "1" * 40
 _WETH = "0x" + "2" * 40
@@ -39,6 +39,13 @@ def _config(**overrides) -> dict:
     return {"trading": trading}
 
 
+def test_classic_triangular_execution_only_allows_matching_v2_routes():
+    executable_usdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    assert _is_classic_triangular_route_executable({"dex": "sushiswap", "token_a_address": executable_usdc}) is True
+    assert _is_classic_triangular_route_executable({"dex": "aerodrome", "token_a_address": executable_usdc}) is False
+    assert _is_classic_triangular_route_executable({"dex": "pancakeswap", "token_a_address": executable_usdc}) is False
+
+
 def test_cross_dex_scan_detects_profitable_cycle_across_different_dexes(db: Database):
     # USDC->WETH la mieux cotée sur uniswap, WETH->AERO sur aerodrome,
     # AERO->USDC sur sushiswap : 3 DEX différents, jamais vu par
@@ -49,7 +56,10 @@ def test_cross_dex_scan_detects_profitable_cycle_across_different_dexes(db: Data
         "WETH/AERO": [_pair("aerodrome", _WETH, _AERO, 3.0)],
         "AERO/USDC": [_pair("sushiswap", _AERO, _USDC, 0.2)],
     }
-    with patch("app.trading.triangular._collect_pairs", return_value=groups):
+    with (
+        patch("app.trading.triangular._collect_pairs", return_value=groups),
+        patch("app.trading.triangular._quote_token_usd_price", return_value=1.0),
+    ):
         signals = run_cross_dex_triangular_scan(db, _config(cross_dex_min_spread_pct_to_log=0.1))
 
     assert len(signals) == 1
@@ -58,10 +68,14 @@ def test_cross_dex_scan_detects_profitable_cycle_across_different_dexes(db: Data
     assert signal["dex_bc"] == "aerodrome"
     assert signal["dex_ca"] == "sushiswap"
     assert signal["cycle_multiplier"] == pytest.approx(2.0 * 3.0 * 0.2)
+    assert signal["token_b_usd_price"] == pytest.approx(0.5)
+    assert signal["token_c_usd_price"] == pytest.approx(0.2)
     # Persisté en base, consultable via list_cross_dex_triangular_signals.
     stored = db.list_cross_dex_triangular_signals(limit=10)
     assert len(stored) == 1
     assert stored[0]["dex_ab"] == "uniswap"
+    assert stored[0]["token_b_usd_price"] == pytest.approx(0.5)
+    assert stored[0]["token_c_usd_price"] == pytest.approx(0.2)
 
 
 def test_cross_dex_scan_skips_cycle_fully_on_a_single_dex(db: Database):

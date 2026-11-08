@@ -7,17 +7,58 @@ from app.trading import flashloan
 
 USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 WETH = "0x4200000000000000000000000000000000000006"
+TOKEN_B = "0x" + "1" * 40
+TOKEN_C = "0x" + "2" * 40
+
+
+def _cross_dex_config(**overrides):
+    trading = {
+        "flashloan_enabled": True,
+        "cross_dex_flashloan_enabled": True,
+        "flashloan_notional_usd": 1_000,
+        "flashloan_min_net_profit_usd": 0.01,
+        "liquidity_safety_fraction": 0.02,
+        "min_liquidity_usd": 10_000,
+    }
+    trading.update(overrides)
+    return {"trading": trading}
+
+
+def _cross_dex_signal(**overrides):
+    signal = {
+        "id": 1,
+        "chain": "base",
+        "token_a_symbol": "WETH",
+        "token_a_address": WETH,
+        "token_b_symbol": "TOKEN_B",
+        "token_b_address": TOKEN_B,
+        "token_c_symbol": "TOKEN_C",
+        "token_c_address": TOKEN_C,
+        "dex_ab": "sushiswap",
+        "dex_bc": "baseswap",
+        "dex_ca": "swapbased",
+        "token_b_usd_price": 1.0,
+        "token_c_usd_price": 0.5,
+        "cycle_multiplier": 1.1,
+        "spread_pct": 10.0,
+        "min_liquidity_usd": 100_000,
+        "would_execute_flashloan": True,
+    }
+    signal.update(overrides)
+    return signal
 
 
 def test_flashloan_disabled_by_default():
     assert flashloan.flashloan_enabled({}) is False
     assert flashloan.flashloan_enabled({"trading": {}}) is False
     assert flashloan.flashloan_enabled({"trading": {"flashloan_enabled": True}}) is True
+    assert flashloan.cross_dex_flashloan_enabled({}) is False
+    assert flashloan.cross_dex_flashloan_enabled({"trading": {}}) is False
 
 
 def test_flashloan_config_defaults():
     assert flashloan.flashloan_notional_usd({}) == 1000
-    assert flashloan.flashloan_min_net_profit_usd({}) == 1.0
+    assert flashloan.flashloan_min_net_profit_usd({}) == 0.0
     assert flashloan.flashloan_liquidity_safety_fraction({}) == 0.02
 
     config = {"trading": {"flashloan_notional_usd": 50, "flashloan_min_net_profit_usd": 2.5,
@@ -25,6 +66,25 @@ def test_flashloan_config_defaults():
     assert flashloan.flashloan_notional_usd(config) == 50
     assert flashloan.flashloan_min_net_profit_usd(config) == 2.5
     assert flashloan.flashloan_liquidity_safety_fraction(config) == 0.01
+
+
+def test_flashloan_profit_floor_scales_with_notional():
+    config = {
+        "trading": {
+            "flashloan_min_net_profit_usd": 0.25,
+            "min_net_profit_pct": 0.5,
+        },
+    }
+
+    assert flashloan.flashloan_min_net_profit_usd(config, 20.0) == 0.25
+    assert flashloan.flashloan_min_net_profit_usd(config, 100.0) == 0.5
+    assert flashloan.flashloan_min_net_profit_usd(config, 10_000.0) == 50.0
+    assert flashloan.flashloan_min_net_profit_usd(config) == 0.25
+
+
+def test_minimum_profit_units_always_requires_positive_onchain_profit():
+    assert flashloan._minimum_profit_units(0.0, 1.0, 6) == 1
+    assert flashloan._minimum_profit_units(0.25, 1.0, 6) == 250_000
 
 
 def test_pair_signal_eligibility_requires_flashloan_enabled():
@@ -51,19 +111,156 @@ def test_pair_signal_eligibility_rejects_non_executable_quote():
 
 def test_triangular_signal_eligibility():
     config = {"trading": {"flashloan_enabled": True}}
-    eligible_signal = {"dex": "aerodrome", "token_a_address": WETH}
+    eligible_signal = {"dex": "sushiswap", "token_a_address": WETH}
     assert flashloan.triangular_signal_is_flashloan_eligible(config, eligible_signal) is True
+    # Aerodrome/PancakeSwap can resolve to stable or concentrated pools that
+    # the scanner's generic DEX quote does not identify exactly; never execute
+    # those triangular opportunities until route-aware quoting is available.
+    for dex in ("aerodrome", "pancakeswap"):
+        signal = {"dex": dex, "token_a_address": WETH}
+        assert flashloan.triangular_signal_is_flashloan_eligible(config, signal) is False
 
-    # Cas théorique : "uniswap" fait partie de FLASHLOAN_CAPABLE_DEXES (jambe
-    # kind=2 single-hop supportée par le contrat), mais en pratique
-    # `triangular.TRIANGULAR_CAPABLE_DEXES` ne propose jamais "uniswap" comme
-    # `dex` d'un signal triangulaire (scan dédié, scope distinct) — ce test
-    # documente le comportement de la fonction elle-même, pas un cas réel.
+    # Uniswap V3 n'est pas pris en charge par le scanner triangulaire.
     uniswap_signal = {"dex": "uniswap", "token_a_address": WETH}
-    assert flashloan.triangular_signal_is_flashloan_eligible(config, uniswap_signal) is True
+    assert flashloan.triangular_signal_is_flashloan_eligible(config, uniswap_signal) is False
 
     disabled_config = {"trading": {"flashloan_enabled": False}}
     assert flashloan.triangular_signal_is_flashloan_eligible(disabled_config, eligible_signal) is False
+
+
+def test_cross_dex_signal_eligibility_requires_both_flags_and_valid_routes():
+    signal = _cross_dex_signal()
+    assert flashloan.cross_dex_triangular_signal_is_flashloan_eligible(
+        _cross_dex_config(), signal,
+    )
+    assert not flashloan.cross_dex_triangular_signal_is_flashloan_eligible(
+        _cross_dex_config(cross_dex_flashloan_enabled=False), signal,
+    )
+    assert not flashloan.cross_dex_triangular_signal_is_flashloan_eligible(
+        _cross_dex_config(flashloan_enabled=False), signal,
+    )
+    assert not flashloan.cross_dex_triangular_signal_is_flashloan_eligible(
+        _cross_dex_config(), _cross_dex_signal(chain="ethereum"),
+    )
+    assert not flashloan.cross_dex_triangular_signal_is_flashloan_eligible(
+        _cross_dex_config(), _cross_dex_signal(token_c_address=TOKEN_B),
+    )
+    assert not flashloan.cross_dex_triangular_signal_is_flashloan_eligible(
+        _cross_dex_config(), _cross_dex_signal(dex_ca="unknown-dex"),
+    )
+    assert not flashloan.cross_dex_triangular_signal_is_flashloan_eligible(
+        _cross_dex_config(),
+        _cross_dex_signal(dex_bc="sushiswap", dex_ca="sushiswap"),
+    )
+
+
+def test_cross_dex_flashloan_preview_applies_three_leg_costs_and_gas_safety(monkeypatch):
+    monkeypatch.setattr(
+        flashloan, "_estimate_premium_and_gas_cost_usd",
+        lambda _notional, _units: (0.0, 0.01),
+    )
+    preview = flashloan.estimate_cross_dex_triangular_flashloan_preview(
+        _cross_dex_config(), _cross_dex_signal(),
+    )
+
+    assert preview is not None
+    assert 0 < preview["notional_usd"] <= 1_000
+    assert preview["net_profit_usd"] > 0.01
+    assert preview["estimated_gas_cost_usd"] == 0.015
+
+
+def test_cross_dex_preview_refuses_missing_or_invalid_depth_and_gas(monkeypatch):
+    config = _cross_dex_config()
+    assert flashloan.estimate_cross_dex_triangular_flashloan_preview(
+        config, _cross_dex_signal(min_liquidity_usd=None),
+    ) is None
+
+    monkeypatch.setattr(
+        flashloan, "_estimate_premium_and_gas_cost_usd",
+        lambda _notional, _units: (0.0, None),
+    )
+    assert flashloan.estimate_cross_dex_triangular_flashloan_preview(
+        config, _cross_dex_signal(),
+    ) is None
+
+
+def test_cross_dex_executor_builds_mixed_legs_and_persists_simulated_result(
+    tmp_path, monkeypatch,
+):
+    from app.database import Database
+    from web3 import Web3
+
+    config = _cross_dex_config()
+    signal = _cross_dex_signal()
+    db = Database(tmp_path / "cross-dex.db")
+    signal["id"] = db.add_cross_dex_triangular_signal(signal)
+    built_legs = []
+
+    class FakeWeb3:
+        class eth:
+            pass
+
+        @staticmethod
+        def to_checksum_address(address):
+            return Web3.to_checksum_address(address)
+
+    class FakeEth:
+        def contract(self, **_kwargs):
+            return object()
+
+    FakeWeb3.eth = FakeEth()
+
+    monkeypatch.setattr(flashloan, "is_trading_live", lambda _config: True)
+    monkeypatch.setattr(flashloan, "make_w3", lambda **_kwargs: FakeWeb3())
+    monkeypatch.setattr(flashloan, "_is_connected_with_retry", lambda _w3: True)
+    monkeypatch.setattr(flashloan, "_get_decimals", lambda _w3, _address: 18)
+    monkeypatch.setattr(flashloan, "_quote_token_usd_price", lambda _address: 2_000.0)
+    monkeypatch.setattr(flashloan, "_onchain_quote_depth_usd", lambda *_args: 100_000.0)
+    monkeypatch.setattr(
+        flashloan, "_estimate_premium_and_gas_cost_usd",
+        lambda _notional, _units: (0.0, 0.01),
+    )
+    monkeypatch.setattr(
+        flashloan, "_build_leg",
+        lambda dex, _w3, *, token_in, token_out: (
+            built_legs.append((dex, token_in, token_out)) or (dex, token_in, token_out)
+        ),
+    )
+    monkeypatch.setattr(flashloan, "_flash_arbitrage_abi", lambda: [])
+    monkeypatch.setattr(flashloan, "_flashloan_actual_profit_quote", lambda *_args: 0.25)
+    monkeypatch.setattr(
+        flashloan, "_actual_execution_metrics",
+        lambda profit, _price, _gas: {
+            "realized_pnl_usd": profit,
+            "actual_profit_quote": profit,
+            "actual_gas_cost_wei": 100,
+            "actual_gas_cost_usd": 0.01,
+        },
+    )
+    sent = {}
+
+    def fake_send(*_args, **kwargs):
+        sent.update(kwargs)
+        return {
+            "tx_hash": "0xsimulated",
+            "error": None,
+            "receipt": None,
+            "gas_cost_wei": 100,
+        }
+
+    monkeypatch.setattr(flashloan, "send_trading_transaction", fake_send)
+
+    result = flashloan.execute_cross_dex_triangular_signal_via_flashloan(db, config, signal)
+
+    assert result == {"executed": True, "tx_hash": "0xsimulated", "error": None}
+    assert [leg[0] for leg in built_legs] == ["sushiswap", "baseswap", "swapbased"]
+    assert len(sent["args"][2]) == 3
+    stored = db.fetch_one(
+        "SELECT * FROM cross_dex_triangular_signals WHERE id = ?", (signal["id"],),
+    )
+    assert stored["execution_status"] == "executed"
+    assert stored["execution_tx_hash"] == "0xsimulated"
+    assert stored["actual_profit_quote"] == 0.25
 
 
 def test_amm_price_impact_pct_grows_with_notional_vs_liquidity():
@@ -159,7 +356,13 @@ def test_pair_signal_flashloan_preview_penalizes_thin_liquidity_pool(monkeypatch
 def test_triangular_signal_flashloan_preview_computes_notional_and_profit(monkeypatch):
     monkeypatch.setattr(flashloan, "_estimate_premium_and_gas_cost_usd", lambda notional, gas_units: (0.5, 0.2))
     config = {"trading": {"flashloan_enabled": True, "flashloan_notional_usd": 1000, "liquidity_safety_fraction": 0.02}}
-    signal = {"dex": "aerodrome", "token_a_address": WETH, "min_liquidity_usd": 100_000, "spread_pct": 2.0}
+    for dex in ("aerodrome", "pancakeswap"):
+        unsupported_signal = {
+            "dex": dex, "token_a_address": WETH, "min_liquidity_usd": 100_000, "spread_pct": 2.0,
+        }
+        assert flashloan.estimate_triangular_signal_flashloan_preview(config, unsupported_signal) is None
+
+    signal = {"dex": "sushiswap", "token_a_address": WETH, "min_liquidity_usd": 100_000, "spread_pct": 2.0}
     preview = flashloan.estimate_triangular_signal_flashloan_preview(config, signal)
     assert preview is not None
     # Plafond = min(1000$, 2% de 100k$=2000$) = 1000$, mais la recherche

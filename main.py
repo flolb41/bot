@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import threading
+from pathlib import Path
 
 # Force stdout/stderr en UTF-8 : le dashboard texte utilise des caractères Unicode
 # (box-drawing, émojis) qui plantent sur une console Windows en cp1252 par défaut.
@@ -40,40 +42,108 @@ def _build_components(config_path: str):
         token=telegram_cfg.get("bot_token", ""),
         chat_id=telegram_cfg.get("chat_id", ""),
         db=db,
-        scan_callback=lambda: run_arbitrage_scan_job(db, telegram, config),
+        scan_callback=lambda: run_arbitrage_scan_job(db, telegram, config.raw),
     )
     return config, db, telegram
+
+
+# Référence conservée pour la durée du process : fermer le fichier relâcherait le verrou.
+_SINGLE_INSTANCE_LOCK = None
+
+
+def acquire_single_instance_lock(db_path: str) -> bool:
+    """Garantit qu'un seul `main.py run` pilote une base SQLite donnée.
+
+    Verrou `flock` exclusif sur `<base>.lock`, relâché automatiquement par le
+    noyau à la mort du process (pas de verrou orphelin après un crash ou un
+    `kill -9`). Le 08/11/2026, deux instances ont tourné ~35 min en parallèle
+    sur la même base (cycles de scan jumeaux dans app.log, IntegrityError sur
+    les paper trades) : deux schedulers live sur un même wallet peuvent
+    doubler des transactions. Retourne False si une autre instance détient
+    déjà le verrou ; True sur un système sans `fcntl` (poste de dev Windows,
+    aucun verrou possible)."""
+    global _SINGLE_INSTANCE_LOCK
+    try:
+        import fcntl
+    except ImportError:
+        return True
+    lock_path = Path(f"{db_path}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.seek(0)
+        other_pid = handle.read().strip() or "inconnu"
+        handle.close()
+        logging.getLogger("app.main").error(
+            "Une autre instance du bot (pid %s) pilote déjà %s — arrêt pour ne pas faire tourner deux "
+            "schedulers/exécuteurs sur le même wallet.", other_pid, db_path,
+        )
+        return False
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    _SINGLE_INSTANCE_LOCK = handle
+    return True
 
 
 def cmd_run(args: argparse.Namespace) -> None:
     config, db, telegram = _build_components(args.config)
     logger = logging.getLogger("app.main")
+    if not acquire_single_instance_lock(str(db.db_path)):
+        raise SystemExit(1)
+
+    from app.killswitch import is_stopped
+    from app.trading.guardrails import trading_live_blockers
+
+    blockers = trading_live_blockers(config.raw)
+    if blockers:
+        logger.warning("Trading en mode simulation : %s", "; ".join(blockers))
+    elif is_stopped(db):
+        logger.warning("Trading en mode simulation : killswitch actif.")
+    else:
+        logger.info("Prérequis d'activation live satisfaits ; les contrôles par transaction restent actifs.")
 
     scheduler_cfg = config.get("scheduler", {})
     scheduler = build_scheduler(
         db, telegram,
         arbitrage_scan_interval_minutes=scheduler_cfg.get("arbitrage_scan_interval_minutes", 5),
         config=config,
+        ws_urls=config.get("rpc", {}).get("websocket_urls"),
     )
     scheduler.start()
     logger.info("Scheduler démarré.")
 
     dashboard_cfg = config.get("dashboard", {})
     if dashboard_cfg.get("enabled", True):
+        import threading
+        import time
+
         import uvicorn
 
         from app.dashboard import create_app
 
         dash_app = create_app(db)
-        thread = threading.Thread(
-            target=lambda: uvicorn.run(
-                dash_app,
-                host=dashboard_cfg.get("host", "0.0.0.0"),
-                port=dashboard_cfg.get("port", 8000),
-                log_level="warning",
-            ),
-            daemon=True,
-        )
+
+        def _dashboard_loop() -> None:
+            """Boucle de relance du dashboard : si uvicorn s'arrête (port occupé,
+            exception dans l'event loop, ...), on relance après un court délai
+            plutôt que de laisser le processus sans interface HTTP."""
+            while not getattr(threading.current_thread(), "_stop", False):
+                try:
+                    uvicorn.run(
+                        dash_app,
+                        host=dashboard_cfg.get("host", "0.0.0.0"),
+                        port=dashboard_cfg.get("port", 8000),
+                        log_level="warning",
+                    )
+                except Exception as exc:  # pragma: no cover - résilience runtime
+                    logger.exception("Dashboard s'est arrêté, relance dans 5s : %s", exc)
+                    time.sleep(5)
+
+        thread = threading.Thread(target=_dashboard_loop, daemon=True)
         thread.start()
         logger.info("Dashboard démarré sur le port %s.", dashboard_cfg.get("port", 8000))
 
@@ -91,6 +161,9 @@ def cmd_run(args: argparse.Namespace) -> None:
         pass
     finally:
         scheduler.shutdown(wait=False)
+        ws_listener = getattr(scheduler, "ws_listener", None)
+        if ws_listener is not None:
+            ws_listener.stop(timeout=10.0)
 
 
 def cmd_telegram(args: argparse.Namespace) -> None:
@@ -117,6 +190,26 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     _, db, _ = _build_components(args.config)
     print(build_dashboard_text(db))
+
+
+def cmd_trading_status(args: argparse.Namespace) -> None:
+    from app.killswitch import is_stopped
+    from app.trading.guardrails import trading_live_blockers
+
+    config = load_config(args.config)
+    db = Database(config.get("database", {}).get("path", "data/reward_hunter.db"))
+    blockers = trading_live_blockers(config.raw)
+    stopped = is_stopped(db)
+
+    print("Trading live : " + ("AUTORISÉ par les garde-fous de configuration" if not blockers else "BLOQUÉ"))
+    for blocker in blockers:
+        print(f"- {blocker}")
+    print(f"Killswitch : {'ACTIF' if stopped else 'inactif'}")
+    print("Mode effectif : " + ("SIMULATION" if blockers or stopped else "LIVE autorisé"))
+    print(
+        "Note : cette commande ne vérifie ni le solde, ni le keystore, ni le RPC, "
+        "ni la rentabilité du prochain signal."
+    )
 
 
 def cmd_scan_arbitrage(args: argparse.Namespace) -> None:
@@ -262,6 +355,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("telegram").set_defaults(func=cmd_telegram)
     sub.add_parser("dashboard").set_defaults(func=cmd_dashboard)
     sub.add_parser("status").set_defaults(func=cmd_status)
+    sub.add_parser(
+        "trading-status",
+        help="Explique si les garde-fous autorisent le trading live, sans envoyer de transaction.",
+    ).set_defaults(func=cmd_trading_status)
 
     sub.add_parser(
         "scan-arbitrage",

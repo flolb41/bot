@@ -56,6 +56,7 @@ from app.trading.guardrails import (
     slippage_pct,
 )
 from app.trading.rpc import call_with_rate_limit_retry, is_connected_with_retry, make_w3, rpc_urls
+from app.trading.token_risk import quote_depth_floor, token_slippage_pct, token_trade_cap
 from app.trading.routers import (
     AERODROME_POOL_ABI,
     AERODROME_ROUTER_ABI,
@@ -72,6 +73,7 @@ from app.trading.routers import (
     PANCAKESWAP_V3_ROUTER_ABI,
     PANCAKESWAP_V3_ROUTER_ADDRESS,
     ROUTER_ADDRESSES,
+    TRIANGULAR_V2_EXECUTABLE_DEXES,
     UNISWAP_V2_FACTORY_ABI,
     UNISWAP_V2_PAIR_ABI,
     UNISWAP_V2_ROUTER_ABI,
@@ -85,11 +87,13 @@ from app.trading.routers import (
 
 logger = logging.getLogger("app.trading.executor")
 
-# USDC et WETH sur Base — tokens "quote" exécutables (voir docstring ci-dessus).
-# Un round-trip part et termine dans UN de ces deux tokens (jamais un mélange).
+# USDC, WETH et BRETT sur Base — tokens "quote" exécutables. Un round-trip
+# part et termine dans l'un de ces trois tokens ; le quote utilisé est porté
+# explicitement par le signal (voir `_resolve_aerodrome_route`/`_resolve_pancakeswap_route`).
 USDC_ADDRESS = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 WETH_ADDRESS = "0x4200000000000000000000000000000000000006"
-EXECUTABLE_QUOTE_TOKENS = frozenset({USDC_ADDRESS, WETH_ADDRESS})
+BRETT_ADDRESS = "0x532f27101965dd16442e59d40670faf5ebb142e4"
+EXECUTABLE_QUOTE_TOKENS = frozenset({USDC_ADDRESS, WETH_ADDRESS, BRETT_ADDRESS})
 
 # Forks UniswapV2 classiques (ABI `swapExactTokensForTokens` standard,
 # `factory()`/`getPair()` pour résoudre la pool unique) — voir `_build_swap_call`
@@ -102,6 +106,7 @@ UNISWAP_V2_FORK_DEXES = frozenset({"sushiswap", "pancakeswap", "baseswap", "alie
 _QUOTE_TOKEN_COINGECKO_ID: dict[str, str | None] = {
     USDC_ADDRESS: None,
     WETH_ADDRESS: "ethereum",
+    BRETT_ADDRESS: "based-brett",
 }
 
 _DECIMALS_CACHE: dict[str, int] = {}
@@ -185,6 +190,10 @@ def _balance_of_with_retry(contract, address: str) -> int:
     return int(call_with_rate_limit_retry(lambda: contract.functions.balanceOf(Web3.to_checksum_address(address)).call()))
 
 
+def _newly_acquired_token_amount(balance_before: int, balance_after: int) -> int:
+    return max(0, balance_after - balance_before)
+
+
 def _get_decimals(w3, token_address: str) -> int:
     key = token_address.lower()
     if key not in _DECIMALS_CACHE:
@@ -217,9 +226,75 @@ def _quote_token_usd_price(quote_address: str) -> float | None:
     return get_price_usd(coingecko_id)
 
 
+def _actual_execution_metrics(
+    profit_quote: float | None, quote_usd_price: float | None, gas_cost_wei: int | None,
+) -> dict:
+    gas_cost_usd = None
+    realized_pnl_usd = None
+    if gas_cost_wei is not None:
+        from app.wallet.pricing import get_price_usd
+
+        gas_cost_usd = fees.actual_gas_cost_usd(gas_cost_wei, get_price_usd("ethereum"))
+        if profit_quote is not None:
+            realized_pnl_usd = fees.realized_net_profit_usd(
+                profit_quote, quote_usd_price, gas_cost_usd,
+            )
+    return {
+        "realized_pnl_usd": realized_pnl_usd,
+        "actual_profit_quote": profit_quote,
+        "actual_gas_cost_wei": gas_cost_wei,
+        "actual_gas_cost_usd": gas_cost_usd,
+    }
+
+
 # Marge tolérée entre un prix on-chain lu directement et un prix de référence
 # (DexScreener, ou dernier prix connu) avant de considérer la lecture on-chain
 # comme non fiable — voir `_onchain_price_is_plausible`.
+def _net_token_transfer_from_receipts(
+    token_address: str, wallet_address: str, receipts: list[dict | None],
+) -> int | None:
+    """Mesure les transferts du token dans ces transactions, sans le bruit d'autres mouvements du wallet."""
+    from web3 import Web3
+
+    token = token_address.lower()
+    wallet = wallet_address.lower()
+    transfer_topic = Web3.keccak(text="Transfer(address,address,uint256)")
+    total = 0
+    found_transfer = False
+    for receipt in receipts:
+        if receipt is None:
+            continue
+        for log in receipt.get("logs", []):
+            topics = log.get("topics", [])
+            if len(topics) < 3:
+                continue
+            topic_zero = topics[0]
+            if isinstance(topic_zero, str):
+                topic_zero = bytes.fromhex(topic_zero.removeprefix("0x"))
+            if (
+                (log.get("address") or "").lower() != token
+                or bytes(topic_zero) != bytes(transfer_topic)
+            ):
+                continue
+            sender_topic, recipient_topic = topics[1], topics[2]
+            if isinstance(sender_topic, str):
+                sender_topic = bytes.fromhex(sender_topic.removeprefix("0x"))
+            if isinstance(recipient_topic, str):
+                recipient_topic = bytes.fromhex(recipient_topic.removeprefix("0x"))
+            sender = "0x" + bytes(sender_topic)[-20:].hex()
+            recipient = "0x" + bytes(recipient_topic)[-20:].hex()
+            amount = int(log.get("data", 0), 16) if isinstance(log.get("data"), str) else int.from_bytes(
+                bytes(log.get("data", b"")), "big"
+            )
+            if sender == wallet:
+                total -= amount
+                found_transfer = True
+            if recipient == wallet:
+                total += amount
+                found_transfer = True
+    return total if found_transfer else None
+
+
 _ONCHAIN_PRICE_MAX_PLAUSIBLE_RATIO = 10.0
 
 
@@ -556,18 +631,21 @@ def _best_aerodrome_slipstream_pool(w3, token_address: str, quote_address: str) 
     return best
 
 
-def _resolve_aerodrome_route(w3, token_in: str, token_out: str) -> dict | None:
+def _resolve_aerodrome_route(w3, token_in: str, token_out: str, quote_address: str | None = None) -> dict | None:
     """Choisit, pour une jambe Aerodrome token_in<->token_out, entre le pool
     classique (stable=False, `defaultFactory`) et la meilleure pool Slipstream
     (`_best_aerodrome_slipstream_pool`, toutes factories/tick spacings
-    confondues) -- comparaison par plus grande réserve on-chain du quote token
-    (`EXECUTABLE_QUOTE_TOKENS` garantit que token_in OU token_out en est
-    toujours un). Utilisé À LA FOIS par `_build_swap_call`/`_build_leg`
-    (construction de l'appel réel) ET `_onchain_pool_price_usd` (revérification
-    de prix) — les deux doivent appeler EXACTEMENT cette fonction pour rester
-    cohérents sur la pool choisie. Retourne un dict (`is_slipstream`, `router`,
-    `pool`, + `default_factory` ou `tick_spacing` selon le cas), ou `None` si
-    aucune pool n'existe nulle part pour cette paire.
+    confondues) -- comparaison par plus grande réserve on-chain du quote token.
+    `quote_address`, quand fourni, désigne explicitement le token de cotation
+    du round-trip (évite l'ambiguïté quand les deux côtés de la paire sont
+    dans `EXECUTABLE_QUOTE_TOKENS`, ex. WETH/BRETT). Quand il est None, le
+    quote est déduit de l'appartenance à `EXECUTABLE_QUOTE_TOKENS` (comportement
+    historique). Utilisé À LA FOIS par `_build_swap_call` (construction de
+    l'appel réel) ET `_onchain_pool_price_usd` (revérification de prix) — les
+    deux doivent appeler EXACTEMENT cette fonction pour rester cohérents sur
+    la pool choisie. Retourne un dict (`is_slipstream`, `router`, `pool`, +
+    `default_factory` ou `tick_spacing` selon le cas), ou `None` si aucune
+    pool n'existe nulle part pour cette paire.
 
     Résultat mis en cache (`_route_cache`, voir `_best_v3_style_pool`) : en
     plus de `_best_aerodrome_slipstream_pool` (déjà caché), les lectures
@@ -575,7 +653,7 @@ def _resolve_aerodrome_route(w3, token_in: str, token_out: str) -> dict | None:
     elles aussi rappelées plusieurs fois par cycle pour la même paire. Les
     deux branches (pool classique / `_best_aerodrome_slipstream_pool`) sont
     résolues EN PARALLÈLE (indépendantes l'une de l'autre)."""
-    cache_key = ("aerodrome_route",) + _pair_key(token_in, token_out)
+    cache_key = ("aerodrome_route", (quote_address or "").lower()) + _pair_key(token_in, token_out)
     cached = _route_cache_get(cache_key)
     if cached is not _ROUTE_CACHE_MISSING:
         return cached  # type: ignore[return-value]
@@ -583,7 +661,19 @@ def _resolve_aerodrome_route(w3, token_in: str, token_out: str) -> dict | None:
     from web3 import Web3
     token_in_cs = Web3.to_checksum_address(token_in)
     token_out_cs = Web3.to_checksum_address(token_out)
-    if token_in.lower() in EXECUTABLE_QUOTE_TOKENS:
+    if quote_address:
+        quote_address = quote_address.lower()
+        if token_in.lower() == quote_address:
+            other_token = token_out
+        elif token_out.lower() == quote_address:
+            other_token = token_in
+        else:
+            # quote_address pas membre de la paire : repli sur l'inférence.
+            if token_in.lower() in EXECUTABLE_QUOTE_TOKENS:
+                quote_address, other_token = token_in, token_out
+            else:
+                quote_address, other_token = token_out, token_in
+    elif token_in.lower() in EXECUTABLE_QUOTE_TOKENS:
         quote_address, other_token = token_in, token_out
     else:
         quote_address, other_token = token_out, token_in
@@ -641,15 +731,16 @@ def _resolve_aerodrome_route(w3, token_in: str, token_out: str) -> dict | None:
     return result
 
 
-def _resolve_pancakeswap_route(w3, token_in: str, token_out: str) -> dict | None:
+def _resolve_pancakeswap_route(w3, token_in: str, token_out: str, quote_address: str | None = None) -> dict | None:
     """Même principe que `_resolve_aerodrome_route`, pour PancakeSwap v2
     (classique) vs PancakeSwap V3 (`_best_pancakeswap_v3_pool`). Retourne un
     dict (`is_v3`, `router`, `pool`, + `fee` si v3), ou `None` si aucune pool
-    n'existe nulle part pour cette paire.
+    n'existe nulle part pour cette paire. `quote_address` désigne explicitement
+    le token de cotation (voir `_resolve_aerodrome_route`).
 
     Résultat mis en cache (`_route_cache`, voir `_resolve_aerodrome_route`),
     même parallélisation des deux branches (classique / V3)."""
-    cache_key = ("pancakeswap_route",) + _pair_key(token_in, token_out)
+    cache_key = ("pancakeswap_route", (quote_address or "").lower()) + _pair_key(token_in, token_out)
     cached = _route_cache_get(cache_key)
     if cached is not _ROUTE_CACHE_MISSING:
         return cached  # type: ignore[return-value]
@@ -657,7 +748,18 @@ def _resolve_pancakeswap_route(w3, token_in: str, token_out: str) -> dict | None
     from web3 import Web3
     token_in_cs = Web3.to_checksum_address(token_in)
     token_out_cs = Web3.to_checksum_address(token_out)
-    if token_in.lower() in EXECUTABLE_QUOTE_TOKENS:
+    if quote_address:
+        quote_address = quote_address.lower()
+        if token_in.lower() == quote_address:
+            other_token = token_out
+        elif token_out.lower() == quote_address:
+            other_token = token_in
+        else:
+            if token_in.lower() in EXECUTABLE_QUOTE_TOKENS:
+                quote_address, other_token = token_in, token_out
+            else:
+                quote_address, other_token = token_out, token_in
+    elif token_in.lower() in EXECUTABLE_QUOTE_TOKENS:
         quote_address, other_token = token_in, token_out
     else:
         quote_address, other_token = token_out, token_in
@@ -753,9 +855,15 @@ def _v2_fork_pool_confirmed_absent(w3, dex: str, token_in: str, token_out: str) 
 
 
 def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: int,
-                      min_amount_out: int, recipient: str, deadline: int) -> tuple[str, list[dict], str, tuple]:
+                      min_amount_out: int, recipient: str, deadline: int,
+                      quote_address: str | None = None) -> tuple[str, list[dict], str, tuple]:
     """Construit (contract_address, abi, function_name, args) pour le DEX demandé.
-    Lève `TradingRefused` si le DEX n'est pas dans EXECUTABLE_DEXES."""
+    Lève `TradingRefused` si le DEX n'est pas dans EXECUTABLE_DEXES.
+
+    `quote_address` désigne explicitement le token de cotation du round-trip
+    (USDC/WETH/BRETT) et est transmis à la résolution de route des DEX qui en
+    ont besoin (aerodrome, pancakeswap) afin de choisir la bonne réserve de
+    quote même quand les deux côtés de la paire sont exécutables."""
     from web3 import Web3
     if dex not in EXECUTABLE_DEXES:
         raise TradingRefused(f"Exécution non implémentée pour le DEX '{dex}' (voir EXECUTABLE_DEXES).")
@@ -770,7 +878,7 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
         return router_address, UNISWAP_V3_ROUTER_ABI, "exactInputSingle", (params,)
 
     if dex == "aerodrome":
-        route = _resolve_aerodrome_route(w3, token_in, token_out)
+        route = _resolve_aerodrome_route(w3, token_in, token_out, quote_address)
         if route is None:
             raise TradingRefused(f"Aucune pool Aerodrome (classique ou Slipstream) trouvée pour {token_in}/{token_out}.")
         if route["is_slipstream"]:
@@ -785,7 +893,7 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
         )
 
     if dex == "pancakeswap":
-        route = _resolve_pancakeswap_route(w3, token_in, token_out)
+        route = _resolve_pancakeswap_route(w3, token_in, token_out, quote_address)
         if route is None:
             raise TradingRefused(f"Aucune pool PancakeSwap (v2 ou v3) trouvée pour {token_in}/{token_out}.")
         if route["is_v3"]:
@@ -814,6 +922,37 @@ def _build_swap_call(dex: str, w3, *, token_in: str, token_out: str, amount_in: 
     raise TradingRefused(f"Exécution non implémentée pour le DEX '{dex}' (voir EXECUTABLE_DEXES).")
 
 
+def _build_swap_call_and_ensure_allowance(
+    db: Database,
+    w3,
+    *,
+    dex: str,
+    token_in: str,
+    token_out: str,
+    amount_in: int,
+    min_amount_out: int,
+    recipient: str,
+    deadline: int,
+    quote_address: str,
+    allowance_token_address: str,
+    owner: str,
+    allowance_amount: int,
+    count_against_daily_limit: bool = True,
+) -> tuple[str, list[dict], str, tuple, dict]:
+    """Build the exact swap route, then approve its selected router as spender."""
+    contract_address, abi, function_name, args = _build_swap_call(
+        dex, w3, token_in=token_in, token_out=token_out,
+        amount_in=amount_in, min_amount_out=min_amount_out,
+        recipient=recipient, deadline=deadline, quote_address=quote_address,
+    )
+    approval = _ensure_allowance(
+        db, w3, token_address=allowance_token_address, owner=owner,
+        spender=contract_address, amount=allowance_amount,
+        count_against_daily_limit=count_against_daily_limit,
+    )
+    return contract_address, abi, function_name, args, approval
+
+
 def _build_triangular_swap_call(dex: str, w3, *, token_a: str, token_b: str, token_c: str,
                                  amount_in: int, min_amount_out: int, recipient: str,
                                  deadline: int) -> tuple[str, list[dict], str, tuple]:
@@ -821,33 +960,21 @@ def _build_triangular_swap_call(dex: str, w3, *, token_a: str, token_b: str, tok
     (voir `app.trading.triangular`) : UNE SEULE transaction pour tout le cycle,
     atomique (si une jambe échoue, l'intégralité revert — aucun état
     intermédiaire possible, contrairement au round-trip classique 2-jambes de
-    `_build_swap_call`/`execute_signal`). Ne supporte que les DEX listés dans
-    `app.trading.triangular.TRIANGULAR_CAPABLE_DEXES` (Uniswap V3 exclu, voir
-    son docstring) ; lève `TradingRefused` sinon."""
+    `_build_swap_call`/`execute_signal`). N'autorise que les routeurs V2 qui
+    représentent directement les pools utilisées par le scan ; lève
+    `TradingRefused` pour les DEX à routes ambiguës."""
     from web3 import Web3
 
-    from app.trading.triangular import TRIANGULAR_CAPABLE_DEXES
-    if dex not in TRIANGULAR_CAPABLE_DEXES or dex not in EXECUTABLE_DEXES:
+    if dex not in TRIANGULAR_V2_EXECUTABLE_DEXES or dex not in EXECUTABLE_DEXES:
         raise TradingRefused(
-            f"Exécution triangulaire non implémentée pour le DEX '{dex}' (voir TRIANGULAR_CAPABLE_DEXES)."
+            f"Exécution triangulaire wallet-funded non supportée pour '{dex}' : "
+            "seuls les routeurs V2 correspondant exactement au scan sont autorisés."
         )
     router_address = ROUTER_ADDRESSES[dex]
     a_cs = Web3.to_checksum_address(token_a)
     b_cs = Web3.to_checksum_address(token_b)
     c_cs = Web3.to_checksum_address(token_c)
     recipient_cs = Web3.to_checksum_address(recipient)
-
-    if dex == "aerodrome":
-        router = w3.eth.contract(address=Web3.to_checksum_address(router_address), abi=AERODROME_ROUTER_ABI)
-        default_factory = router.functions.defaultFactory().call()
-        routes = [
-            (a_cs, b_cs, False, default_factory),
-            (b_cs, c_cs, False, default_factory),
-            (c_cs, a_cs, False, default_factory),
-        ]
-        return router_address, AERODROME_ROUTER_ABI, "swapExactTokensForTokens", (
-            amount_in, min_amount_out, routes, recipient_cs, deadline,
-        )
 
     # Forks V2 classiques : chemin multi-hop natif à swapExactTokensForTokens
     # (même fonction/ABI que le round-trip 2-jambes, juste un path à 4 adresses
@@ -856,6 +983,26 @@ def _build_triangular_swap_call(dex: str, w3, *, token_a: str, token_b: str, tok
     return router_address, UNISWAP_V2_ROUTER_ABI, "swapExactTokensForTokens", (
         amount_in, min_amount_out, path, recipient_cs, deadline,
     )
+
+
+def _quote_v2_triangular_output(w3, dex: str, path: list[str], amount_in: int) -> int:
+    """Obtient le montant de sortie du chemin V2 exact, sans allowance ni écriture."""
+    from web3 import Web3
+
+    router = w3.eth.contract(
+        address=Web3.to_checksum_address(ROUTER_ADDRESSES[dex]),
+        abi=UNISWAP_V2_ROUTER_ABI,
+    )
+    checksum_path = [Web3.to_checksum_address(address) for address in path]
+    amounts = call_with_rate_limit_retry(
+        lambda: router.functions.getAmountsOut(amount_in, checksum_path).call()
+    )
+    if len(amounts) != len(checksum_path) or int(amounts[0]) != amount_in:
+        raise TradingRefused(f"Réponse getAmountsOut invalide pour le cycle triangulaire {dex}.")
+    output = int(amounts[-1])
+    if output <= 0:
+        raise TradingRefused(f"Le chemin triangulaire {dex} ne retourne aucun token de cotation.")
+    return output
 
 
 def execute_triangular_signal(db: Database, config: dict, signal: dict) -> dict:
@@ -877,11 +1024,10 @@ def execute_triangular_signal(db: Database, config: dict, signal: dict) -> dict:
         result["error"] = "Trading live désactivé (voir app.trading.guardrails.is_trading_live)."
         return result
 
-    from app.trading.triangular import TRIANGULAR_CAPABLE_DEXES
-    if signal["dex"] not in TRIANGULAR_CAPABLE_DEXES or signal["dex"] not in EXECUTABLE_DEXES:
+    if signal["dex"] not in TRIANGULAR_V2_EXECUTABLE_DEXES or signal["dex"] not in EXECUTABLE_DEXES:
         result["error"] = (
             f"DEX non exécutable en triangulaire ({signal['dex']}) "
-            f"— seuls {sorted(TRIANGULAR_CAPABLE_DEXES & EXECUTABLE_DEXES)} sont implémentés."
+            f"— seuls {sorted(TRIANGULAR_V2_EXECUTABLE_DEXES & EXECUTABLE_DEXES)} sont implémentés."
         )
         return result
 
@@ -932,6 +1078,7 @@ def execute_triangular_signal(db: Database, config: dict, signal: dict) -> dict:
         # --- Garde-fou solde réel : ne jamais trader plus que ce qui est dispo ---
         token_a_contract = w3.eth.contract(address=Web3.to_checksum_address(token_a), abi=ERC20_ABI)
         token_a_balance_units = _balance_of_with_retry(token_a_contract, wallet_address)
+        actual_gas_cost_wei = 0
         amount_in_tokens = trade_size_usd / quote_usd_price
         amount_in_units = int(amount_in_tokens * (10 ** token_a_decimals))
         if amount_in_units > token_a_balance_units:
@@ -942,18 +1089,30 @@ def execute_triangular_signal(db: Database, config: dict, signal: dict) -> dict:
             )
             return result
 
-        # min_amount_out dérivé du cycle_multiplier mesuré à la détection
-        # (même token en entrée et en sortie : pas de conversion de décimales
-        # à faire, le ratio s'applique directement en unités brutes).
-        expected_amount_out_units = int(amount_in_units * signal["cycle_multiplier"])
-        min_amount_out_units = int(expected_amount_out_units * (1 - slip))
-
-        approve_result = _ensure_allowance(
-            db, w3, token_address=token_a, owner=wallet_address,
-            spender=ROUTER_ADDRESSES[signal["dex"]], amount=amount_in_units,
+        path = [token_a, token_b, token_c, token_a]
+        quoted_amount_out_units = _quote_v2_triangular_output(
+            w3, signal["dex"], path, amount_in_units,
         )
-        if approve_result["error"]:
-            result["error"] = f"Approve échoué : {approve_result['error']}"
+        min_amount_out_units = int(quoted_amount_out_units * (1 - slip))
+        gas_cost_usd = signal.get("gas_cost_usd")
+        if gas_cost_usd is None:
+            result["error"] = "Coût de gas du cycle indisponible — refus par prudence, aucune approbation envoyée."
+            return result
+        projected_net_profit_usd = (
+            (min_amount_out_units - amount_in_units) / (10 ** token_a_decimals) * quote_usd_price
+            - float(gas_cost_usd)
+        )
+        trading_cfg = (config or {}).get("trading", {}) or {}
+        profit_threshold_usd = max(
+            float(trading_cfg.get("min_net_profit_usd", 0.0)),
+            trade_size_usd * float(trading_cfg.get("min_net_profit_pct", 0.0)) / 100,
+        )
+        if not fees.is_net_profit_above_threshold(projected_net_profit_usd, profit_threshold_usd):
+            result["error"] = (
+                f"Devis on-chain du cycle {signal['dex']} non rentable après slippage et gas "
+                f"({projected_net_profit_usd:.4f}$ < {profit_threshold_usd:.4f}$) — "
+                "aucune approbation envoyée."
+            )
             return result
 
         contract_address, abi, fn_name, args = _build_triangular_swap_call(
@@ -961,6 +1120,21 @@ def execute_triangular_signal(db: Database, config: dict, signal: dict) -> dict:
             amount_in=amount_in_units, min_amount_out=min_amount_out_units,
             recipient=wallet_address, deadline=deadline,
         )
+
+        approve_result = _ensure_allowance(
+            db, w3, token_address=token_a, owner=wallet_address,
+            spender=ROUTER_ADDRESSES[signal["dex"]], amount=amount_in_units,
+        )
+        actual_gas_cost_wei += int(approve_result.get("gas_cost_wei") or 0)
+        if approve_result["error"]:
+            result["error"] = f"Approve échoué : {approve_result['error']}"
+            if approve_result.get("tx_hash"):
+                db.mark_triangular_signal_executed(
+                    signal["id"], tx_hash=approve_result["tx_hash"], execution_error=result["error"],
+                    **_actual_execution_metrics(None, quote_usd_price, actual_gas_cost_wei),
+                )
+            return result
+
         swap_result = send_trading_transaction(
             db, rpc_url=_resolve_rpc_url(), contract_address=contract_address, abi=abi,
             function_name=fn_name, args=args, whitelist_target=contract_address,
@@ -970,13 +1144,30 @@ def execute_triangular_signal(db: Database, config: dict, signal: dict) -> dict:
             ),
         )
         result["tx_hash"] = swap_result["tx_hash"]
+        actual_gas_cost_wei += int(swap_result.get("gas_cost_wei") or 0)
         if swap_result["error"]:
             result["error"] = f"Cycle triangulaire échoué (revert complet, aucun fonds déplacé) : {swap_result['error']}"
-            db.mark_triangular_signal_executed(signal["id"], tx_hash=result["tx_hash"], execution_error=result["error"])
+            db.mark_triangular_signal_executed(
+                signal["id"], tx_hash=result["tx_hash"], execution_error=result["error"],
+                **_actual_execution_metrics(
+                    0.0 if swap_result.get("gas_cost_wei") is not None else None,
+                    quote_usd_price, actual_gas_cost_wei,
+                ),
+            )
             return result
 
         result["executed"] = True
-        db.mark_triangular_signal_executed(signal["id"], tx_hash=result["tx_hash"])
+        profit_units = _net_token_transfer_from_receipts(
+            token_a, wallet_address, [swap_result.get("receipt")],
+        )
+        profit_quote = profit_units / (10 ** token_a_decimals) if profit_units is not None else None
+        if profit_quote is None:
+            logger.warning("Aucun transfert du token de cotation trouvé dans le reçu triangulaire %s.",
+                           result["tx_hash"])
+        db.mark_triangular_signal_executed(
+            signal["id"], tx_hash=result["tx_hash"],
+            **_actual_execution_metrics(profit_quote, quote_usd_price, actual_gas_cost_wei),
+        )
         db.add_notification(
             title="✅ Cycle triangulaire exécuté",
             message=(
@@ -994,6 +1185,11 @@ def execute_triangular_signal(db: Database, config: dict, signal: dict) -> dict:
         logger.exception("Erreur inattendue pendant execute_triangular_signal")
         result["error"] = f"Erreur inattendue : {exc}"
         return result
+
+
+def _onchain_price_supported(dex: str) -> bool:
+    """DEX dont `_onchain_pool_price_usd` sait lire la pool réellement routée."""
+    return dex in UNISWAP_V2_FORK_DEXES or dex in ("aerodrome", "uniswap")
 
 
 def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) -> float | None:
@@ -1025,7 +1221,7 @@ def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) ->
     Retourne None si le DEX n'est pas supporté ici, ou si la lecture échoue
     pour n'importe quelle raison (RPC injoignable, pool inexistante...) — dans
     ce cas l'appelant retombe sur DexScreener plutôt que d'échouer."""
-    if dex not in UNISWAP_V2_FORK_DEXES and dex not in ("aerodrome", "uniswap"):
+    if not _onchain_price_supported(dex):
         return None
     try:
         from web3 import Web3
@@ -1155,11 +1351,21 @@ def _onchain_pool_price_usd(dex: str, token_address: str, quote_address: str) ->
             return None
         return price_in_quote * quote_price_usd
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Lecture on-chain du prix échouée pour %s/%s sur %s: %s", token_address, quote_address, dex, exc)
+        # INFO et non DEBUG : un échec silencieux ici a masqué pendant des
+        # semaines l'ABI `slot0` PancakeSwap V3 erronée (voir routers.py).
+        logger.info(
+            "Lecture on-chain du prix échouée pour %s/%s sur %s : %s: %s",
+            token_address, quote_address, dex, type(exc).__name__, str(exc)[:160],
+        )
         return None
 
 
-def _onchain_quote_depth_usd(dex: str, token_address: str, quote_address: str) -> float | None:
+def _onchain_quote_depth_usd(
+    dex: str,
+    token_address: str,
+    quote_address: str,
+    quote_usd_price: float | None = None,
+) -> float | None:
     """Profondeur RÉELLE (en USD) côté quote token de la pool que `dex`
     utiliserait pour `token_address`/`quote_address` — la même pool que celle
     choisie par `_build_swap_call`/`flashloan._build_leg` (résolutions de
@@ -1176,7 +1382,12 @@ def _onchain_quote_depth_usd(dex: str, token_address: str, quote_address: str) -
     simulations à -40/-90 %, aucune transaction jamais possible (09/10/2026).
 
     Retourne None si indéterminable (DEX non supporté, RPC...) : l'appelant ne
-    doit alors PAS écarter le signal sur ce seul critère."""
+    doit alors PAS écarter le signal sur ce seul critère.
+
+    `quote_usd_price` permet à l'appelant cross-DEX de fournir le prix USD
+    estimé d'un token intermédiaire, qui n'est pas nécessairement USDC/WETH.
+    Sans cette valeur, seuls les quotes reconnus par `_quote_token_usd_price`
+    restent évaluables."""
     try:
         from web3 import Web3
         w3 = make_w3(timeout=10)
@@ -1219,7 +1430,10 @@ def _onchain_quote_depth_usd(dex: str, token_address: str, quote_address: str) -
             depth_units = _quote_reserve_in_pool(w3, pool_address, quote_address)
         else:
             return None
-        quote_price_usd = _quote_token_usd_price(quote_address)
+        if quote_usd_price is None:
+            quote_price_usd = _quote_token_usd_price(quote_address)
+        else:
+            quote_price_usd = quote_usd_price
         if quote_price_usd is None:
             return None
         return depth_units / (10 ** _get_decimals(w3, quote_address)) * quote_price_usd
@@ -1246,24 +1460,37 @@ def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, de
     `_onchain_price_is_plausible` AVANT de la faire confiance — voir sa
     docstring pour le bug concret évité (pool Uniswap V3 quasi vide pour un
     token récemment ajouté, prix ~10^42x réel, toujours gagnant du tri par
-    profit du scheduler). Si implausible, on retombe sur DexScreener
-    ci-dessous exactement comme si la lecture on-chain avait échoué.
+    profit du scheduler).
 
-    Parmi tous les pools DexScreener partageant ce `dex_id` (un même DEX peut
-    exposer plusieurs pools distincts pour la même paire — Aerodrome
-    stable/volatile, Uniswap v3/v4, plusieurs fee tiers v3...), on retient
-    celui de plus grande liquidité : c'est l'heuristique utilisée partout
-    ailleurs (voir `app.trading.arbitrage._collect_pairs`) pour approximer le
-    pool réellement routable par `_build_swap_call`, et rester cohérent avec
-    le prix qui a servi à dimensionner le signal."""
+    Pour un DEX dont la pool est lisible on-chain (tous les DEX exécutables),
+    AUCUN repli DexScreener : cette fonction sert à dimensionner
+    `amountOutMinimum` et à valider l'écart juste avant d'envoyer une
+    transaction, et un prix DexScreener peut dater de plusieurs minutes. Le
+    08/11/2026 (ICNT/USDC), une lecture on-chain en échec (RPC 429) a été
+    remplacée par un prix DexScreener 0,5 % sous le prix réel de la pool :
+    `amountOutMinimum` inatteignable, achat reverté on-chain (« Too little
+    received »), killswitch. Mieux vaut refuser la tentative (aucun capital
+    engagé, cooldown court) que trader sur un prix périmé. Le repli
+    DexScreener ci-dessous ne reste utilisé que pour un DEX sans lecture
+    on-chain (`_onchain_pool_price_usd` non supporté) ; parmi ses pools
+    partageant ce `dex_id`, on retient celui de plus grande liquidité."""
     onchain_price = _onchain_pool_price_usd(dex, token_address, quote_address)
     if onchain_price is not None:
         if _onchain_price_is_plausible(onchain_price, reference_price_usd):
             return onchain_price
         logger.warning(
-            "Prix on-chain implausible ignoré pour %s/%s sur %s (%.6g, référence %.6g) — repli DexScreener.",
+            "Prix on-chain implausible pour %s/%s sur %s (%.6g, référence %.6g) — pas de repli DexScreener "
+            "pour une décision d'exécution.",
             token_address, quote_address, dex, onchain_price, reference_price_usd,
         )
+        return None
+    if _onchain_price_supported(dex):
+        logger.warning(
+            "Prix on-chain indisponible pour %s/%s sur %s — tentative refusée plutôt que de se fier à un prix "
+            "DexScreener potentiellement périmé.",
+            token_address, quote_address, dex,
+        )
+        return None
     try:
         pairs = dex_sources.fetch_token_pairs(chain_id, token_address)
     except Exception as exc:  # noqa: BLE001
@@ -1304,6 +1531,49 @@ def _refresh_price_usd(chain_id: str, token_address: str, quote_address: str, de
             best_liquidity = liquidity_usd
             best_price = candidate_price
     return best_price
+
+
+def _spread_pct(buy_price: float | None, sell_price: float | None) -> float:
+    """Écart achat→vente en % ; 0 si l'un des prix est inutilisable."""
+    if not buy_price or not sell_price or buy_price <= 0:
+        return 0.0
+    return (sell_price - buy_price) / buy_price * 100
+
+
+def _minimum_spread_pct(signal: dict) -> float:
+    """Écart minimal pour qu'un round-trip couvre au moins les frais des deux DEX."""
+    return fees.dex_fee_pct(signal["buy_dex"]) + fees.dex_fee_pct(signal["sell_dex"])
+
+
+def _pool_fee_pct(w3, dex: str, token_in: str, token_out: str, quote_address: str | None = None) -> float:
+    """Frais de swap (%) de la pool que `_build_swap_call` routera réellement
+    pour `dex` : fee tier réel pour Uniswap V3 et PancakeSwap V3 (résolutions
+    de route déjà cachées, coût RPC marginal), constante par DEX de
+    `fees.dex_fee_pct` sinon (forks V2, Aerodrome). Ne lève jamais : repli sur
+    la constante si la route n'est pas déterminable ici."""
+    try:
+        if dex == "uniswap":
+            return _find_uniswap_v3_fee_tier(w3, token_in, token_out) / 10_000
+        if dex == "pancakeswap":
+            route = _resolve_pancakeswap_route(w3, token_in, token_out, quote_address)
+            if route is not None and route.get("is_v3"):
+                return int(route["fee"]) / 10_000
+    except Exception as exc:  # noqa: BLE001
+        logger.info(
+            "Frais réels de la pool %s %s/%s indisponibles (%s) — constante par DEX utilisée.",
+            dex, token_in, token_out, exc,
+        )
+    return fees.dex_fee_pct(dex)
+
+
+def _min_amount_out_units(expected_out_units: float, *, fee_pct: float, slippage_pct: float) -> int:
+    """`amountOutMinimum` à partir de la sortie attendue AU PRIX SPOT (hors
+    frais) : retire d'abord les frais de la pool, puis la tolérance de
+    slippage. Sans le premier terme, les frais consommaient la tolérance —
+    0,3 % de frais sur 0,5 % tolérés ne laissaient que 0,2 % pour l'impact de
+    prix et la dérive entre simulation et inclusion, et une pool à 1 % de
+    frais revertait systématiquement en « Too little received »."""
+    return max(1, int(expected_out_units * (1 - fee_pct / 100) * (1 - slippage_pct / 100)))
 
 
 def execute_signal(db: Database, config: dict, signal: dict) -> dict:
@@ -1357,8 +1627,16 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
         token_address = signal["token_address"]
         quote_address = signal["quote_address"]
         trade_size_usd = float(signal["trade_size_usd"])
-        slip = slippage_pct() / 100.0
+        risk_slippage_pct = token_slippage_pct(config, token_address, quote_address)
+        slip = (risk_slippage_pct if risk_slippage_pct is not None else slippage_pct()) / 100.0
         deadline = int(time.time()) + 180
+        trade_cap_usd = token_trade_cap(config, token_address, quote_address, trade_size_usd)
+        if trade_size_usd > trade_cap_usd:
+            result["error"] = (
+                f"Taille du signal ({trade_size_usd:.4f}$) supérieure au plafond de cette paire "
+                f"({trade_cap_usd:.4f}$) — refus."
+            )
+            return result
 
         quote_decimals = _get_decimals(w3, quote_address)
         token_decimals = _get_decimals(w3, token_address)
@@ -1371,6 +1649,7 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
         # --- Garde-fou solde réel : ne jamais trader plus que ce qui est dispo ---
         quote_contract = w3.eth.contract(address=Web3.to_checksum_address(quote_address), abi=ERC20_ABI)
         quote_balance_units = _balance_of_with_retry(quote_contract, wallet_address)
+        actual_gas_cost_wei = 0
         amount_in_quote_tokens = trade_size_usd / quote_usd_price
         amount_in_units = int(amount_in_quote_tokens * (10 ** quote_decimals))
         if amount_in_units > quote_balance_units:
@@ -1380,36 +1659,105 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
             )
             return result
 
-        # --- Jambe 1 : achat de token_address avec quote_address sur buy_dex ---
-        expected_token_out = trade_size_usd / signal["buy_price_usd"]
-        min_token_out_units = int(expected_token_out * (1 - slip) * (10 ** token_decimals))
+        if risk_slippage_pct is not None:
+            minimum_depth = quote_depth_floor(
+                config, token_address, quote_address,
+                float(((config or {}).get("trading") or {}).get("min_liquidity_usd", 10_000)),
+            )
+            for dex in (signal["buy_dex"], signal["sell_dex"]):
+                depth = _onchain_quote_depth_usd(dex, token_address, quote_address)
+                if depth is None or depth < minimum_depth:
+                    result["error"] = (
+                        f"Profondeur on-chain BRETT indisponible ou sous {minimum_depth:.2f}$ "
+                        f"sur {dex} — refus avant envoi."
+                    )
+                    return result
 
-        approve_result = _ensure_allowance(
-            db, w3, token_address=quote_address, owner=wallet_address,
-            spender=ROUTER_ADDRESSES[signal["buy_dex"]], amount=amount_in_units,
-        )
-        if approve_result["error"]:
-            result["error"] = f"Approve (jambe achat) échoué : {approve_result['error']}"
+        # --- Revérification du prix d'achat en direct avant la jambe 1 ---
+        # Même principe que la jambe 2 ci-dessous : le prix de détection peut
+        # être périmé (DexScreener cache de quelques secondes à quelques
+        # minutes). On utilise le prix on-chain frais du pool réellement routé
+        # pour dimensionner min_amount_out, sinon la simulation reverte et le
+        # cycle est inutilement mis en cooldown.
+        fresh_buy_price = _refresh_price_usd(signal["chain"], token_address, quote_address,
+                                              signal["buy_dex"], reference_price_usd=signal.get("buy_price_usd"))
+        if fresh_buy_price is None:
+            result["error"] = (
+                "Impossible de revérifier le prix d'achat avant la jambe 1 — "
+                "round-trip interrompu par prudence."
+            )
+            db.mark_arbitrage_signal_executed(signal["id"], execution_error=result["error"])
             return result
 
-        contract_address, abi, fn_name, args = _build_swap_call(
-            signal["buy_dex"], w3, token_in=quote_address, token_out=token_address,
-            amount_in=amount_in_units, min_amount_out=min_token_out_units,
-            recipient=wallet_address, deadline=deadline,
+        # --- Revérification de l'ÉCART avant d'engager le moindre capital ---
+        # Jusqu'ici seul le prix d'achat était rafraîchi avant la jambe 1 ; le
+        # contrôle de l'écart n'intervenait qu'APRÈS l'achat, si bien qu'un
+        # spread DexScreener fictif (ICNT/USDC 08/11/2026 : 4,59 % affiché,
+        # 0,53 % réel) déclenchait quand même un achat, puis une revente de
+        # récupération au cycle suivant — frais + gas perdus pour rien. Ici
+        # aucune transaction n'a encore été envoyée : refus sans capital
+        # engagé (cooldown court côté scheduler).
+        fresh_sell_price = _refresh_price_usd(signal["chain"], token_address, quote_address, signal["sell_dex"],
+                                               reference_price_usd=signal.get("sell_price_usd"))
+        if fresh_sell_price is None:
+            result["error"] = (
+                "Impossible de revérifier le prix de vente avant la jambe 1 — "
+                "round-trip refusé par prudence, aucune transaction envoyée."
+            )
+            return result
+        pre_buy_spread_pct = _spread_pct(fresh_buy_price, fresh_sell_price)
+        min_required_spread_pct = _minimum_spread_pct(signal)
+        if pre_buy_spread_pct < min_required_spread_pct:
+            result["error"] = (
+                f"Écart refermé avant la jambe d'achat ({pre_buy_spread_pct:.3f}% < "
+                f"{min_required_spread_pct:.3f}% de frais minimum) — aucune transaction envoyée."
+            )
+            return result
+
+        # --- Jambe 1 : achat de token_address avec quote_address sur buy_dex ---
+        expected_token_out_units = trade_size_usd / fresh_buy_price * (10 ** token_decimals)
+        min_token_out_units = _min_amount_out_units(
+            expected_token_out_units,
+            fee_pct=_pool_fee_pct(w3, signal["buy_dex"], quote_address, token_address, quote_address),
+            slippage_pct=slip * 100,
         )
+        contract_address, abi, fn_name, args, approve_result = _build_swap_call_and_ensure_allowance(
+            db, w3, dex=signal["buy_dex"], token_in=quote_address, token_out=token_address,
+            amount_in=amount_in_units, min_amount_out=min_token_out_units,
+            recipient=wallet_address, deadline=deadline, quote_address=quote_address,
+            allowance_token_address=quote_address, owner=wallet_address,
+            allowance_amount=amount_in_units,
+        )
+        actual_gas_cost_wei += int(approve_result.get("gas_cost_wei") or 0)
+        if approve_result["error"]:
+            result["error"] = f"Approve (jambe achat) échoué : {approve_result['error']}"
+            if approve_result.get("tx_hash"):
+                db.mark_arbitrage_signal_executed(
+                    signal["id"], execution_error=result["error"],
+                    **_actual_execution_metrics(None, quote_usd_price, actual_gas_cost_wei),
+                )
+            return result
+
+        token_contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
+        token_balance_before_units = _balance_of_with_retry(token_contract, wallet_address)
         buy_result = send_trading_transaction(
             db, rpc_url=_resolve_rpc_url(), contract_address=contract_address, abi=abi,
             function_name=fn_name, args=args, whitelist_target=contract_address,
             action_label=f"arbitrage achat {signal['token_symbol']} sur {signal['buy_dex']}",
         )
         result["tx_hash_buy"] = buy_result["tx_hash"]
+        actual_gas_cost_wei += int(buy_result.get("gas_cost_wei") or 0)
         if buy_result["error"]:
             result["error"] = f"Jambe achat échouée : {buy_result['error']}"
             db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
-                                               execution_error=result["error"])
+                                               execution_error=result["error"],
+                                               **_actual_execution_metrics(
+                                                   0.0 if buy_result.get("gas_cost_wei") is not None else None,
+                                                   quote_usd_price, actual_gas_cost_wei,
+                                               ))
             return result
 
-        # --- Solde réel de token_address reçu (robuste au slippage réel) ---
+        # --- Solde net de token reçu par cet achat, hors inventaire préexistant ---
         # Quelques tentatives avec backoff : certains endpoints RPC publics sont
         # répartis sur plusieurs nœuds qui ne sont pas rigoureusement synchronisés
         # entre eux — lire le solde immédiatement après le receipt de la jambe
@@ -1418,21 +1766,24 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
         # a posteriori via les logs Transfer). Sans cette tolérance, le bot
         # annule la jambe de vente à tort et laisse le wallet exposé au token
         # acheté au lieu de boucler proprement en USDC.
-        token_contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
         token_balance_units = 0
         for attempt in range(4):
-            token_balance_units = _balance_of_with_retry(token_contract, wallet_address)
+            token_balance_after_units = _balance_of_with_retry(token_contract, wallet_address)
+            token_balance_units = _newly_acquired_token_amount(
+                token_balance_before_units, token_balance_after_units,
+            )
             if token_balance_units > 0:
                 break
             if attempt < 3:
                 time.sleep(3)
         if token_balance_units <= 0:
             result["error"] = (
-                "Jambe achat confirmée on-chain mais solde du token reçu toujours nul après "
-                "plusieurs tentatives — anomalie."
+                "Jambe achat confirmée on-chain mais aucun nouveau solde de token attribuable à cet achat "
+                "après plusieurs tentatives — vente annulée pour préserver les tokens déjà détenus."
             )
             db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
-                                               execution_error=result["error"])
+                                               execution_error=result["error"],
+                                               **_actual_execution_metrics(None, quote_usd_price, actual_gas_cost_wei))
             return result
 
         # --- Revérification du prix avant la jambe 2 (mitigation non-atomique) ---
@@ -1446,58 +1797,77 @@ def execute_signal(db: Database, config: dict, signal: dict) -> dict:
                 "par prudence (le token acheté reste dans le wallet, revente manuelle possible)."
             )
             db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
-                                               execution_error=result["error"])
+                                               execution_error=result["error"],
+                                               **_actual_execution_metrics(None, quote_usd_price, actual_gas_cost_wei))
             return result
 
-        fresh_spread_pct = (
-            (fresh_sell_price - fresh_buy_price) / fresh_buy_price * 100 if fresh_buy_price else 0.0
-        )
-        min_required_spread_pct = fees.dex_fee_pct(signal["buy_dex"]) + fees.dex_fee_pct(signal["sell_dex"])
+        fresh_spread_pct = _spread_pct(fresh_buy_price, fresh_sell_price)
+        min_required_spread_pct = _minimum_spread_pct(signal)
         if fresh_spread_pct < min_required_spread_pct:
             result["error"] = (
                 f"Écart refermé avant la 2e jambe ({fresh_spread_pct:.3f}% < {min_required_spread_pct:.3f}% "
                 "de frais minimum) — round-trip interrompu, le token acheté reste dans le wallet."
             )
             db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
-                                               execution_error=result["error"])
+                                               execution_error=result["error"],
+                                               **_actual_execution_metrics(None, quote_usd_price, actual_gas_cost_wei))
             return result
 
         # --- Jambe 2 : vente de token_address contre quote_address sur sell_dex ---
         quote_usd_price_sell = _quote_token_usd_price(quote_address) or quote_usd_price
         expected_quote_out_usd = token_balance_units / (10 ** token_decimals) * fresh_sell_price
         expected_quote_out_tokens = expected_quote_out_usd / quote_usd_price_sell
-        min_quote_out_units = int(expected_quote_out_tokens * (1 - slip) * (10 ** quote_decimals))
-
-        approve_result = _ensure_allowance(
-            db, w3, token_address=token_address, owner=wallet_address,
-            spender=ROUTER_ADDRESSES[signal["sell_dex"]], amount=token_balance_units,
+        min_quote_out_units = _min_amount_out_units(
+            expected_quote_out_tokens * (10 ** quote_decimals),
+            fee_pct=_pool_fee_pct(w3, signal["sell_dex"], token_address, quote_address, quote_address),
+            slippage_pct=slip * 100,
         )
+        contract_address, abi, fn_name, args, approve_result = _build_swap_call_and_ensure_allowance(
+            db, w3, dex=signal["sell_dex"], token_in=token_address, token_out=quote_address,
+            amount_in=token_balance_units, min_amount_out=min_quote_out_units,
+            recipient=wallet_address, deadline=deadline, quote_address=quote_address,
+            allowance_token_address=token_address, owner=wallet_address,
+            allowance_amount=token_balance_units,
+        )
+        actual_gas_cost_wei += int(approve_result.get("gas_cost_wei") or 0)
         if approve_result["error"]:
             result["error"] = f"Approve (jambe vente) échoué : {approve_result['error']}"
             db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
-                                               execution_error=result["error"])
+                                               execution_error=result["error"],
+                                               **_actual_execution_metrics(None, quote_usd_price, actual_gas_cost_wei))
             return result
 
-        contract_address, abi, fn_name, args = _build_swap_call(
-            signal["sell_dex"], w3, token_in=token_address, token_out=quote_address,
-            amount_in=token_balance_units, min_amount_out=min_quote_out_units,
-            recipient=wallet_address, deadline=deadline,
-        )
         sell_result = send_trading_transaction(
             db, rpc_url=_resolve_rpc_url(), contract_address=contract_address, abi=abi,
             function_name=fn_name, args=args, whitelist_target=contract_address,
             action_label=f"arbitrage vente {signal['token_symbol']} sur {signal['sell_dex']}",
         )
         result["tx_hash_sell"] = sell_result["tx_hash"]
+        actual_gas_cost_wei += int(sell_result.get("gas_cost_wei") or 0)
         if sell_result["error"]:
             result["error"] = f"Jambe vente échouée : {sell_result['error']}"
             db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
-                                               tx_hash_sell=result["tx_hash_sell"], execution_error=result["error"])
+                                               tx_hash_sell=result["tx_hash_sell"], execution_error=result["error"],
+                                               **_actual_execution_metrics(
+                                                   None,
+                                                   quote_usd_price, actual_gas_cost_wei,
+                                               ))
             return result
 
         result["executed"] = True
+        profit_units = _net_token_transfer_from_receipts(
+            quote_address, wallet_address,
+            [buy_result.get("receipt"), sell_result.get("receipt")],
+        )
+        profit_quote = profit_units / (10 ** quote_decimals) if profit_units is not None else None
+        if profit_quote is None:
+            logger.warning(
+                "Aucun transfert du token de cotation trouvé dans les reçus de l'arbitrage %s/%s.",
+                signal["token_symbol"], signal["quote_symbol"],
+            )
+        actual_metrics = _actual_execution_metrics(profit_quote, quote_usd_price, actual_gas_cost_wei)
         db.mark_arbitrage_signal_executed(signal["id"], tx_hash_buy=result["tx_hash_buy"],
-                                           tx_hash_sell=result["tx_hash_sell"])
+                                           tx_hash_sell=result["tx_hash_sell"], **actual_metrics)
         db.add_notification(
             title="✅ Round-trip d'arbitrage exécuté",
             message=(
@@ -1527,6 +1897,55 @@ _MIN_RECOVERY_VALUE_USD = 0.50
 # `tx_hash_sell IS NULL` : y laisser NULL ferait réapparaître indéfiniment la
 # même ligne à chaque cycle (elle ne serait jamais exclue).
 _NO_SALE_CLOSED_SENTINEL = "no-sale:balance-zero"
+
+
+def _fetch_receipt(w3, tx_hash: str | None) -> dict | None:
+    """Reçu d'une transaction déjà confirmée (hash persisté sans préfixe 0x)."""
+    if not tx_hash:
+        return None
+    normalized = tx_hash if tx_hash.startswith("0x") else f"0x{tx_hash}"
+    try:
+        return call_with_rate_limit_retry(lambda: w3.eth.get_transaction_receipt(normalized))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Reçu de la transaction %s indisponible : %s", normalized, exc)
+        return None
+
+
+def _recovery_execution_metrics(
+    position: dict, wallet_address: str, buy_receipt: dict | None, sell_receipt: dict | None,
+    quote_decimals: int, quote_usd_price: float | None, recovery_gas_cost_wei: int,
+) -> dict:
+    """P&L réellement imputable à un round-trip clôturé par `recover_open_positions`.
+
+    La vente de récupération écoule TOUT le solde du token (inventaire
+    préexistant compris, ICNT 08/11/2026 : 0,54$ achetés, ~3,28$ revendus) :
+    seule la fraction correspondant aux unités acquises par la jambe d'achat
+    est imputée au signal, au prorata des unités vendues. Sans reçu d'achat
+    exploitable, le P&L reste non mesuré plutôt qu'estimé sur le solde entier
+    (ce qui gonflerait artificiellement le profit)."""
+    buy_gas_cost_wei = position.get("actual_gas_cost_wei")
+    if buy_gas_cost_wei is None and buy_receipt is not None:
+        buy_gas_cost_wei = fees.receipt_total_gas_cost_wei(buy_receipt)
+    total_gas_cost_wei = int(buy_gas_cost_wei or 0) + int(recovery_gas_cost_wei or 0)
+
+    token_address = position["token_address"]
+    quote_address = position["quote_address"]
+    acquired_units = _net_token_transfer_from_receipts(token_address, wallet_address, [buy_receipt])
+    spent_quote_units = _net_token_transfer_from_receipts(quote_address, wallet_address, [buy_receipt])
+    sold_units = _net_token_transfer_from_receipts(token_address, wallet_address, [sell_receipt])
+    received_quote_units = _net_token_transfer_from_receipts(quote_address, wallet_address, [sell_receipt])
+    profit_quote = None
+    if (
+        acquired_units is not None and acquired_units > 0
+        and spent_quote_units is not None
+        and sold_units is not None and sold_units < 0
+        and received_quote_units is not None
+    ):
+        attributable_fraction = min(1.0, acquired_units / -sold_units)
+        # `spent_quote_units` est négatif (le quote a quitté le wallet à l'achat).
+        profit_units = received_quote_units * attributable_fraction + spent_quote_units
+        profit_quote = profit_units / (10 ** quote_decimals)
+    return _actual_execution_metrics(profit_quote, quote_usd_price, total_gas_cost_wei)
 
 
 def recover_open_positions(db: Database, config: dict) -> list[dict]:
@@ -1579,10 +1998,13 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
                 # on referme réellement la ligne (sentinelle non-nulle) pour ne plus la
                 # retenter à chaque cycle — laisser tx_hash_sell=None ne l'aurait pas
                 # exclue de `list_open_positions` (déjà NULL avant cet appel).
+                closure_note = "Position considérée close : solde on-chain nul au moment de la relance."
+                original_error = position.get("execution_error")
                 db.mark_arbitrage_signal_executed(
                     position["id"], tx_hash_buy=position["tx_hash_buy"], tx_hash_sell=_NO_SALE_CLOSED_SENTINEL,
-                    execution_error="Position considérée close : solde on-chain nul au moment de la relance.",
+                    execution_error=f"{original_error} {closure_note}" if original_error else closure_note,
                 )
+                logger.info("Position résiduelle %s (signal #%s) : %s", position["token_symbol"], position["id"], closure_note)
                 continue
 
             token_decimals = _get_decimals(w3, token_address)
@@ -1624,38 +2046,68 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
             slip = slippage_pct() / 100.0
             deadline = int(time.time()) + 180
             last_error = None
+            recovery_gas_cost_wei = 0
+            logger.warning(
+                "Récupération de position résiduelle %s (signal #%s) : ~%.2f$ à revendre, DEX candidats %s.",
+                position["token_symbol"], position["id"], estimated_value_usd,
+                ", ".join(dex for dex, _ in dex_prices),
+            )
             for dex, price in dex_prices:
-                min_quote_out_units = int(
-                    token_balance_units / (10 ** token_decimals) * price / quote_usd_price * (1 - slip) * (10 ** quote_decimals)
+                min_quote_out_units = _min_amount_out_units(
+                    token_balance_units / (10 ** token_decimals) * price / quote_usd_price * (10 ** quote_decimals),
+                    fee_pct=_pool_fee_pct(w3, dex, token_address, quote_address, quote_address),
+                    slippage_pct=slip * 100,
                 )
-
-                approve_result = _ensure_allowance(
-                    db, w3, token_address=token_address, owner=wallet_address,
-                    spender=ROUTER_ADDRESSES[dex], amount=token_balance_units,
+                contract_address, abi, fn_name, args, approve_result = _build_swap_call_and_ensure_allowance(
+                    db, w3, dex=dex, token_in=token_address, token_out=quote_address,
+                    amount_in=token_balance_units, min_amount_out=min_quote_out_units,
+                    recipient=wallet_address, deadline=deadline, quote_address=quote_address,
+                    allowance_token_address=token_address, owner=wallet_address,
+                    allowance_amount=token_balance_units,
                     count_against_daily_limit=False,
                 )
+                recovery_gas_cost_wei += int(approve_result.get("gas_cost_wei") or 0)
                 if approve_result["error"]:
                     last_error = f"Approve échoué sur {dex} : {approve_result['error']}"
+                    logger.warning("Récupération %s : %s", position["token_symbol"], last_error)
                     continue
 
-                contract_address, abi, fn_name, args = _build_swap_call(
-                    dex, w3, token_in=token_address, token_out=quote_address,
-                    amount_in=token_balance_units, min_amount_out=min_quote_out_units,
-                    recipient=wallet_address, deadline=deadline,
-                )
                 sell_result = send_trading_transaction(
                     db, rpc_url=_resolve_rpc_url(), contract_address=contract_address, abi=abi,
                     function_name=fn_name, args=args, whitelist_target=contract_address,
                     action_label=f"récupération position {position['token_symbol']} sur {dex}",
                     count_against_daily_limit=False,
                 )
+                recovery_gas_cost_wei += int(sell_result.get("gas_cost_wei") or 0)
                 if sell_result["error"]:
                     last_error = f"Vente échouée sur {dex} : {sell_result['error']}"
+                    logger.warning("Récupération %s : %s", position["token_symbol"], last_error)
                     continue
 
                 outcome["tx_hash_sell"] = sell_result["tx_hash"]
+                # Le round-trip reste un ÉCHEC (vente de récupération, pas la
+                # 2e jambe prévue) : on conserve la raison d'origine au lieu de
+                # l'écraser — sinon `live_trading_stats` le comptait comme un
+                # arbitrage « completed » et le P&L restait non mesuré.
+                closure_note = f"Position résiduelle revendue sur {dex} (tx {outcome['tx_hash_sell']})."
+                original_error = position.get("execution_error")
+                metrics = _recovery_execution_metrics(
+                    position, wallet_address,
+                    buy_receipt=_fetch_receipt(w3, position.get("tx_hash_buy")),
+                    sell_receipt=sell_result.get("receipt"),
+                    quote_decimals=quote_decimals, quote_usd_price=quote_usd_price,
+                    recovery_gas_cost_wei=recovery_gas_cost_wei,
+                )
                 db.mark_arbitrage_signal_executed(
                     position["id"], tx_hash_buy=position["tx_hash_buy"], tx_hash_sell=outcome["tx_hash_sell"],
+                    execution_error=f"{original_error} {closure_note}" if original_error else closure_note,
+                    **metrics,
+                )
+                realized = metrics.get("realized_pnl_usd")
+                logger.warning(
+                    "Position résiduelle %s revendue sur %s (~%.2f$) — tx %s — P&L imputé au signal #%s : %s.",
+                    position["token_symbol"], dex, estimated_value_usd, outcome["tx_hash_sell"], position["id"],
+                    f"{realized:+.4f}$" if realized is not None else "non mesuré (reçu d'achat indisponible)",
                 )
                 db.add_notification(
                     title="✅ Position résiduelle clôturée",

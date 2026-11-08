@@ -1,0 +1,11 @@
+[Unit]
+Description=Vérifie toutes les 2 min si la branche main du bot a changé
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Unit=bot-self-update.service
+
+[Install]
+WantedBy=timers.target

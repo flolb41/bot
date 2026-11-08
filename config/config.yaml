@@ -7,6 +7,9 @@ logging:
 
 database:
   path: data/reward_hunter.db
+  # Archive avant purge les signaux/observations âgés de plus de 90 jours.
+  # L'historique live, les trades et les notifications non lues sont conservés.
+  retention_days: 90
 
 telegram:
   bot_token: "${TELEGRAM_BOT_TOKEN}"
@@ -20,23 +23,63 @@ scheduler:
   # de 60 req/min. CoinGecko est mis en cache 10 min indépendamment de cette
   # fréquence (pas d'appel supplémentaire).
   #
-  # Abaissé de 3 à 1 min le 08/10, APRÈS avoir corrigé un bug distinct qui
-  # rendait cette valeur sans effet : `run_arbitrage_scan`, `run_triangular_scan`
-  # ET `run_cross_dex_triangular_scan` (tous appelés dans le même cycle, voir
-  # app/scheduler.py::run_arbitrage_scan_job) interrogeaient CHACUN DexScreener
-  # indépendamment pour les MÊMES tokens/whitelist/liquidité (39 appels/cycle,
-  # pas 13), faisant déjà dépasser la durée réelle d'un cycle au-delà de 3 min
-  # — confirmé en production : "maximum number of running instances reached"
-  # sur la quasi-totalité des ticks programmés. Un seul fetch partagé par
-  # cycle (voir app/trading/arbitrage.py::collect_pairs_for_config) règle ce
-  # problème ET justifie de pouvoir descendre à 1 min sans risquer de
-  # surcharger DexScreener ni de faire chevaucher les cycles.
+  # Le raffinement on-chain est maintenant parallélisé (ThreadPoolExecutor,
+  # voir app/trading/arbitrage.py::_SCAN_PARALLEL_WORKERS) : le cycle passe
+  # de 55-65s à ~15-25s sur le RPi3, ce qui permet de revenir à un intervalle
+  # de 1 min sans risquer de sauter des ticks ("maximum number of running
+  # instances"). Un seul fetch DexScreener partagé par cycle (voir
+  # collect_pairs_for_config) évite de surcharger l'API publique.
   arbitrage_scan_interval_minutes: 1
 
 dashboard:
   enabled: true
   host: 0.0.0.0
   port: 8000
+
+# URLs WebSocket Base pour la détection de nouveaux blocs (eth_subscribe newHeads).
+# Utilisées par app.trading.block_ws : scan réactif dès un nouveau bloc, avec
+# l'intervalle scheduler (ci-dessus) comme fallback si le WS est coupé.
+# Endpoints publics gratuits (sans clé API) — ajoutés en rotation automatique.
+rpc:
+  websocket_urls:
+    - "wss://base-rpc.publicnode.com"
+    - "wss://base.blockpi.network/v1/rpc/public"
+
+# Les règles de momentum restent évaluées en paper; la stratégie live
+# directionnelle distincte ci-dessous réutilise ces seuils de signal/sortie.
+paper_research:
+  enabled: true
+  roundtrip_gas_units: 300000
+  liquid_momentum:
+    lookback_minutes: 15
+    max_reference_age_minutes: 20
+    entry_return_pct: 1.0
+    max_entry_return_pct: 5.0
+    take_profit_pct: 2.0
+    stop_loss_pct: 1.5
+    max_hold_minutes: 60
+    stake_usd: 5.0
+    min_liquidity_usd: 100000
+    min_volume_24h_usd: 500000
+  microcap_momentum:
+    lookback_minutes: 15
+    max_reference_age_minutes: 20
+    entry_return_pct: 1.0
+    max_entry_return_pct: 5.0
+    take_profit_pct: 2.0
+    stop_loss_pct: 1.5
+    max_hold_minutes: 60
+    stake_usd: 5.0
+    min_liquidity_usd: 25000
+    min_volume_24h_usd: 100000
+    max_fdv_usd: 50000000
+
+# Trading directionnel Base : une position USDC à la fois, mise plafonnée à 2 $.
+# Le démarrage effectif reste soumis aux garde-fous live de guardrails.py.
+directional_live:
+  enabled: true
+  position_usd: 2
+  daily_loss_limit_usd: 1
 
 # Bot de trading : arbitrage inter-DEX sur Base (demande "microtrades + seuil de
 # rentabilité"). PHASE 2 = EXÉCUTION LIVE ACTIVÉE (décision explicite de
@@ -177,8 +220,58 @@ trading:
     - symbol: wstETH
       address: "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452"
       coingecko_id: superbridge-bridged-wsteth-base
+    - symbol: VVV
+      address: "0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf"
+      coingecko_id: venice-token
+    # cbBTC (Coinbase wrapped Bitcoin) ajouté le 2026-10-21 : BTC wrapped très
+    # liquide sur Base (48k+ supply, ~$8B market cap). Adresse vérifiée via
+    # DEUX sources indépendantes : BaseScan (contrat vérifié) + Coinbase
+    # wrapped assets page + Aave V3 governance (ARFC). Créera des paires
+    # cbBTC/WETH, cbBTC/USDC, etc. sur aerodrome/uniswap/pancakeswap.
+    # Note : retiré précédemment (2026-10-08) pour rentabilité insuffisante,
+    # réintégré à la demande pour élargir la couverture — le scanner décidera
+    # seul si un écart est rentable après coûts.
+    - symbol: cbBTC
+      address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
+      coingecko_id: coinbase-wrapped-btc
+    # cbXRP (Coinbase wrapped XRP) ajouté le 2026-10-21 : XRP wrapped très
+    # liquide sur Base (100k+ supply, ~$110M market cap, 278 pools
+    # DexPaprika). Adresse vérifiée via DEUX sources indépendantes : BaseScan
+    # (contrat vérifié) + Coinbase wrapped assets page + DexPaprika.
+    - symbol: cbXRP
+      address: "0xcb585250f852C6c6bf90434AB21A00f02833a4af"
+      coingecko_id: coinbase-wrapped-xrp
+    # USDbC (USDC Coinbase sur Base) ajouté le 2026-10-21 : stablecoin très
+    # liquide émis par Coinbase, complément naturel à USDC/USDT/DAI pour
+    # l'arbitrage inter-stablecoins (USDbC/USDC, USDbC/USDT, USDbC/WETH...).
+    # Adresse vérifiée via DEUX sources indépendantes : API CoinGecko
+    # (`platforms.base`) + étiquette BaseScan "USD Coin (Coinbase)".
+    - symbol: USDbC
+      address: "0x4d8223658bd43a1f7e36e28f32f2ea5cc4072a32"
+      coingecko_id: usd-coin
   min_liquidity_usd: 10000        # ignore les pools trop fines (risque de prix manipulé/non réaliste)
   max_trade_size_usd: 3           # plafond de secours si le solde réel est illisible (RPC down, etc.)
+  # Exception demandée pour BRETT/WETH et BRETT/USDC uniquement. Les pools
+  # doivent toujours avoir au moins 25$ de profondeur on-chain vérifiée.
+  # La taille reste bornée par liquidity_safety_fraction (2%), le solde,
+  # le profit net et la simulation. Un slippage de 15% expose à des pertes.
+  low_liquidity_token_overrides:
+    brett:
+      address: "0x532f27101965dd16442e59d40670faf5ebb142e4"
+      quote_addresses:
+        - "0x4200000000000000000000000000000000000006"
+        - "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+      min_pool_liquidity_usd: 25
+      min_quote_depth_usd: 25
+      max_trade_size_usd: 2
+      max_slippage_pct: 15
+      flashloan_enabled: true
+  # Favorise modérément BRETT et AERO dans l'ordre des candidats rentables.
+  # Ces facteurs ne changent jamais l'éligibilité, les seuils de profit, le
+  # montant des trades ni les garde-fous de liquidité/slippage.
+  token_priority_multipliers:
+    "0x532f27101965dd16442e59d40670faf5ebb142e4": 1.25
+    "0x940181a94a35a4569e4529a3cdfb74e38fd98631": 1.25
   # Dimensionnement dynamique : taille de trade = cette fraction du solde
   # RÉEL (USDC ou WETH, selon la devise de cotation du signal) du wallet de
   # trading (relu à chaque scan), au lieu d'un montant fixe.
@@ -190,18 +283,40 @@ trading:
   # capital dépasserait ce seuil).
   trade_size_capital_fraction: 0.8
   liquidity_safety_fraction: 0.02 # taille de trade ≤ 2% de la plus petite liquidité des deux pools
+
+  # Fraction du capital quote allouée PAR PAIRE (clé "token_address:quote_address")
+  # qui override `trade_size_capital_fraction` pour cette paire spécifique.
+  # Exemple : BRETT est plus volatil, on alloue moins (0.3) ; cbBTC/cbXRP sont
+  # plus liquides, on peut allouer plus (0.9). Valeur entre 0 et 1.
+  # Si absent pour une paire, `trade_size_capital_fraction` (0.8) s'applique.
+  # Reste toujours borné par `liquidity_safety_fraction` (jamais plus de 2%
+  # de la plus petite liquidité des deux pools).
+  position_size_fraction_per_pair:
+    "0x532f27101965dd16442e59d40670faf5ebb142e4:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 0.3  # BRETT/USDC
+    "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 0.6  # cbBTC/USDC
+    "0xcb585250f852C6c6bf90434AB21A00f02833a4af:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 0.6  # cbXRP/USDC
+
+  # Slippage d'exécution toléré PAR TOKEN (clé "token_address", en %), qui
+  # override `TRADING_SLIPPAGE_PCT` global (0.5%) pour le calcul de la taille
+  # de trade limitée par le slippage (impact prix sur pool peu profonde).
+  # Les tokens plus volatils (BRETT, DEGEN) méritent un slippage toléré plus
+  # élevé pour ne pas rater des trades rentables ; les stablecoins (USDC,
+  # USDT, USDbC, DAI, EURC) et ETH peuvent garder le 0.5% par défaut.
+  slippage_pct_per_token:
+    "0x532f27101965dd16442e59d40670faf5ebb142e4": 2.0   # BRETT : volatilité élevée
+    "0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed": 2.0   # DEGEN : volatilité élevée
+    "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf": 1.0   # cbBTC : modéré
+    "0xcb585250f852C6c6bf90434AB21A00f02833a4af": 1.0   # cbXRP : modéré
   min_spread_pct_to_log: 0.10     # écart minimum pour journaliser un signal (réduit le bruit)
   # Scan triangulaire INFORMATIONNEL inter-DEX (voir
   # app.trading.triangular.run_cross_dex_triangular_scan) : cycles dont les 3
-  # jambes peuvent être sur des DEX différents. JAMAIS exécutable
-  # automatiquement (aucune transaction atomique ne peut router 3 jambes vers
-  # 3 DEX différents sans redéployer FlashArbitrage.sol) — consultable via
+  # jambes peuvent être sur des DEX différents. L'exécution flashloan atomique
+  # est protégée par `cross_dex_flashloan_enabled` — consultable via
   # /api/cross-dex-triangular. Seuil volontairement plus élevé que
   # min_spread_pct_to_log pour ne pas noyer la base avec du bruit non actionnable.
   cross_dex_min_spread_pct_to_log: 0.50
-  # Seuil de rentabilité à 5 $ de capital : un seuil fixe en $ n'a plus de sens
-  # (0,50 $ est inatteignable sur un trade de 3 $). "would_execute" exige à la
-  # fois un plancher absolu minimal ET un profit net relatif à la taille du trade.
+  # Planchers de profit renforcés à partir des résultats observés :
+  # 0.01$ au minimum et 0.5% du notionnel pour les voies classiques et flashloan.
   min_net_profit_usd: 0.01
   min_net_profit_pct: 0.5
 
@@ -232,6 +347,11 @@ trading:
   # swapbased sont éligibles à cette voie (voir
   # app/trading/flashloan.py::FLASHLOAN_CAPABLE_DEXES).
   flashloan_enabled: true
+  # Exécution flashloan des cycles à jambes sur plusieurs DEX. Activée après
+  # validation explicite de l'utilisateur le 2026-11-08.
+  # Le scheduler ne routant que les signaux économiquement rentables après
+  # préfiltre, profondeur on-chain, seuil de gas majoré et simulation atomique.
+  cross_dex_flashloan_enabled: true
   # Plafond du montant notionnel empruntable par flashloan, en $ (indépendant
   # du solde réel du wallet). Le notionnel RÉELLEMENT utilisé est désormais
   # OPTIMISÉ (recherche ternaire sur la fonction de profit, concave en
@@ -255,15 +375,18 @@ trading:
   # sécurité liée à sa liquidité réelle, seul le plafond artificiel qui
   # empêchait d'exploiter pleinement les paires les plus liquides est levé.
   flashloan_notional_usd: 10000
-  # Profit net minimum exigé (frais DEX + prime flashloan Aave ~0,05% +
-  # tampon de slippage + gas déjà déduits) pour tenter un flashloan —
-  # volontairement plus élevé que min_net_profit_usd classique : chaque
-  # tentative, même en cas de revert, coûte du gas réel immédiatement.
-  # Abaissé de 1.0$ à 0.3$ le 08/10, puis à 0.1$ le 08/10 (même jour) : le gas
-  # Base est bon marché (quelques centimes) et un revert ne touche jamais au
-  # capital emprunté (atomique), donc un seuil plus bas capture des
-  # opportunités réelles (ex. BRETT/WETH ~0.1-0.5$ net) sans risque de perte
-  # de capital, juste plus de tentatives (et donc plus de gas cumulé en cas
-  # de reverts répétés si le marché bouge entre détection et exécution).
-  flashloan_min_net_profit_usd: 0.1
+  # Même plancher pour les flashloans, après frais DEX, prime Aave, slippage
+  # et gas estimés. La simulation on-chain et le contrôle de
+  # profit minimum du contrat restent obligatoires ; un revert live coûte
+  # tout de même du gas.
+  flashloan_min_net_profit_usd: 0.25
 
+# Surveillance santé du Pi (température + alimentation) pour éviter le gel nocturne.
+# Vérifié périodiquement par une tâche scheduler indépendante du scan
+# arbitrage. Si un seuil est franchi, le killswitch est activé et le bot
+# s'arrête proprement jusqu'à refroidissement/réparation du Pi.
+system_health:
+  enabled: true
+  check_interval_seconds: 60      # vérification toutes les 60s
+  max_temperature_celsius: 80.0   # arrêt si CPU > 80°C
+  max_memory_percent: 90.0        # arrêt si RAM > 90% (risque OOM sur Pi3 1Go)

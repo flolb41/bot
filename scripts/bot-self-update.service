@@ -1,0 +1,13 @@
+[Unit]
+Description=Mise à jour automatique du bot depuis GitHub (branche main)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/bot
+ExecStart=%h/bot/scripts/self_update.sh
+Nice=10
+# Une mise à jour complète (pip + redémarrage + health check) reste bien en
+# dessous ; au-delà, quelque chose est bloqué et le verrou doit être libéré.
+TimeoutStartSec=20min

@@ -17,15 +17,70 @@ GARDE-FOUS DE PHASE (lire avant de modifier) :
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
 
 from app.database import Database
 from app.trading import dex_sources, fees
-from app.trading.flashloan import estimate_pair_signal_flashloan_preview, flashloan_min_net_profit_usd
+from app.trading.flashloan import (
+    _amm_price_impact_pct,
+    estimate_pair_signal_flashloan_preview,
+    flashloan_min_net_profit_usd,
+)
 from app.trading.pair_health import pair_health
+from app.trading.executor import EXECUTABLE_QUOTE_TOKENS
+from app.trading.routers import EXECUTABLE_DEXES
+from app.trading.token_risk import (
+    notional_under_slippage,
+    pool_liquidity_floor,
+    position_size_fraction,
+    quote_depth_floor,
+    token_slippage_pct,
+    token_slippage_pct_global,
+    token_trade_cap,
+)
 from app.wallet.pricing import get_price_usd
 
 logger = logging.getLogger(__name__)
+
+# Nombre de workers pour le raffinement on-chain en parallèle (chaque signal
+# déclenche 3 à 5 appels RPC : prix buy/sell, profondeur buy/sell, pool V2).
+# Le Pi3 tient ~8 workers sans saturer le CPU ; le goulot d'étranglement est
+# le réseau/RPC, pas le CPU.
+_SCAN_PARALLEL_WORKERS = 8
+
+# Pools écartées pour profondeur on-chain insuffisante : mémorisées `TTL`
+# secondes pour (1) ne pas relire leur réserve à chaque scan (appels RPC
+# inutiles, la liquidité d'une pool quasi vide ne réapparaît pas en quelques
+# minutes) et (2) n'émettre qu'UN avertissement par fenêtre au lieu d'un par
+# scan — la pool Uniswap BRETT/USDC (≈3$ de profondeur) produisait ~95
+# warnings identiques par heure le 08/11/2026.
+_SHALLOW_POOL_TTL_SECONDS = 600.0
+_shallow_pool_rejections: dict[tuple[str, str, str], tuple[float, float]] = {}
+
+
+def _shallow_pool_key(dex: str, token_address: str, quote_address: str) -> tuple[str, str, str]:
+    return (dex, token_address.lower(), quote_address.lower())
+
+
+def _recent_shallow_pool_depth(dex: str, token_address: str, quote_address: str) -> float | None:
+    """Profondeur mesurée lors d'un rejet récent de cette pool, ou None si
+    aucun rejet n'est en cours de validité."""
+    entry = _shallow_pool_rejections.get(_shallow_pool_key(dex, token_address, quote_address))
+    if entry is None:
+        return None
+    expires_at, depth_usd = entry
+    if time.monotonic() > expires_at:
+        _shallow_pool_rejections.pop(_shallow_pool_key(dex, token_address, quote_address), None)
+        return None
+    return depth_usd
+
+
+def _remember_shallow_pool(dex: str, token_address: str, quote_address: str, depth_usd: float) -> None:
+    _shallow_pool_rejections[_shallow_pool_key(dex, token_address, quote_address)] = (
+        time.monotonic() + _SHALLOW_POOL_TTL_SECONDS, depth_usd,
+    )
 
 _DEFAULT_SEED_TOKENS = [
     {"symbol": "WETH", "address": "0x4200000000000000000000000000000000000006", "coingecko_id": "ethereum"},
@@ -57,6 +112,16 @@ def _normalize_pair(raw: dict, chain_id: str) -> dict | None:
         liquidity_usd = float(liquidity_usd) if liquidity_usd is not None else None
     except (TypeError, ValueError):
         liquidity_usd = None
+    volume = raw.get("volume") or {}
+    try:
+        volume_24h_usd = float(volume.get("h24") or 0)
+    except (TypeError, ValueError):
+        volume_24h_usd = 0.0
+    fdv_value = raw.get("fdv", raw.get("marketCap"))
+    try:
+        fdv_usd = float(fdv_value) if fdv_value is not None else None
+    except (TypeError, ValueError):
+        fdv_usd = None
 
     return {
         "dex_id": (raw.get("dexId") or "").lower(),
@@ -68,6 +133,8 @@ def _normalize_pair(raw: dict, chain_id: str) -> dict | None:
         "price_usd_base": price_usd,
         "price_native": price_native,
         "liquidity_usd": liquidity_usd,
+        "volume_24h_usd": volume_24h_usd,
+        "fdv_usd": fdv_usd,
     }
 
 
@@ -83,7 +150,7 @@ def _token_usd_price(pair: dict, token_address: str) -> float | None:
 
 
 def _collect_pairs(chain_id: str, seed_tokens: list[dict], dex_whitelist: set[str],
-                    min_liquidity_usd: float) -> dict[str, list[dict]]:
+                    min_liquidity_usd: float, config: dict | None = None) -> dict[str, list[dict]]:
     """Récupère et regroupe les pools par paire canonique (couple d'adresses
     triées), tous DEX whitelistés confondus, pour chaque token "seed".
 
@@ -98,9 +165,14 @@ def _collect_pairs(chain_id: str, seed_tokens: list[dict], dex_whitelist: set[st
     dimensionné (prix, min_amount_out) sur un pool minoritaire/obsolète alors
     que l'exécution réelle passe par un AUTRE pool du même DEX au prix
     différent — cause confirmée des échecs `InsufficientOutputAmount` observés
-    en conditions réelles sur AERO/aerodrome. Heuristique : le pool légitime et
+    en conditions réelles sur AERO/aerodrome.     Heuristique : le pool légitime et
     réellement routable est quasi toujours celui de plus grande liquidité pour
     ce couple de tokens sur ce DEX ; on ne garde que celui-là."""
+    # On ne scanne QUE les paires dont le quote est exécutable (USDC/WETH) :
+    # un round-trip part et termine dans l'un de ces deux tokens. Les autres
+    # tokens de la config ne servent que de contre-valeur volatile côté base
+    # de la paire (ex: VIRTUAL/USDC), jamais de quote.
+    seed_tokens = [s for s in seed_tokens if (s.get("address") or "").lower() in EXECUTABLE_QUOTE_TOKENS]
     groups: dict[str, list[dict]] = {}
     for seed in seed_tokens:
         raw_pairs = dex_sources.fetch_token_pairs(chain_id, seed["address"])
@@ -110,7 +182,10 @@ def _collect_pairs(chain_id: str, seed_tokens: list[dict], dex_whitelist: set[st
                 continue
             if pair["dex_id"] not in dex_whitelist:
                 continue
-            if pair["liquidity_usd"] is None or pair["liquidity_usd"] < min_liquidity_usd:
+            pair_liquidity_floor = pool_liquidity_floor(
+                config or {}, pair["base_address"], pair["quote_address"], min_liquidity_usd,
+            )
+            if pair["liquidity_usd"] is None or pair["liquidity_usd"] < pair_liquidity_floor:
                 continue
             key = "_".join(sorted([pair["base_address"], pair["quote_address"]]))
             groups.setdefault(key, []).append(pair)
@@ -156,7 +231,8 @@ def _best_spread(pairs: list[dict], token_address: str) -> dict | None:
 
 
 def _refine_spread_with_onchain_price(spread: dict, token_address: str, quote_address: str,
-                                      min_quote_depth_usd: float | None = None) -> dict:
+                                      min_quote_depth_usd: float | None = None,
+                                      require_known_depth: bool = False) -> dict:
     """Affine `spread` (prix DexScreener, potentiellement périmés de quelques
     secondes à quelques minutes pour une paire peu liquide) avec le prix
     on-chain RÉEL de chaque pool concernée — la MÊME lecture que celle faite
@@ -223,20 +299,47 @@ def _refine_spread_with_onchain_price(spread: dict, token_address: str, quote_ad
                 refined["spread_pct"] = 0.0
                 return refined
 
+    quote_depths: dict[str, float | None] = {}
     if min_quote_depth_usd is not None and min_quote_depth_usd > 0:
         for dex_side in ("buy_dex", "sell_dex"):
             dex = spread[dex_side]
+            recent_depth_usd = _recent_shallow_pool_depth(dex, token_address, quote_address)
+            if recent_depth_usd is not None and recent_depth_usd < min_quote_depth_usd:
+                logger.debug(
+                    "Signal écarté : pool %s pour %s/%s déjà jugée trop peu profonde (≈%.0f$ < %.0f$) "
+                    "il y a moins de %.0f min (%s).",
+                    dex, token_address, quote_address, recent_depth_usd, min_quote_depth_usd,
+                    _SHALLOW_POOL_TTL_SECONDS / 60, dex_side,
+                )
+                refined = dict(spread)
+                refined["spread_pct"] = 0.0
+                return refined
             depth_usd = _onchain_quote_depth_usd(dex, token_address, quote_address)
+            quote_depths[dex_side] = depth_usd
+            if require_known_depth and depth_usd is None:
+                logger.warning(
+                    "Signal BRETT écarté : profondeur on-chain indisponible pour %s/%s sur %s.",
+                    token_address, quote_address, dex,
+                )
+                refined = dict(spread)
+                refined["spread_pct"] = 0.0
+                return refined
             if depth_usd is not None and depth_usd < min_quote_depth_usd:
+                _remember_shallow_pool(dex, token_address, quote_address, depth_usd)
                 logger.warning(
                     "Signal écarté : pool %s réellement routée pour %s/%s trop peu profonde on-chain "
-                    "(≈%.0f$ côté quote < %.0f$ requis) — liquidité DexScreener non exploitable (%s).",
+                    "(≈%.0f$ côté quote < %.0f$ requis) — liquidité DexScreener non exploitable (%s) ; "
+                    "pool ignorée pendant %.0f min.",
                     dex, token_address, quote_address, depth_usd, min_quote_depth_usd, dex_side,
+                    _SHALLOW_POOL_TTL_SECONDS / 60,
                 )
                 refined = dict(spread)
                 refined["spread_pct"] = 0.0
                 return refined
 
+    spread = dict(spread)
+    spread["buy_quote_depth_usd"] = quote_depths.get("buy_dex")
+    spread["sell_quote_depth_usd"] = quote_depths.get("sell_dex")
     buy_price = _onchain_pool_price_usd(spread["buy_dex"], token_address, quote_address)
     sell_price = _onchain_pool_price_usd(spread["sell_dex"], token_address, quote_address)
     # Garde-fou de plausibilité (voir `_onchain_price_is_plausible`) : écarte
@@ -266,6 +369,8 @@ def _refine_spread_with_onchain_price(spread: dict, token_address: str, quote_ad
     refined = dict(spread)
     refined["buy_price_usd"] = buy_price
     refined["sell_price_usd"] = sell_price
+    refined["buy_quote_depth_usd"] = quote_depths.get("buy_dex")
+    refined["sell_quote_depth_usd"] = quote_depths.get("sell_dex")
     refined["spread_pct"] = (sell_price - buy_price) / buy_price * 100
     return refined
 
@@ -290,6 +395,14 @@ def _profitability(spread: dict, trade_size_usd: float, slippage_buffer_pct: flo
         "net_profit_usd": net_profit_usd,
         "would_execute": would_execute,  # décidé par l'appelant (seuil configurable)
     }
+
+
+def _is_classic_pair_route_executable(signal: dict) -> bool:
+    return (
+        signal.get("buy_dex") in EXECUTABLE_DEXES
+        and signal.get("sell_dex") in EXECUTABLE_DEXES
+        and (signal.get("quote_address") or "").lower() in EXECUTABLE_QUOTE_TOKENS
+    )
 
 
 def collect_pairs_for_config(config: dict | None = None) -> dict[str, list[dict]]:
@@ -317,7 +430,7 @@ def collect_pairs_for_config(config: dict | None = None) -> dict[str, list[dict]
     dex_whitelist = set(trading_cfg.get("dex_whitelist") or _DEFAULT_DEX_WHITELIST)
     seed_tokens = trading_cfg.get("seed_tokens") or _DEFAULT_SEED_TOKENS
     min_liquidity_usd = float(trading_cfg.get("min_liquidity_usd", 10_000))
-    return _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd)
+    return _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd, config)
 
 
 def run_arbitrage_scan(
@@ -339,7 +452,7 @@ def run_arbitrage_scan(
     max_trade_size_usd = float(trading_cfg.get("max_trade_size_usd", 200))
     liquidity_safety_fraction = float(trading_cfg.get("liquidity_safety_fraction", 0.02))
     min_spread_pct_to_log = float(trading_cfg.get("min_spread_pct_to_log", 0.10))
-    min_net_profit_usd = float(trading_cfg.get("min_net_profit_usd", 0.50))
+    min_net_profit_usd = float(trading_cfg.get("min_net_profit_usd", 0.0))
     min_net_profit_pct = float(trading_cfg.get("min_net_profit_pct", 0.0))
 
     # Dimensionnement dynamique optionnel : au lieu d'une taille de trade fixe
@@ -365,7 +478,7 @@ def run_arbitrage_scan(
             logger.warning("Dimensionnement dynamique : échec lecture des soldes réels, repli sur max_trade_size_usd : %s", exc)
 
     if groups is None:
-        groups = _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd)
+        groups = _collect_pairs(chain_id, seed_tokens, dex_whitelist, min_liquidity_usd, config)
     if not groups:
         logger.info("Arbitrage scan : aucune pool éligible trouvée (liquidité/DEX whitelist).")
         return []
@@ -379,126 +492,202 @@ def run_arbitrage_scan(
         )
 
     signals: list[dict] = []
+
+    # Pré-calcule tous les candidats (paire canonique × sens du token) avant le
+    # raffinement on-chain, qui est la partie RPC-intensive et parallélisable.
+    candidates: list[tuple] = []
     for pair_key, pairs in groups.items():
         token_a, token_b = pair_key.split("_")
         for token_address in (token_a, token_b):
             spread = _best_spread(pairs, token_address)
             if spread is None or spread["spread_pct"] < min_spread_pct_to_log:
                 continue
-
             other_address = token_b if token_address == token_a else token_a
-            # Affinage on-chain réservé aux candidats qui dépassent DÉJÀ le
-            # seuil DexScreener ci-dessus (pas tous les pools scannés) — limite
-            # le coût RPC ajouté à ~2 appels par signal potentiellement
-            # rentable, pas par pool. Un signal dont l'écart s'évapore une fois
-            # vérifié on-chain est reclassé immédiatement (voir docstring de
-            # `_refine_spread_with_onchain_price`).
-            spread = _refine_spread_with_onchain_price(
-                spread, token_address, other_address,
-                # Côté quote d'une pool V2 de `min_liquidity_usd` ≈ la moitié ;
-                # même exigence appliquée à la profondeur RÉELLE on-chain.
-                min_quote_depth_usd=min_liquidity_usd / 2,
-            )
-            if spread["spread_pct"] < min_spread_pct_to_log:
-                continue
+            candidates.append((pair_key, pairs, token_address, other_address, spread))
 
-            quote_balance_usd = quote_capital_balances_usd.get(other_address.lower())
-            trade_size_cap_usd = (
-                trade_size_capital_fraction * quote_balance_usd
-                if trade_size_capital_fraction > 0 and quote_balance_usd is not None
-                else max_trade_size_usd
-            )
-            trade_size_usd = min(
-                trade_size_cap_usd,
-                liquidity_safety_fraction * min(spread["buy_liquidity_usd"], spread["sell_liquidity_usd"]),
-            )
-            if trade_size_usd <= 0:
-                continue
-
-            profit = _profitability(
-                spread, trade_size_usd,
-                slippage_buffer_pct=fees.DEFAULT_SLIPPAGE_BUFFER_PCT,
-                gas_cost_usd=gas_cost_usd,
-            )
-
-            # Symboles indicatifs (le même token peut apparaître avec des libellés
-            # légèrement différents selon la pool ; on prend le premier trouvé).
+    def _process_one(candidate) -> dict | None:
+        """Traite un candidat (raffinement on-chain, profit, flashloan) et
+        retourne un signal dict sans `id` (écriture DB séquentielle après)."""
+        pair_key, pairs, token_address, other_address, spread = candidate
+        # Le quote token doit être exécutable : un round-trip
+        # démarre et se termine dans le quote. Les paires avec un quote exotique
+        # (TOSHI, AERO…) ne peuvent pas être exécutées et ne servent
+        # qu'à générer des faux positifs et des appels RPC inutiles.
+        if other_address.lower() not in EXECUTABLE_QUOTE_TOKENS:
             token_symbol = next((p["base_symbol"] for p in pairs if p["base_address"] == token_address),
                                  next((p["quote_symbol"] for p in pairs if p["quote_address"] == token_address), "?"))
             other_symbol = next((p["base_symbol"] for p in pairs if p["base_address"] == other_address),
                                  next((p["quote_symbol"] for p in pairs if p["quote_address"] == other_address), "?"))
+            db.record_missed_opportunity({
+                "chain": chain_id, "token_symbol": token_symbol, "token_address": token_address,
+                "quote_symbol": other_symbol, "quote_address": other_address,
+                "buy_dex": "", "sell_dex": "", "spread_pct": spread["spread_pct"],
+                "trade_size_usd": 0.0, "net_profit_usd": None,
+                "reason": "quote_non_executable",
+            })
+            return None
+        # Raffinement on-chain (appels RPC, parallèle entre candidats).
+        minimum_quote_depth_usd = quote_depth_floor(
+            config or {}, token_address, other_address, min_liquidity_usd,
+        )
+        max_slippage_pct = token_slippage_pct(config or {}, token_address, other_address)
+        if max_slippage_pct is None:
+            # Fallback : slippage par token (config global par token, pas par paire)
+            max_slippage_pct = token_slippage_pct_global(config or {}, token_address)
+        if max_slippage_pct is None:
+            max_slippage_pct = token_slippage_pct_global(config or {}, other_address)
+        spread = _refine_spread_with_onchain_price(
+            spread, token_address, other_address,
+            min_quote_depth_usd=minimum_quote_depth_usd,
+            require_known_depth=max_slippage_pct is not None,
+        )
+        if spread["spread_pct"] < min_spread_pct_to_log:
+            token_symbol = next((p["base_symbol"] for p in pairs if p["base_address"] == token_address),
+                                 next((p["quote_symbol"] for p in pairs if p["quote_address"] == token_address), "?"))
+            other_symbol = next((p["base_symbol"] for p in pairs if p["base_address"] == other_address),
+                                 next((p["quote_symbol"] for p in pairs if p["quote_address"] == other_address), "?"))
+            db.record_missed_opportunity({
+                "chain": chain_id, "token_symbol": token_symbol, "token_address": token_address,
+                "quote_symbol": other_symbol, "quote_address": other_address,
+                "buy_dex": spread["buy_dex"], "sell_dex": spread["sell_dex"],
+                "spread_pct": spread["spread_pct"], "trade_size_usd": 0.0, "net_profit_usd": None,
+                "reason": "spread_below_log_threshold",
+            })
+            return None
 
-            # Historique d'exécution réelle de cette paire précise (buy_dex/sell_dex) :
-            # seuil de profit relevé si échecs récents fréquents, exclusion
-            # temporaire après une série d'échecs consécutifs — voir
-            # `app.trading.pair_health`.
-            health = pair_health(
-                db, config or {}, token_symbol=token_symbol,
-                buy_dex=spread["buy_dex"], sell_dex=spread["sell_dex"],
-            )
-            adaptive_min_net_profit_usd = min_net_profit_usd * health["threshold_multiplier"]
-            would_execute_classic = (
-                not health["disabled"]
-                and profit["net_profit_usd"] is not None
-                and profit["net_profit_usd"]
-                >= max(adaptive_min_net_profit_usd, trade_size_usd * min_net_profit_pct / 100)
-            )
-            if health["disabled"]:
-                logger.info("Arbitrage scan : %s", health["disabled_reason"])
+        quote_balance_usd = quote_capital_balances_usd.get(other_address.lower())
+        # Fraction de capital allouée à cette paire spécifique (override de
+        # trade_size_capital_fraction global) : BRETT/USDC → 0.3, cbBTC/USDC → 0.6, etc.
+        pair_fraction = position_size_fraction(
+            config or {}, token_address, other_address,
+            default_fraction=trade_size_capital_fraction,
+        )
+        trade_size_cap_usd = (
+            pair_fraction * quote_balance_usd
+            if pair_fraction > 0 and quote_balance_usd is not None
+            else max_trade_size_usd
+        )
+        trade_size_cap_usd = token_trade_cap(
+            config or {}, token_address, other_address, trade_size_cap_usd,
+        )
+        trade_size_usd = min(
+            trade_size_cap_usd,
+            liquidity_safety_fraction * min(spread["buy_liquidity_usd"], spread["sell_liquidity_usd"]),
+        )
+        if max_slippage_pct is not None:
+            for side in ("buy_quote_depth_usd", "sell_quote_depth_usd"):
+                quote_depth = spread.get(side)
+                if quote_depth is None:
+                    trade_size_usd = 0.0
+                    break
+                slippage_limited_size = notional_under_slippage(quote_depth, max_slippage_pct)
+                trade_size_usd = min(trade_size_usd, slippage_limited_size)
+        if trade_size_usd <= 0:
+            token_symbol = next((p["base_symbol"] for p in pairs if p["base_address"] == token_address),
+                                 next((p["quote_symbol"] for p in pairs if p["quote_address"] == token_address), "?"))
+            other_symbol = next((p["base_symbol"] for p in pairs if p["base_address"] == other_address),
+                                 next((p["quote_symbol"] for p in pairs if p["quote_address"] == other_address), "?"))
+            db.record_missed_opportunity({
+                "chain": chain_id, "token_symbol": token_symbol, "token_address": token_address,
+                "quote_symbol": other_symbol, "quote_address": other_address,
+                "buy_dex": spread["buy_dex"], "sell_dex": spread["sell_dex"],
+                "spread_pct": spread["spread_pct"], "trade_size_usd": trade_size_usd, "net_profit_usd": None,
+                "reason": "trade_size_zero_or_negative",
+            })
+            return None
 
-            signal = {
-                "chain": chain_id,
-                "token_symbol": token_symbol,
-                "token_address": token_address,
-                "quote_symbol": other_symbol,
-                "quote_address": other_address,
+        profit = _profitability(
+            spread, trade_size_usd,
+            slippage_buffer_pct=max(
+                fees.DEFAULT_SLIPPAGE_BUFFER_PCT,
+                (
+                    _amm_price_impact_pct(trade_size_usd, spread["buy_quote_depth_usd"])
+                    + _amm_price_impact_pct(trade_size_usd, spread["sell_quote_depth_usd"])
+                ) if max_slippage_pct is not None else 0.0,
+            ),
+            gas_cost_usd=gas_cost_usd,
+        )
+
+        token_symbol = next((p["base_symbol"] for p in pairs if p["base_address"] == token_address),
+                             next((p["quote_symbol"] for p in pairs if p["quote_address"] == token_address), "?"))
+        other_symbol = next((p["base_symbol"] for p in pairs if p["base_address"] == other_address),
+                             next((p["quote_symbol"] for p in pairs if p["quote_address"] == other_address), "?"))
+
+        health = pair_health(
+            db, config or {}, token_symbol=token_symbol,
+            buy_dex=spread["buy_dex"], sell_dex=spread["sell_dex"],
+        )
+        adaptive_min_net_profit_usd = min_net_profit_usd * health["threshold_multiplier"]
+        would_execute_classic = (
+            not health["disabled"]
+            and _is_classic_pair_route_executable({
                 "buy_dex": spread["buy_dex"],
-                "buy_price_usd": spread["buy_price_usd"],
-                "buy_liquidity_usd": spread["buy_liquidity_usd"],
                 "sell_dex": spread["sell_dex"],
-                "sell_price_usd": spread["sell_price_usd"],
-                "sell_liquidity_usd": spread["sell_liquidity_usd"],
-                "spread_pct": spread["spread_pct"],
-                "trade_size_usd": trade_size_usd,
-                "gross_profit_usd": profit["gross_profit_usd"],
-                "fees_usd": profit["fees_usd"],
-                "slippage_buffer_usd": profit["slippage_buffer_usd"],
-                "gas_cost_usd": profit["gas_cost_usd"],
-                "net_profit_usd": profit["net_profit_usd"],
-                # Phase 1 : simulation uniquement, aucun moteur d'exécution live
-                # n'existe dans ce commit — voir garde-fous en tête de fichier.
-                "mode": "simulation",
-                "executed": False,
-            }
-            # Aperçu du profit à l'échelle flashloan (notionnel bien plus grand
-            # que `trade_size_usd` ci-dessus, borné par la liquidité et non par
-            # le solde du wallet) — `None` si le signal n'est pas éligible
-            # flashloan ou si le gas est indisponible, voir
-            # `app.trading.flashloan.estimate_pair_signal_flashloan_preview`.
-            # Calculé AVANT `would_execute` ci-dessous : un signal peut être non
-            # rentable au micro-capital du wallet (quelques dollars, dominé par
-            # le gas) mais tout de même rentable à l'échelle flashloan — sans
-            # ce calcul préalable, le flashloan n'était jamais tenté car
-            # `would_execute` ne considérait que `would_execute_classic`.
-            flashloan_preview = estimate_pair_signal_flashloan_preview(config or {}, signal)
-            would_execute_flashloan = (
-                not health["disabled"]
-                and flashloan_preview is not None
-                and flashloan_preview["net_profit_usd"] >= flashloan_min_net_profit_usd(config or {})
+                "quote_address": other_address,
+            })
+            and fees.is_net_profit_above_threshold(
+                profit["net_profit_usd"],
+                max(adaptive_min_net_profit_usd, trade_size_usd * min_net_profit_pct / 100),
             )
-            signal["would_execute"] = would_execute_classic or would_execute_flashloan
-            # Champs distincts (non persistés en base, consommés uniquement par
-            # `app.scheduler` pour router vers la bonne voie d'exécution — voir
-            # commentaire ci-dessus) : un signal rentable UNIQUEMENT via
-            # flashloan ne doit jamais être exécuté via la voie classique
-            # (capital propre), qui utiliserait sinon `trade_size_usd` alors
-            # que ce microtrade précis n'est pas rentable à cette échelle.
-            signal["would_execute_classic"] = would_execute_classic
-            signal["would_execute_flashloan"] = would_execute_flashloan
-            signal["flashloan_notional_usd"] = flashloan_preview["notional_usd"] if flashloan_preview else None
-            signal["flashloan_net_profit_usd"] = flashloan_preview["net_profit_usd"] if flashloan_preview else None
-            signal["id"] = db.add_arbitrage_signal(signal)
-            signals.append(signal)
+        )
+        if health["disabled"]:
+            logger.info("Arbitrage scan : %s", health["disabled_reason"])
+
+        signal = {
+            "chain": chain_id,
+            "token_symbol": token_symbol,
+            "token_address": token_address,
+            "quote_symbol": other_symbol,
+            "quote_address": other_address,
+            "buy_dex": spread["buy_dex"],
+            "buy_price_usd": spread["buy_price_usd"],
+            "buy_liquidity_usd": spread["buy_liquidity_usd"],
+            "sell_dex": spread["sell_dex"],
+            "sell_price_usd": spread["sell_price_usd"],
+            "sell_liquidity_usd": spread["sell_liquidity_usd"],
+            "spread_pct": spread["spread_pct"],
+            "trade_size_usd": trade_size_usd,
+            "gross_profit_usd": profit["gross_profit_usd"],
+            "fees_usd": profit["fees_usd"],
+            "slippage_buffer_usd": profit["slippage_buffer_usd"],
+            "gas_cost_usd": profit["gas_cost_usd"],
+            "net_profit_usd": profit["net_profit_usd"],
+            "mode": "simulation",
+            "executed": False,
+        }
+
+        flashloan_preview = estimate_pair_signal_flashloan_preview(config or {}, signal)
+        would_execute_flashloan = (
+            not health["disabled"]
+            and flashloan_preview is not None
+            and fees.is_net_profit_above_threshold(
+                flashloan_preview["net_profit_usd"],
+                flashloan_min_net_profit_usd(
+                    config or {}, flashloan_preview["notional_usd"],
+                ),
+            )
+        )
+        signal["would_execute"] = would_execute_classic or would_execute_flashloan
+        signal["would_execute_classic"] = would_execute_classic
+        signal["would_execute_flashloan"] = would_execute_flashloan
+        signal["flashloan_notional_usd"] = flashloan_preview["notional_usd"] if flashloan_preview else None
+        signal["flashloan_net_profit_usd"] = flashloan_preview["net_profit_usd"] if flashloan_preview else None
+        return signal
+
+    # Le raffinement on-chain fait 3 à 5 appels RPC par candidat ; on le
+    # parallélise sur un pool de threads (goulot réseau, pas CPU). Les
+    # écritures DB restent séquentielles après (SQLite n'est pas thread-safe
+    # en écriture).
+    if candidates:
+        with ThreadPoolExecutor(max_workers=_SCAN_PARALLEL_WORKERS) as pool:
+            futures = {pool.submit(_process_one, c): c for c in candidates}
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    signals.append(result)
+
+    for signal in signals:
+        signal["id"] = db.add_arbitrage_signal(signal)
 
     logger.info("Arbitrage scan terminé : %d signal(aux) détecté(s), %d rentable(s) après coûts.",
                 len(signals), sum(1 for s in signals if s["would_execute"]))

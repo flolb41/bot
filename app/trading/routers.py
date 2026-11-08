@@ -58,6 +58,13 @@ EXECUTABLE_DEXES = frozenset({
     "uniswap", "aerodrome", "sushiswap", "pancakeswap", "baseswap", "alien-base", "swapbased",
 })
 
+# The wallet-funded triangular executor uses one UniswapV2-compatible router
+# for all three legs. Exclude DEXes whose resolver may select concentrated
+# liquidity or a different Aerodrome pool than the scanner's quote.
+TRIANGULAR_V2_EXECUTABLE_DEXES = frozenset({
+    "sushiswap", "baseswap", "alien-base", "swapbased",
+})
+
 ROUTER_ADDRESSES: dict[str, str] = {
     "uniswap": "0x2626664c2603336E57B271c5C0b26F421741e481",     # SwapRouter02
     "aerodrome": "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43",    # Router.sol
@@ -97,6 +104,13 @@ AERODROME_SLIPSTREAM_FACTORIES: tuple[tuple[str, str, str], ...] = (
     ("gauge_caps", "0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a", "0xcbBb8035cAc7D4B3Ca7aBb74cF7BdF900215Ce0D"),
     ("gauges_v3", "0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef", "0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F"),
 )
+
+# Fixed allowlist for all routers the swap builder can select. The V3-style
+# routers are distinct from the classic DEX routers in ROUTER_ADDRESSES.
+TRADING_ROUTER_ADDRESSES = frozenset(ROUTER_ADDRESSES.values()) | {
+    PANCAKESWAP_V3_ROUTER_ADDRESS,
+    *(router for _, _, router in AERODROME_SLIPSTREAM_FACTORIES),
+}
 
 # Contrat `FlashArbitrage` (arbitrage financé par flashloan Aave V3, voir
 # contracts/FlashArbitrage.sol et contracts/README.md) déployé RÉELLEMENT sur
@@ -206,6 +220,15 @@ UNISWAP_V2_ROUTER_ABI = [
         "outputs": [{"name": "amounts", "type": "uint256[]"}],
         "stateMutability": "nonpayable", "type": "function",
     },
+    {
+        "inputs": [
+            {"name": "amountIn", "type": "uint256"},
+            {"name": "path", "type": "address[]"},
+        ],
+        "name": "getAmountsOut",
+        "outputs": [{"name": "amounts", "type": "uint256[]"}],
+        "stateMutability": "view", "type": "function",
+    },
 ]
 
 # ABIs minimales de POOL (lecture seule, aucune fonction d'écriture) utilisées
@@ -275,9 +298,27 @@ UNISWAP_V2_PAIR_ABI = [
 # docstring).
 PANCAKESWAP_V3_FACTORY_ABI = UNISWAP_V3_FACTORY_ABI
 
-# Pool Uniswap-V3-style générique (même shape que UNISWAP_V3_POOL_ABI, utilisée
-# aussi pour PancakeSwap V3 — fork quasi-identique).
-PANCAKESWAP_V3_POOL_ABI = UNISWAP_V3_POOL_ABI
+# Pool PancakeSwap V3 : même shape que Uniswap V3 SAUF `feeProtocol`, codé sur
+# uint32 (deux uint16 empaquetés, token0/token1) au lieu de uint8 — voir
+# IPancakeV3PoolState.sol. Réutiliser l'ABI Uniswap faisait échouer le
+# décodage de `slot0()` dès que les frais protocole sont activés (valeur
+# > 255, ex. ICNT/USDC fee 500 : feeProtocol=222825800), donc
+# `_onchain_pool_price_usd("pancakeswap")` renvoyait toujours None et le bot
+# retombait sur un prix DexScreener périmé — source de spreads fantômes
+# (08/11/2026 : 3 round-trips ICNT perdants puis killswitch).
+PANCAKESWAP_V3_POOL_ABI = [
+    {"inputs": [], "name": "token0", "outputs": [{"name": "", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "slot0", "outputs": [
+        {"name": "sqrtPriceX96", "type": "uint160"},
+        {"name": "tick", "type": "int24"},
+        {"name": "observationIndex", "type": "uint16"},
+        {"name": "observationCardinality", "type": "uint16"},
+        {"name": "observationCardinalityNext", "type": "uint16"},
+        {"name": "feeProtocol", "type": "uint32"},
+        {"name": "unlocked", "type": "bool"},
+     ], "stateMutability": "view", "type": "function"},
+]
 
 # PancakeSwap V3 ("IV3SwapRouter" officiel de PancakeSwap, PAS SwapRouter02
 # d'Uniswap) : struct ExactInputSingleParams AVEC un champ `deadline`, ABI

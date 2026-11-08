@@ -56,6 +56,44 @@ def dex_fee_pct(dex_id: str) -> float:
     return DEX_FEE_PCT.get(dex_id.lower(), _DEFAULT_DEX_FEE_PCT)
 
 
+def is_net_profit_above_threshold(net_profit_usd: float | None, threshold_usd: float) -> bool:
+    """Accepte uniquement un profit estimé strictement positif et supérieur
+    au seuil configuré. Un seuil nul ne rend donc jamais un profit nul rentable."""
+    return net_profit_usd is not None and net_profit_usd > max(0.0, threshold_usd)
+
+
+def actual_gas_cost_usd(gas_cost_wei: int, native_token_usd: float | None) -> float | None:
+    """Convertit le coût de gas réellement reçu du reçu on-chain en USD."""
+    if native_token_usd is None or native_token_usd <= 0:
+        return None
+    return gas_cost_wei / 1e18 * native_token_usd
+
+
+def receipt_total_gas_cost_wei(receipt: dict, fallback_gas_price_wei: int = 0) -> int:
+    """Retourne le gas L2 et, si le reçu Base l'expose, les frais L1."""
+    def as_int(value: int | str) -> int:
+        return int(value, 0) if isinstance(value, str) else int(value)
+
+    gas_used = as_int(receipt.get("gasUsed", 0))
+    effective_gas_price = receipt.get("effectiveGasPrice", fallback_gas_price_wei)
+    l2_cost = gas_used * as_int(effective_gas_price)
+    l1_fee = receipt.get("l1Fee")
+    if l1_fee is None:
+        return l2_cost
+    return l2_cost + as_int(l1_fee)
+
+
+def realized_net_profit_usd(
+    profit_quote: float,
+    quote_usd_price: float | None,
+    gas_cost_usd: float | None,
+) -> float | None:
+    """Retourne le P&L net mesuré, ou None si l'un des prix de conversion manque."""
+    if quote_usd_price is None or quote_usd_price <= 0 or gas_cost_usd is None:
+        return None
+    return profit_quote * quote_usd_price - gas_cost_usd
+
+
 def estimate_base_gas_price_gwei() -> float | None:
     """Interroge le RPC Base configuré (RPC_BASE, sinon l'endpoint public
     gratuit mainnet.base.org) pour le gas price courant. Lecture seule,
