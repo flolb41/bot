@@ -59,7 +59,9 @@ scripts/                   # déploiement RPi3, systemd, watchdog, sauvegarde SQ
 ```powershell
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\pip install -r requirements-dev.txt   # pytest (même suite que la CI GitHub)
 copy .env.example .env        # puis renseigner TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+python -m pytest -q            # 190+ tests, aucune transaction ni accès wallet
 python main.py scan-arbitrage  # un scan manuel, SIMULATION uniquement
 python main.py trading-status  # explique les garde-fous live, sans transaction
 python main.py status          # dashboard texte dans le terminal
