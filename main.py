@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 import threading
-from pathlib import Path
 
 # Force stdout/stderr en UTF-8 : le dashboard texte utilise des caractères Unicode
 # (box-drawing, émojis) qui plantent sur une console Windows en cp1252 par défaut.
@@ -29,6 +27,7 @@ from app.config import load_config
 from app.database import Database
 from app.logger import setup_logger
 from app.notifications.telegram import TelegramBot
+from app.runtime_lock import acquire_single_instance_lock
 from app.scheduler import build_scheduler, run_arbitrage_scan_job
 
 
@@ -45,48 +44,6 @@ def _build_components(config_path: str):
         scan_callback=lambda: run_arbitrage_scan_job(db, telegram, config.raw),
     )
     return config, db, telegram
-
-
-# Référence conservée pour la durée du process : fermer le fichier relâcherait le verrou.
-_SINGLE_INSTANCE_LOCK = None
-
-
-def acquire_single_instance_lock(db_path: str) -> bool:
-    """Garantit qu'un seul `main.py run` pilote une base SQLite donnée.
-
-    Verrou `flock` exclusif sur `<base>.lock`, relâché automatiquement par le
-    noyau à la mort du process (pas de verrou orphelin après un crash ou un
-    `kill -9`). Le 08/11/2026, deux instances ont tourné ~35 min en parallèle
-    sur la même base (cycles de scan jumeaux dans app.log, IntegrityError sur
-    les paper trades) : deux schedulers live sur un même wallet peuvent
-    doubler des transactions. Retourne False si une autre instance détient
-    déjà le verrou ; True sur un système sans `fcntl` (poste de dev Windows,
-    aucun verrou possible)."""
-    global _SINGLE_INSTANCE_LOCK
-    try:
-        import fcntl
-    except ImportError:
-        return True
-    lock_path = Path(f"{db_path}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_path, "a+", encoding="utf-8")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        handle.seek(0)
-        other_pid = handle.read().strip() or "inconnu"
-        handle.close()
-        logging.getLogger("app.main").error(
-            "Une autre instance du bot (pid %s) pilote déjà %s — arrêt pour ne pas faire tourner deux "
-            "schedulers/exécuteurs sur le même wallet.", other_pid, db_path,
-        )
-        return False
-    handle.seek(0)
-    handle.truncate()
-    handle.write(str(os.getpid()))
-    handle.flush()
-    _SINGLE_INSTANCE_LOCK = handle
-    return True
 
 
 def cmd_run(args: argparse.Namespace) -> None:

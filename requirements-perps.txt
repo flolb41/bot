@@ -1,0 +1,9 @@
+# Dépendances du service perps PAPIER (venv séparé `.venv-perps`, voir
+# scripts/install_perps_paper.sh). Le SDK Veranta impose eth-account<0.14 et
+# websockets<15, incompatibles avec le web3 du bot d'arbitrage : ne JAMAIS
+# installer ce fichier dans `.venv`.
+veranta-sdk==2.2.1
+PyYAML>=6.0.1
+python-dotenv>=1.0.1
+fastapi>=0.111.0
+uvicorn>=0.30.0

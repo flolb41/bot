@@ -1,35 +1,39 @@
-"""Tests du point d'entrée CLI (verrou mono-instance de `main.py run`)."""
+"""Tests du verrou mono-instance (`app.runtime_lock`), utilisé par `main.py run`
+et `perps_main.py run`."""
 from __future__ import annotations
 
 import importlib.util
 
 import pytest
 
-import main as cli
+from app import runtime_lock
 
 
 @pytest.fixture
 def _release_lock():
     yield
-    handle = cli._SINGLE_INSTANCE_LOCK
-    if handle is not None:
-        handle.close()
-        cli._SINGLE_INSTANCE_LOCK = None
+    runtime_lock.release_single_instance_locks()
 
 
-def test_single_instance_lock_is_noop_without_fcntl(tmp_path, monkeypatch, _release_lock):
+def test_single_instance_lock_is_noop_without_fcntl(tmp_path, _release_lock):
     if importlib.util.find_spec("fcntl") is not None:
         pytest.skip("fcntl disponible : voir test_single_instance_lock_refuses_second_instance")
-    assert cli.acquire_single_instance_lock(str(tmp_path / "bot.db")) is True
-    assert cli._SINGLE_INSTANCE_LOCK is None
+    assert runtime_lock.acquire_single_instance_lock(str(tmp_path / "bot.db")) is True
+    assert runtime_lock._HANDLES == {}
 
 
 def test_single_instance_lock_refuses_second_instance(tmp_path, _release_lock):
     pytest.importorskip("fcntl")
     db_path = str(tmp_path / "bot.db")
 
-    assert cli.acquire_single_instance_lock(db_path) is True
+    assert runtime_lock.acquire_single_instance_lock(db_path) is True
     assert (tmp_path / "bot.db.lock").read_text(encoding="utf-8").strip().isdigit()
     # Second `open()` + flock sur le même fichier : nouvelle description de
     # fichier, donc conflit même depuis le même process.
-    assert cli.acquire_single_instance_lock(db_path) is False
+    assert runtime_lock.acquire_single_instance_lock(db_path) is False
+
+
+def test_main_cli_reexports_the_lock_helper():
+    import main as cli
+
+    assert cli.acquire_single_instance_lock is runtime_lock.acquire_single_instance_lock

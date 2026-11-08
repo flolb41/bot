@@ -390,3 +390,56 @@ system_health:
   check_interval_seconds: 60      # vérification toutes les 60s
   max_temperature_celsius: 80.0   # arrêt si CPU > 80°C
   max_memory_percent: 90.0        # arrêt si RAM > 90% (risque OOM sur Pi3 1Go)
+
+# Trading de perpétuels sur Base — PHASE PAPIER UNIQUEMENT (aucun ordre, aucune
+# clé). Service séparé (perps_main.py, scripts/perps-paper.service, venv
+# .venv-perps) qui lit le marché Veranta (ex-Avantis) et simule deux
+# stratégies avec les frais, spreads, funding et rollover réels du protocole.
+# Synthetix V3 sur Base a été écarté le 08/11/2026 : maxOpenInterest = 0 sur
+# ETH/BTC/SOL (marchés en extinction, funding aberrant).
+perps:
+  enabled: true
+  mode: paper                     # seul mode implémenté ; toute autre valeur arrête le service
+  interval_minutes: 5             # ~12 lectures HTTP par marché et par heure, négligeable pour le Pi
+  database:
+    path: data/perps_paper.db     # base dédiée (verrou mono-instance séparé)
+  logging:
+    file: logs/perps.log
+    level: INFO
+  dashboard:
+    enabled: true
+    host: 0.0.0.0
+    port: 8001
+  venue: veranta
+  markets: [ETH/USD, BTC/USD, SOL/USD, AERO/USD]
+  observation_retention_days: 30
+  # Cash-and-carry : short perp (notionnel réel minimum Veranta : 100 USDC) +
+  # long spot modélisé au prix d'index (frais DEX + glissement + gas). Revenu
+  # = funding reçu par le côté short ; le funding Veranta est exprimé par heure.
+  funding_carry:
+    enabled: true
+    markets: [ETH/USD, BTC/USD]   # spot profond sur Base (WETH, cbBTC)
+    notional_usd: 100
+    entry_min_apr_pct: 6          # entrer si le short encaisse ≥ 6 %/an de funding
+    exit_min_apr_pct: 0           # sortir si le funding devient un coût pour le short…
+    exit_confirm_ticks: 6         # … pendant 6 ticks consécutifs (30 min)
+    max_hold_hours: 336           # 14 jours
+    spot_cost_pct: 0.07           # 0,05 % de frais DEX + ~0,02 % de glissement par jambe spot
+    spot_gas_usd: 0.02
+  # Tendance basse fréquence, levier faible, stop/objectif/durée max, cooldown
+  # après sortie, plafond de perte journalière (même esprit que
+  # directional_live).
+  trend:
+    enabled: true
+    markets: [ETH/USD, BTC/USD, SOL/USD]
+    notional_usd: 100
+    leverage: 2
+    lookback_minutes: 240         # signal : rendement sur 4 h
+    confirm_minutes: 60           # … confirmé par le sens de la dernière heure
+    entry_pct: 1.0
+    stop_loss_pct: 1.5            # sur le prix (soit 3 % du collatéral à 2x)
+    take_profit_pct: 3.0
+    max_hold_hours: 24
+    reentry_cooldown_minutes: 120
+    max_open_positions: 3
+    daily_loss_limit_usd: 5

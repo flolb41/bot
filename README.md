@@ -298,7 +298,44 @@ sudo bash ~/bot/scripts/install_os_updates.sh      # mises à jour de sécurité
 Variables optionnelles pour `self_update.sh` : `SELF_UPDATE_BRANCH` (défaut
 `main`), `SELF_UPDATE_REQUIRED_CHECK` (défaut `tests`, vide pour désactiver la
 gate CI), `GITHUB_TOKEN` (relève la limite d'API, inutile pour un dépôt
-public).
+public). Si `perps-paper.service` est actif, il est arrêté puis redémarré avec
+la mise à jour, et `.venv-perps` est réinstallé lorsque
+`requirements-perps.txt` change.
+
+## Perps sur Base — phase papier
+
+`app/perps/` simule deux stratégies de perpétuels sur **Veranta** (ex-Avantis,
+perps sur Base) **sans aucun ordre ni clé** : il lit le marché public (prix,
+spread dynamique, frais d'ouverture/clôture, funding par côté et par heure,
+rollover, intérêt ouvert, position minimale) et comptabilise chaque position
+papier avec ces coûts réels. Synthetix V3 sur Base a été écarté le 08/11/2026
+(`maxOpenInterest = 0` sur ETH/BTC/SOL : marchés en extinction).
+
+- **`funding_carry`** : short perp + long spot modélisé (frais DEX, glissement,
+  gas) quand le côté short encaisse ≥ `entry_min_apr_pct` de funding ; sortie
+  quand le funding redevient un coût pendant `exit_confirm_ticks` ticks ou
+  après `max_hold_hours`.
+- **`trend`** : tendance sur `lookback_minutes` confirmée par la dernière heure,
+  levier faible, stop/objectif/durée max, cooldown de ré-entrée, plafond de
+  positions et de perte journalière ; liquidation simulée à 85 % du collatéral
+  (seuil Veranta).
+
+Service **séparé** du bot d'arbitrage : process `perps_main.py`, venv
+`.venv-perps` (le SDK Veranta impose des versions d'`eth-account`/`websockets`
+incompatibles avec web3), base `data/perps_paper.db`, journal
+`logs/perps.log`, dashboard `http://<IP-DU-PI>:8001` (`/api/perps`,
+`/api/health`). Configuration dans la section `perps:` de `config/config.yaml`.
+
+```bash
+bash ~/bot/scripts/install_perps_paper.sh   # une fois, sans sudo
+.venv-perps/bin/python perps_main.py status # résumé texte
+```
+
+Hypothèses de modélisation : le spread joue contre le trader à l'ouverture et
+à la clôture ; la jambe spot du carry est exécutée au prix d'index majoré de
+`spot_cost_pct` ; les stops s'exécutent au prix observé au tick (5 min), sans
+ordre déclencheur côté venue. Les résultats papier ne préjugent pas d'une
+exécution live, qui n'est pas implémentée.
 
 ## Docker
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=Perps papier sur Base (Veranta) — simulation, aucun ordre réel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/bot
+ExecStart=%h/bot/.venv-perps/bin/python %h/bot/perps_main.py run
+Restart=on-failure
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+Nice=10
+MemoryMax=300M
+
+[Install]
+WantedBy=default.target

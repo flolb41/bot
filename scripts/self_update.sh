@@ -13,6 +13,10 @@ cd "$BOT_DIR"
 PYTHON="$BOT_DIR/.venv/bin/python"
 PIP="$BOT_DIR/.venv/bin/pip"
 SERVICE="trading-bot-user.service"
+# Services annexes (venv/process séparés) redémarrés avec la mise à jour s'ils
+# étaient actifs ; leur venv est réinstallé si leur fichier de dépendances change.
+PERPS_SERVICE="perps-paper.service"
+PERPS_VENV="$BOT_DIR/.venv-perps"
 BRANCH="${SELF_UPDATE_BRANCH:-main}"
 # Nom du check GitHub Actions exigé (vide = pas de contrôle CI) ; doit
 # correspondre au job « tests » de .github/workflows/ci.yml.
@@ -142,6 +146,11 @@ echo "$LOCAL" > "$BACKUP/commit.txt"
 
 CROSS_DEX_BEFORE="$(cross_dex_flag)"
 PREVIOUS_KILLSWITCH="$(killswitch_get)"
+PERPS_WAS_ACTIVE=0
+if systemctl --user is-active --quiet "$PERPS_SERVICE" 2>/dev/null; then
+    PERPS_WAS_ACTIVE=1
+    systemctl --user stop "$PERPS_SERVICE"
+fi
 killswitch_set 1
 systemctl --user stop "$SERVICE"
 
@@ -152,6 +161,10 @@ apply_commit() {  # commit_cible commit_de_reference
         log "requirements.txt modifié entre ${2:0:8} et ${1:0:8} — pip install."
         "$PIP" install -q --extra-index-url https://www.piwheels.org/simple -r requirements.txt
     fi
+    if [ -x "$PERPS_VENV/bin/pip" ] && ! git diff --quiet "$2" "$1" -- requirements-perps.txt; then
+        log "requirements-perps.txt modifié entre ${2:0:8} et ${1:0:8} — pip install dans .venv-perps."
+        "$PERPS_VENV/bin/pip" install -q --extra-index-url https://www.piwheels.org/simple -r requirements-perps.txt
+    fi
     # Passage simulation -> cross-DEX live : décision explicite exigée (même
     # garde-fou que deploy.sh --enable-cross-dex-live), via un marqueur posé
     # une fois à la main sur le Pi.
@@ -160,9 +173,12 @@ apply_commit() {  # commit_cible commit_de_reference
         log "Le commit ${1:0:8} active trading.cross_dex_flashloan_enabled sans marqueur .allow-cross-dex-live — refus."
         return 5
     fi
-    "$PYTHON" -m compileall -q app main.py
+    "$PYTHON" -m compileall -q app main.py perps_main.py
     "$PIP" check >/dev/null
     "$PYTHON" -c 'import main, app.scheduler, app.dashboard, app.trading.executor'
+    if [ -x "$PERPS_VENV/bin/python" ]; then
+        "$PERPS_VENV/bin/python" -c 'import perps_main, app.perps.service, app.perps.dashboard'
+    fi
     "$PYTHON" - <<'PY'
 from app.config import load_config
 from app.database import Database
@@ -186,6 +202,19 @@ start_and_wait_healthy() {
     return 1
 }
 
+restart_perps_if_needed() {
+    [ "$PERPS_WAS_ACTIVE" -eq 1 ] || return 0
+    systemctl --user start "$PERPS_SERVICE" || true
+    sleep 5
+    if systemctl --user is-active --quiet "$PERPS_SERVICE"; then
+        log "$PERPS_SERVICE redémarré."
+    else
+        log "AVERTISSEMENT : $PERPS_SERVICE ne redémarre pas (voir logs/perps.log) — le bot d'arbitrage n'est pas concerné."
+        notify "⚠️ Service perps papier arrêté" \
+            "perps-paper.service n'a pas redémarré après la mise à jour ${REMOTE:0:8} ; voir logs/perps.log." warning
+    fi
+}
+
 set +e
 apply_commit "$REMOTE" "$LOCAL" && start_and_wait_healthy
 RC=$?
@@ -199,6 +228,7 @@ if [ "$RC" -ne 0 ]; then
     apply_commit "$LOCAL" "$REMOTE" && start_and_wait_healthy
     ROLLBACK_RC=$?
     set -e
+    restart_perps_if_needed
     if [ "$ROLLBACK_RC" -eq 0 ]; then
         killswitch_set "$PREVIOUS_KILLSWITCH"
         log "Retour à ${LOCAL:0:8} réussi ; killswitch restauré à $PREVIOUS_KILLSWITCH."
@@ -213,6 +243,7 @@ if [ "$RC" -ne 0 ]; then
 fi
 
 killswitch_set "$PREVIOUS_KILLSWITCH"
+restart_perps_if_needed
 log "Mise à jour appliquée : ${REMOTE:0:8} (killswitch restauré à $PREVIOUS_KILLSWITCH)."
 notify "⬆️ Mise à jour automatique appliquée" \
     "${LOCAL:0:8} -> ${REMOTE:0:8} ($COMMIT_COUNT commit(s)) : $(git log -1 --format=%s "$REMOTE"). Service redémarré sain, killswitch restauré à $PREVIOUS_KILLSWITCH." info
