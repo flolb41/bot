@@ -17,6 +17,21 @@ _ENTRY_COOLDOWN_SECONDS = 5 * 60
 _EXIT_COOLDOWN_SECONDS = 15 * 60
 
 
+class PositionBalanceMismatch(Exception):
+    """Le wallet détient moins de tokens que la position enregistrée : les
+    tokens ont quitté le wallet hors du bot (vente manuelle MetaMask via
+    smart account EIP-7702, 09/11/2026 05:21 UTC) — aucune vente possible,
+    la position doit être réconciliée à la main."""
+
+    def __init__(self, balance_units: int, expected_units: int, decimals: int):
+        self.balance_units = balance_units
+        self.expected_units = expected_units
+        super().__init__(
+            f"Solde du token ({balance_units / 10 ** decimals:.6f}) inférieur à la quantité achetée par cette "
+            f"position ({expected_units / 10 ** decimals:.6f}) ; vente refusée — tokens sortis du wallet hors du bot ?"
+        )
+
+
 def _positive(value, default: float) -> float:
     try:
         number = float(value)
@@ -345,8 +360,9 @@ def _close_position(db: Database, config: dict, trade: dict, now: float, price: 
     token_decimals = _get_decimals(w3, token)
     quote_decimals = _get_decimals(w3, quote)
     token_contract = w3.eth.contract(address=Web3.to_checksum_address(token), abi=ERC20_ABI)
-    if _balance_of_with_retry(token_contract, wallet) < amount:
-        raise TradingRefused("Solde du token inférieur à la quantité achetée par cette position; vente refusée.")
+    balance_units = _balance_of_with_retry(token_contract, wallet)
+    if balance_units < amount:
+        raise PositionBalanceMismatch(balance_units, amount, token_decimals)
 
     quote_usd = _quote_token_usd_price(quote)
     if quote_usd is None or quote_usd <= 0:
@@ -425,9 +441,15 @@ def run_live_directional_strategy(db: Database, config: dict, groups: dict[str, 
     position = db.directional_open_trade()
     if position is not None:
         if position["status"] != "open":
-            logger.error(
-                "Trading directionnel suspendu : position %s en état %s nécessitant une vérification.",
-                position["token_symbol"], position["status"],
+            # Une seule ligne ERROR par position : la répétition à chaque scan
+            # (65 par heure le 08/11) noyait le journal sans rien apporter.
+            seen_key = f"directional_unresolved_logged:{position['id']}"
+            level = logging.INFO if db.get_state(seen_key) else logging.ERROR
+            db.set_state(seen_key, "1")
+            logger.log(
+                level,
+                "Trading directionnel suspendu : position %s (#%s) en état %s nécessitant une vérification manuelle.",
+                position["token_symbol"], position["id"], position["status"],
             )
             return
         from app.trading.executor import _refresh_price_usd
@@ -449,17 +471,40 @@ def run_live_directional_strategy(db: Database, config: dict, groups: dict[str, 
         if reason:
             try:
                 _close_position(db, config, position, now, price, reason)
+            except PositionBalanceMismatch as exc:
+                # Les tokens ne sont plus dans le wallet : retenter la vente à
+                # chaque scan ne sert à rien. Passage en `unresolved` (bloque
+                # toute nouvelle entrée, visible dans /api/health) + une seule
+                # alerte, au lieu d'une tentative et d'une alerte toutes les 2 min.
+                logger.error(
+                    "Position directionnelle %s (#%s) passée en unresolved : %s",
+                    position["token_symbol"], position["id"], exc,
+                )
+                db.execute(
+                    "UPDATE directional_live_trades SET status='unresolved', execution_error=? WHERE id=? AND status='open'",
+                    (str(exc), position["id"]),
+                )
+                db.add_notification(
+                    "🛑 Position directionnelle à réconcilier",
+                    f"{position['token_symbol']} (#{position['id']}) — {exc} Vérifier la vente externe puis clôturer la "
+                    f"ligne manuellement (exit_reason manual_reconciliation).",
+                    level="alert",
+                )
             except Exception as exc:
                 logger.exception("Clôture directionnelle en échec pour %s.", position["token_symbol"])
                 db.execute(
                     "UPDATE directional_live_trades SET execution_error=? WHERE id=? AND status='open'",
                     (str(exc), position["id"]),
                 )
-                db.add_notification(
-                    "⚠️ Clôture directionnelle en attente",
-                    f"{position['token_symbol']} — {exc}",
-                    level="alert",
-                )
+                # Une alerte par cause distincte, pas une par scan tant que l'échec persiste.
+                error_key = f"directional_close_error_notified:{position['id']}"
+                if db.get_state(error_key) != str(exc):
+                    db.set_state(error_key, str(exc))
+                    db.add_notification(
+                        "⚠️ Clôture directionnelle en attente",
+                        f"{position['token_symbol']} — {exc}",
+                        level="alert",
+                    )
         return
 
     loss_limit = _positive(live_cfg.get("daily_loss_limit_usd"), 1.0)

@@ -219,3 +219,73 @@ def test_directional_amount_column_migrates_existing_database(tmp_path):
         for row in migrated.fetch_all("PRAGMA table_info(directional_live_trades)")
     }
     assert "token_amount_raw" in columns
+
+
+def _open_live_position(db: Database, now: float) -> int:
+    return db.execute(
+        "INSERT INTO directional_live_trades "
+        "(strategy, token_address, token_symbol, quote_address, dex, entry_at, entry_price_usd, "
+        "stake_usd, token_amount, token_amount_raw, status, entry_tx_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'open', 'buyhash')",
+        ("liquid_momentum", TOKEN, "TEST", USDC, "aerodrome", now - 2 * 3600, 1.0, 2.0, str(5 * 10 ** 18)),
+    )
+
+
+def _enable_live(monkeypatch):
+    import app.trading.directional_live as directional_live
+
+    monkeypatch.setattr("app.trading.guardrails.is_trading_live", lambda _config: True)
+    monkeypatch.setattr("app.trading.guardrails.is_stopped", lambda _db: False)
+    monkeypatch.setattr("app.trading.executor._refresh_price_usd", lambda *_args, **_kwargs: 1.0)
+    return directional_live
+
+
+def test_external_sale_moves_position_to_unresolved_with_a_single_alert(tmp_path, monkeypatch, caplog):
+    import logging
+
+    db = Database(tmp_path / "external-sale.db")
+    now = time.time()
+    position_id = _open_live_position(db, now)   # ouverte depuis 2 h : durée max (60 min) atteinte
+    directional_live = _enable_live(monkeypatch)
+    calls = []
+
+    def fake_close(_db, _config, trade, _now, _price, _reason):
+        calls.append(trade["id"])
+        raise directional_live.PositionBalanceMismatch(0, 5 * 10 ** 18, 18)
+
+    monkeypatch.setattr(directional_live, "_close_position", fake_close)
+    config = {**_config(), "directional_live": {"enabled": True, "position_usd": 2, "daily_loss_limit_usd": 1}}
+
+    with caplog.at_level(logging.INFO, logger="app.trading.directional_live"):
+        run_live_directional_strategy(db, config, _groups(1.0))
+        run_live_directional_strategy(db, config, _groups(1.0))
+        run_live_directional_strategy(db, config, _groups(1.0))
+
+    assert calls == [position_id]                                        # une seule tentative de vente
+    row = db.fetch_one("SELECT status, execution_error FROM directional_live_trades WHERE id=?", (position_id,))
+    assert row["status"] == "unresolved" and "hors du bot" in row["execution_error"]
+    alerts = [n for n in db.list_notifications(limit=20) if n["level"] == "alert"]
+    assert len(alerts) == 1 and "réconcilier" in alerts[0]["title"]
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 2                                              # transition + 1er scan « suspendu », puis INFO
+    assert db.directional_unresolved_positions_count() == 1
+
+
+def test_transient_close_failure_alerts_once_per_distinct_cause(tmp_path, monkeypatch):
+    db = Database(tmp_path / "transient.db")
+    now = time.time()
+    position_id = _open_live_position(db, now)
+    directional_live = _enable_live(monkeypatch)
+    errors = iter([RuntimeError("RPC injoignable"), RuntimeError("RPC injoignable"), RuntimeError("Simulation échouée")])
+
+    def fake_close(*_args):
+        raise next(errors)
+
+    monkeypatch.setattr(directional_live, "_close_position", fake_close)
+    config = {**_config(), "directional_live": {"enabled": True, "position_usd": 2, "daily_loss_limit_usd": 1}}
+    for _ in range(3):
+        run_live_directional_strategy(db, config, _groups(1.0))
+
+    row = db.fetch_one("SELECT status, execution_error FROM directional_live_trades WHERE id=?", (position_id,))
+    assert row["status"] == "open" and row["execution_error"] == "Simulation échouée"   # on retente au scan suivant
+    alerts = [n["message"] for n in db.list_notifications(limit=20) if n["level"] == "alert"]
+    assert sorted(alerts) == sorted(["TEST — RPC injoignable", "TEST — Simulation échouée"])
