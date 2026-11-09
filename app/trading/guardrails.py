@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from app.database import Database
 from app.killswitch import is_stopped, stop as killswitch_stop
 from app.trading.fees import receipt_total_gas_cost_wei
-from app.trading.routers import FLASHLOAN_CONTRACT_ADDRESSES, TRADING_ROUTER_ADDRESSES
+from app.trading.routers import FLASHLOAN_CONTRACT_ADDRESSES, TRADING_ROUTER_ADDRESSES, YIELD_CONTRACT_ADDRESSES
 # Ré-exportés d'ici pour compatibilité (anciennement définis dans ce module) :
 # la résilience RPC (rotation d'endpoints + retry 429) vit dans `app.trading.rpc`.
 from app.trading.rpc import call_with_rate_limit_retry, is_connected_with_retry, is_rate_limit_error, make_w3  # noqa: F401
@@ -126,6 +126,17 @@ def _anomaly_stop(db: Database, reason: str) -> None:
     _notify(db, "🛑 Trading : arrêt automatique", reason, level="alert")
 
 
+def trading_whitelist() -> set[str]:
+    """Adresses (minuscules) vers lesquelles une transaction de trading peut
+    bénéficier : routers DEX, contrat FlashArbitrage, Pool Aave V3. Fixe, en
+    code, jamais étendue par la configuration ni l'environnement."""
+    return (
+        {addr.lower() for addr in TRADING_ROUTER_ADDRESSES}
+        | {addr.lower() for addr in FLASHLOAN_CONTRACT_ADDRESSES}
+        | {addr.lower() for addr in YIELD_CONTRACT_ADDRESSES}
+    )
+
+
 def send_trading_transaction(
     db: Database,
     *,
@@ -163,13 +174,12 @@ def send_trading_transaction(
     Retourne toujours un dict `{"sent": bool, "tx_hash": str|None, "error": str|None}`.
     """
     # Whitelist fixe = routers DEX connus + contrat(s) FlashArbitrage déployé(s)
-    # (voir app/trading/routers.py) — jamais étendue par variable d'environnement.
-    whitelist = {addr.lower() for addr in TRADING_ROUTER_ADDRESSES} | {
-        addr.lower() for addr in FLASHLOAN_CONTRACT_ADDRESSES
-    }
+    # + Pool Aave V3 (dépôt/retrait du capital oisif, voir app/trading/routers.py)
+    # — jamais étendue par variable d'environnement.
+    whitelist = trading_whitelist()
     if whitelist_target.lower() not in whitelist:
         raise TradingRefused(
-            f"{whitelist_target} absent de la whitelist fixe des routers DEX/contrats flashloan "
+            f"{whitelist_target} absent de la whitelist fixe des routers DEX/contrats flashloan/Aave "
             f"({sorted(whitelist)}) — refusé."
         )
 

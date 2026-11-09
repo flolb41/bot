@@ -128,7 +128,8 @@ def build_html(report: dict[str, Any]) -> str:
     treasury = report.get("treasury")
     if treasury:
         treasury_rows = [[
-            _ts(treasury["observed_at"]), _fmt(treasury.get("idle_usdc"), 2, " USDC"), _fmt(treasury.get("aave_usdc_apr_pct"), 2, " %"),
+            _ts(treasury["observed_at"]), _fmt(treasury.get("idle_usdc"), 2, " USDC"), _fmt(treasury.get("deposited_usdc"), 2, " USDC"),
+            _fmt(treasury.get("aave_usdc_apr_pct"), 2, " %"),
             _fmt(treasury.get("vault_7d_apr_pct"), 1, " %"), _fmt(treasury.get("vault_30d_apr_pct"), 1, " %"),
             _fmt(treasury.get("vault_12m_apr_pct"), 1, " %"), escape(str(treasury.get("best_venue") or "—")),
             _fmt(treasury.get("missed_yield_usd"), 4, " $"),
@@ -149,7 +150,7 @@ th{{color:#9fb3c8}} .muted{{color:#7f8c99}} .banner{{background:#3b2f00;border:1
 <h2>Positions ouvertes</h2>{_table(['Stratégie', 'Paire', 'Sens', 'Notionnel $', 'Levier', 'Entrée', 'Marque', 'Non réalisé net', 'Funding encaissé', 'Liquidation', 'Durée', 'Motif'], open_rows)}
 <h2>Dernières clôtures</h2>{_table(['Date', 'Stratégie', 'Paire', 'Sens', 'Entrée', 'Sortie', 'Net', 'Motif'], closed_rows)}
 <h2>Funding — toutes paires ({report.get('funding_scan_pairs', 0)} balayées, top 15 par rendement net)</h2>{_table(['Paire', 'Côté payé', 'Net (instantané)', f"Net moyen {report.get('funding_average_window_days', 7):g} j", 'Net short', 'Net long', 'Rollover', 'OI long / short ($)', 'Spot Base', 'Marché'], funding_rows)}
-<h2>Trésorerie (papier) — rendement du capital oisif</h2>{_table(['Observé', 'USDC oisif', 'Aave USDC', 'Vault Veranta 7 j', '30 j', '12 m', 'Meilleur', 'Manque à gagner cumulé'], treasury_rows)}
+<h2>Trésorerie — rendement du capital (Aave réel via <code>main.py treasury</code>, vault observé)</h2>{_table(['Observé', 'USDC liquide', 'Déposé Aave', 'Aave USDC', 'Vault Veranta 7 j', '30 j', '12 m', 'Meilleur', 'Manque à gagner cumulé (liquide)'], treasury_rows)}
 <h2>Événements</h2>{_table(['Date', 'Niveau', 'Stratégie', 'Message'], event_rows)}
 </body></html>"""
 

@@ -173,6 +173,13 @@ un revert ou une transaction de clôture impossible peut dépasser le stop ou
 retarder la sortie. L'activation reste conditionnée à l'ensemble des contrôles
 live habituels (confirmation explicite, wallet, simulations et killswitch).
 
+**Désactivée le 09/11/2026** (`directional_live.enabled: false`) : bilan
+mesuré de 16 trades live à −0,35 $ (dont 0,09 $ de gas), 579 trades paper à
+−28,6 $ sur les deux variantes, et un backtest perps de la même famille
+momentum sans avantage hors échantillon. La désactivation ne bloque que les
+nouvelles entrées : une position encore ouverte reste suivie et fermée par ses
+règles. Les expérimentations paper continuent d'alimenter le dashboard.
+
 Les seuils live configurés sont de **0,01 $** pour les voies classiques et
 **0,25 $** pour les flashloans, avec un rendement estimé minimum de **0,5 %**
 du montant engagé/emprunté. Ces planchers filtrent les petites marges, mais ne
@@ -443,6 +450,31 @@ l'écart ≈ 0), les signaux « rentables » survivaient à 100 % au scan suivan
 et à l'exécution l'écart réel était systématiquement sous les frais. La
 latence n'était donc pas le facteur limitant : les écarts affichés n'existaient
 pas on-chain (cf. le correctif ABI PancakeSwap V3 du même jour).
+
+## Trésorerie : USDC oisif sur Aave V3
+
+Au niveau de funding observé le 09/11/2026 (~8 %/an net réaliste), un carry
+ETH à 1x rapporte ~3,8 %/an sur le capital engagé (100 $ de spot + 100 USDC
+de collatéral, frais de rotation déduits) alors que les mêmes USDC sur Aave V3
+touchent ~4,9 %/an sans liquidation, sans venue et sans frais. Le carry ne
+redevient supérieur qu'au-dessus de ~15 %/an de funding — le seuil d'alerte
+du scan. En attendant, l'USDC qui dort doit au moins toucher Aave.
+
+```bash
+.venv/bin/python main.py treasury status                               # soldes liquide/déposé, taux courant
+.venv/bin/python main.py treasury deposit                              # aperçu : tout sauf 2 USDC de flottant
+.venv/bin/python main.py treasury deposit --amount 8 --execute         # dépôt réel
+.venv/bin/python main.py treasury withdraw --execute                   # retrait total (intérêts compris)
+```
+
+Mêmes garde-fous que les swaps (`app/trading/treasury_ops.py`) : trading live
+requis, killswitch, whitelist fixe en code (le Pool Aave est la seule adresse
+ajoutée, dans `routers.YIELD_CONTRACT_ADDRESSES`), approbation ERC-20 au
+montant exact, simulation avant envoi, et `onBehalfOf`/`to` toujours égaux au
+wallet de trading : les fonds ne peuvent aller nulle part ailleurs. Le
+dashboard perps (`:8001`) affiche USDC liquide et déposé (aUSDC, intérêts
+inclus) ; le manque à gagner cumulé ne porte que sur la part liquide. Risque
+résiduel : le contrat Aave V3 lui-même et le peg de l'USDC.
 
 ## Liquidation manuelle d'inventaire
 

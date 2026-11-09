@@ -201,6 +201,7 @@ class TreasuryConfig:
     rpc_url: str | None = None
     aave_pool_address: str = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
     usdc_address: str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+    ausdc_address: str = "0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB"   # aToken USDC Aave V3 Base (dépôt + intérêts)
 
     @classmethod
     def from_dict(cls, raw: dict | None) -> "TreasuryConfig":
@@ -213,6 +214,7 @@ class TreasuryConfig:
             rpc_url=str(raw["rpc_url"]) if raw.get("rpc_url") else None,
             aave_pool_address=str(raw.get("aave_pool_address", cls.aave_pool_address)),
             usdc_address=str(raw.get("usdc_address", cls.usdc_address)),
+            ausdc_address=str(raw.get("ausdc_address", cls.ausdc_address)),
         )
 
 

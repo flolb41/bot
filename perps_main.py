@@ -96,7 +96,8 @@ def cmd_status(args: argparse.Namespace) -> None:
     if treasury:
         fmt = lambda v, suffix="": "n/a" if v is None else f"{float(v):.2f}{suffix}"  # noqa: E731
         print(
-            f"  Trésorerie : USDC oisif {fmt(treasury['idle_usdc'])} | Aave {fmt(treasury['aave_usdc_apr_pct'], ' %')} | "
+            f"  Trésorerie : USDC liquide {fmt(treasury['idle_usdc'])} | déposé Aave {fmt(treasury.get('deposited_usdc'))} | "
+            f"Aave {fmt(treasury['aave_usdc_apr_pct'], ' %')} | "
             f"vault Veranta 7j/30j/12m {fmt(treasury['vault_7d_apr_pct'], ' %')}/{fmt(treasury['vault_30d_apr_pct'], ' %')}/"
             f"{fmt(treasury['vault_12m_apr_pct'], ' %')} | manque à gagner cumulé {float(treasury['missed_yield_usd']):.4f} $"
         )

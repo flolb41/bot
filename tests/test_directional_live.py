@@ -270,6 +270,30 @@ def test_external_sale_moves_position_to_unresolved_with_a_single_alert(tmp_path
     assert db.directional_unresolved_positions_count() == 1
 
 
+def test_disabled_strategy_still_closes_an_open_position_but_opens_nothing(tmp_path, monkeypatch):
+    """`enabled: false` = plus de nouvelles entrées ; une position ouverte avant
+    la désactivation est quand même suivie et fermée (sinon orpheline)."""
+    db = Database(tmp_path / "disabled.db")
+    now = time.time()
+    position_id = _open_live_position(db, now)   # ouverte depuis 2 h : durée max atteinte
+    directional_live = _enable_live(monkeypatch)
+    closed = []
+
+    def fake_close(_db, _config, trade, _now, _price, reason):
+        closed.append((trade["id"], reason))
+        db.execute("UPDATE directional_live_trades SET status='closed', exit_reason=? WHERE id=?", (reason, trade["id"]))
+
+    monkeypatch.setattr(directional_live, "_close_position", fake_close)
+    monkeypatch.setattr(directional_live, "_open_position", lambda *_a, **_k: pytest.fail("aucune entrée attendue"))
+    config = {**_config(), "directional_live": {"enabled": False, "position_usd": 2, "daily_loss_limit_usd": 1}}
+
+    run_live_directional_strategy(db, config, _groups(1.0))     # ferme la position existante
+    run_live_directional_strategy(db, config, _groups(1.05))    # signal d'entrée (+5 %) ignoré : désactivé
+
+    assert closed == [(position_id, "max_hold")]
+    assert db.fetch_one("SELECT COUNT(*) AS n FROM directional_live_trades")["n"] == 1
+
+
 def test_transient_close_failure_alerts_once_per_distinct_cause(tmp_path, monkeypatch):
     db = Database(tmp_path / "transient.db")
     now = time.time()

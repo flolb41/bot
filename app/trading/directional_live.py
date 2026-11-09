@@ -428,10 +428,13 @@ def _close_position(db: Database, config: dict, trade: dict, now: float, price: 
 
 
 def run_live_directional_strategy(db: Database, config: dict, groups: dict[str, list[dict]]) -> None:
-    """Manage one USDC-quoted momentum position; never invoke the arbitrage path."""
+    """Manage one USDC-quoted momentum position; never invoke the arbitrage path.
+
+    `directional_live.enabled: false` ne bloque que les NOUVELLES entrées : une
+    position encore ouverte au moment de la désactivation continue d'être
+    suivie et fermée par ses règles (sinon elle resterait orpheline dans le
+    wallet, en token volatil, sans personne pour la vendre)."""
     live_cfg = (config or {}).get("directional_live") or {}
-    if not live_cfg.get("enabled", False):
-        return
     from app.trading.guardrails import is_trading_live, is_stopped
 
     if not is_trading_live(config) or is_stopped(db):
@@ -507,6 +510,8 @@ def run_live_directional_strategy(db: Database, config: dict, groups: dict[str, 
                     )
         return
 
+    if not live_cfg.get("enabled", False):
+        return
     loss_limit = _positive(live_cfg.get("daily_loss_limit_usd"), 1.0)
     if _daily_loss_blocks_entries(db, now, loss_limit):
         return

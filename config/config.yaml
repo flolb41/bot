@@ -80,8 +80,14 @@ paper_research:
 
 # Trading directionnel Base : une position USDC à la fois, mise plafonnée à 2 $.
 # Le démarrage effectif reste soumis aux garde-fous live de guardrails.py.
+# DÉSACTIVÉ le 09/11/2026 (objectif : rentabilité). Bilan mesuré : live 16
+# trades, -0,35 $ (dont 0,09 $ de gas) ; papier liquid_momentum 423 trades
+# -21,74 $, microcap_momentum 156 trades -6,82 $ ; backtest perps de la même
+# famille momentum : aucun avantage hors échantillon. `enabled: false` ne
+# bloque que les nouvelles entrées — une position encore ouverte est suivie
+# et fermée normalement (app/trading/directional_live.py).
 directional_live:
-  enabled: true
+  enabled: false
   position_usd: 2
   daily_loss_limit_usd: 1
 

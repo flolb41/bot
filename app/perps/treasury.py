@@ -56,6 +56,8 @@ class TreasuryDataProvider(Protocol):
 
     async def idle_usdc(self) -> float | None: ...
 
+    async def deposited_usdc(self) -> float | None: ...
+
 
 class VerantaTreasuryData:
     """Fournisseur réel : JSON-RPC brut (httpx) pour Aave/USDC, SDK pour le vault."""
@@ -101,25 +103,31 @@ class VerantaTreasuryData:
             return {"7d": None, "30d": None, "12m": None}
 
     async def idle_usdc(self) -> float | None:
+        return await self._erc20_balance(self._config.usdc_address, "Solde USDC")
+
+    async def deposited_usdc(self) -> float | None:
+        """USDC déposés sur Aave V3 = solde d'aUSDC (il grossit avec les intérêts)."""
+        return await self._erc20_balance(self._config.ausdc_address, "Solde aUSDC")
+
+    async def _erc20_balance(self, token: str, label: str) -> float | None:
         if not self._config.wallet_address:
             return None
         try:
-            raw = await self._eth_call(
-                self._config.usdc_address, _BALANCE_OF_SELECTOR + _encode_address_arg(self._config.wallet_address),
-            )
+            raw = await self._eth_call(token, _BALANCE_OF_SELECTOR + _encode_address_arg(self._config.wallet_address))
             return decode_uint(raw) / 1e6
         except Exception as exc:  # noqa: BLE001
-            logger.info("Solde USDC indisponible : %s", exc)
+            logger.info("%s indisponible : %s", label, exc)
             return None
 
 
 def build_observation(
     store: PerpsStore, now: float, *, idle_usdc: float | None, aave_apr: float | None,
-    vault: dict[str, float | None], max_gap_seconds: float,
+    vault: dict[str, float | None], max_gap_seconds: float, deposited_usdc: float | None = None,
 ) -> dict[str, Any]:
     """Ligne d'observation + manque à gagner cumulé (fonction pure hors lecture
     de la dernière observation). Le vault est comparé sur 30 j : le 7 j est trop
-    bruité, le 12 m lisse les régimes."""
+    bruité, le 12 m lisse les régimes. Le manque à gagner ne porte que sur
+    l'USDC liquide : ce qui est déposé sur Aave travaille déjà."""
     candidates = [("aave_usdc", aave_apr), ("veranta_vault_30d", vault.get("30d"))]
     candidates = [(venue, apr) for venue, apr in candidates if apr is not None]
     best_venue, best_apr = max(candidates, key=lambda c: c[1]) if candidates else (None, None)
@@ -129,7 +137,7 @@ def build_observation(
         elapsed = min(max(0.0, now - float(previous["observed_at"])), max_gap_seconds)
         missed += idle_usdc * best_apr / 100 * elapsed / (365 * 86400)
     return {
-        "observed_at": now, "idle_usdc": idle_usdc, "aave_usdc_apr_pct": aave_apr,
+        "observed_at": now, "idle_usdc": idle_usdc, "deposited_usdc": deposited_usdc, "aave_usdc_apr_pct": aave_apr,
         "vault_7d_apr_pct": vault.get("7d"), "vault_30d_apr_pct": vault.get("30d"), "vault_12m_apr_pct": vault.get("12m"),
         "best_apr_pct": best_apr, "best_venue": best_venue, "missed_yield_usd": missed,
     }
@@ -138,15 +146,18 @@ def build_observation(
 async def run_treasury_observation(store: PerpsStore, config: TreasuryConfig, provider: TreasuryDataProvider,
                                    now: float) -> dict[str, Any]:
     idle = await provider.idle_usdc()
+    deposited = await provider.deposited_usdc()
     aave = await provider.aave_usdc_apr_pct()
     vault = await provider.vault_returns_pct()
     row = build_observation(
         store, now, idle_usdc=idle, aave_apr=aave, vault=vault, max_gap_seconds=2 * config.interval_minutes * 60,
+        deposited_usdc=deposited,
     )
     store.record_treasury_observation(row)
     logger.info(
-        "Trésorerie : USDC oisif %s | Aave %s | vault Veranta 7j/30j/12m %s/%s/%s | manque à gagner cumulé %.4f $",
-        f"{idle:.2f}" if idle is not None else "n/a", f"{aave:.2f} %" if aave is not None else "n/a",
+        "Trésorerie : USDC liquide %s | déposé Aave %s | Aave %s | vault Veranta 7j/30j/12m %s/%s/%s | manque à gagner cumulé %.4f $",
+        f"{idle:.2f}" if idle is not None else "n/a", f"{deposited:.2f}" if deposited is not None else "n/a",
+        f"{aave:.2f} %" if aave is not None else "n/a",
         *(f"{v:.1f} %" if v is not None else "n/a" for v in (vault.get("7d"), vault.get("30d"), vault.get("12m"))),
         row["missed_yield_usd"],
     )

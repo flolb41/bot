@@ -329,6 +329,46 @@ def cmd_liquidate_inventory(args: argparse.Namespace) -> None:
             print(f"    détail : {result['error']}")
 
 
+def cmd_treasury(args: argparse.Namespace) -> None:
+    """Capital oisif → Aave V3 (USDC) et retour. Aperçu par défaut ; l'envoi
+    réel exige `--execute` ET le trading live activé. Voir app/trading/treasury_ops.py."""
+    from app.trading import treasury_ops
+
+    config, db, _ = _build_components(args.config)
+    if args.treasury_command == "status":
+        from app.trading.executor import _is_connected_with_retry, make_w3
+
+        w3 = make_w3(timeout=15)
+        if not _is_connected_with_retry(w3):
+            print("RPC Base injoignable."); return
+        snap = treasury_ops.treasury_snapshot(w3, treasury_ops._wallet_address())
+        apr = "n/a" if snap["apr_pct"] is None else f"{snap['apr_pct']:.2f} %/an"
+        yearly = snap["deposited_usdc"] * (snap["apr_pct"] or 0) / 100
+        print(f"Wallet {snap['wallet']} : {snap['liquid_usdc']:.2f} USDC liquides, {snap['deposited_usdc']:.2f} USDC sur Aave V3 "
+              f"({apr}, ≈ {yearly:.2f} $/an), rendement manqué sur le liquide ≈ "
+              f"{snap['liquid_usdc'] * (snap['apr_pct'] or 0) / 100:.2f} $/an")
+        return
+    if args.treasury_command == "deposit":
+        result = treasury_ops.deposit_usdc(db, config.raw, args.amount, keep_float_usdc=args.keep_float, dry_run=not args.execute)
+    else:
+        result = treasury_ops.withdraw_usdc(db, config.raw, args.amount, dry_run=not args.execute)
+    label = "DRY-RUN" if result["dry_run"] else ("✅ ENVOYÉ" if result["sent"] else "⚪ non envoyé")
+    verb = "dépôt" if result["action"] == "deposit" else "retrait"
+    print(f"{verb} Aave V3 : {label} — {result['amount_usdc']:.2f} USDC")
+    before, after = result.get("before"), result.get("after")
+    if before:
+        print(f"    avant : {before['liquid_usdc']:.2f} liquides / {before['deposited_usdc']:.2f} déposés"
+              + (f" (Aave {before['apr_pct']:.2f} %/an)" if before.get("apr_pct") is not None else ""))
+    if after:
+        print(f"    après : {after['liquid_usdc']:.2f} liquides / {after['deposited_usdc']:.2f} déposés")
+    if result.get("approve_tx_hash"):
+        print(f"    tx approve : {result['approve_tx_hash']}")
+    if result.get("tx_hash"):
+        print(f"    tx : {result['tx_hash']}")
+    if result.get("error"):
+        print(f"    détail : {result['error']}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Crypto Reward Hunter - bot d'arbitrage inter-DEX")
     parser.add_argument("--config", default="config/config.yaml", help="Chemin du fichier de config YAML")
@@ -375,6 +415,21 @@ def build_parser() -> argparse.ArgumentParser:
     liquidate_parser.add_argument("--quote", default=None, help="Token reçu (défaut : USDC)")
     liquidate_parser.add_argument("--execute", action="store_true", help="Envoie réellement les transactions")
     liquidate_parser.set_defaults(func=cmd_liquidate_inventory)
+
+    treasury_parser = sub.add_parser(
+        "treasury",
+        help="Capital oisif sur Aave V3 (USDC) : status, deposit, withdraw (aperçu par défaut ; --execute pour envoyer).",
+    )
+    treasury_sub = treasury_parser.add_subparsers(dest="treasury_command", required=True)
+    treasury_sub.add_parser("status", help="Soldes liquide/déposé et taux Aave courant (lecture seule).")
+    deposit_parser = treasury_sub.add_parser("deposit", help="Dépose des USDC sur Aave V3.")
+    deposit_parser.add_argument("--amount", type=float, default=None, help="Montant en USDC (défaut : tout sauf le flottant)")
+    deposit_parser.add_argument("--keep-float", type=float, default=2.0, help="USDC laissés liquides dans le wallet (défaut : 2)")
+    deposit_parser.add_argument("--execute", action="store_true", help="Envoie réellement les transactions")
+    withdraw_parser = treasury_sub.add_parser("withdraw", help="Retire des USDC d'Aave V3 vers le wallet.")
+    withdraw_parser.add_argument("--amount", type=float, default=None, help="Montant en USDC (défaut : tout, intérêts compris)")
+    withdraw_parser.add_argument("--execute", action="store_true", help="Envoie réellement la transaction")
+    treasury_parser.set_defaults(func=cmd_treasury)
     return parser
 
 

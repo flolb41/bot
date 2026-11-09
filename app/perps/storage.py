@@ -97,9 +97,16 @@ CREATE TABLE IF NOT EXISTS perps_treasury_observations (
     vault_12m_apr_pct REAL,
     best_apr_pct REAL,
     best_venue TEXT,
-    missed_yield_usd REAL NOT NULL DEFAULT 0
+    missed_yield_usd REAL NOT NULL DEFAULT 0,
+    deposited_usdc REAL
 );
 """
+
+# Colonnes ajoutées après la création initiale d'une table : appliquées par
+# `ALTER TABLE` si absentes (les bases existantes sur le Pi ne sont jamais recréées).
+_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("perps_treasury_observations", "deposited_usdc", "REAL"),
+)
 
 
 class PerpsStore:
@@ -108,6 +115,10 @@ class PerpsStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as conn:
             conn.executescript(SCHEMA)
+            for table, column, column_type in _MIGRATIONS:
+                existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -320,12 +331,12 @@ class PerpsStore:
         with self.connection() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO perps_treasury_observations (observed_at, idle_usdc, aave_usdc_apr_pct, "
-                "vault_7d_apr_pct, vault_30d_apr_pct, vault_12m_apr_pct, best_apr_pct, best_venue, missed_yield_usd) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "vault_7d_apr_pct, vault_30d_apr_pct, vault_12m_apr_pct, best_apr_pct, best_venue, missed_yield_usd, "
+                "deposited_usdc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     row["observed_at"], row.get("idle_usdc"), row.get("aave_usdc_apr_pct"), row.get("vault_7d_apr_pct"),
                     row.get("vault_30d_apr_pct"), row.get("vault_12m_apr_pct"), row.get("best_apr_pct"),
-                    row.get("best_venue"), float(row.get("missed_yield_usd") or 0.0),
+                    row.get("best_venue"), float(row.get("missed_yield_usd") or 0.0), row.get("deposited_usdc"),
                 ),
             )
 

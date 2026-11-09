@@ -134,6 +134,37 @@ TRADING_ROUTER_ADDRESSES = frozenset(ROUTER_ADDRESSES.values()) | {
 FLASH_ARBITRAGE_ADDRESS = "0x70d9A2920fFc3eE2CC24F379Cb6483dfde2D790C"  # v4 : corrige l'ABI PancakeSwap V3 (deadline)
 FLASHLOAN_CONTRACT_ADDRESSES = frozenset({FLASH_ARBITRAGE_ADDRESS})
 
+# Aave V3 sur Base (Pool + aToken USDC) : plancher de rendement du capital
+# oisif (voir app/trading/treasury_ops.py). Seules `supply` et `withdraw`
+# sont appelées, toujours avec `onBehalfOf`/`to` = le wallet de trading
+# lui-même : la whitelist reste fixe et aucune transaction ne peut bénéficier
+# à une adresse tierce. Adresses recoupées le 09/11/2026 avec la lecture
+# on-chain `getReserveData(USDC)` (aTokenAddress) utilisée par app/perps/treasury.py.
+AAVE_V3_POOL_ADDRESS = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
+AAVE_V3_USDC_ATOKEN_ADDRESS = "0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB"
+YIELD_CONTRACT_ADDRESSES = frozenset({AAVE_V3_POOL_ADDRESS})
+
+AAVE_V3_POOL_ABI = [
+    {"inputs": [{"name": "asset", "type": "address"}, {"name": "amount", "type": "uint256"},
+                {"name": "onBehalfOf", "type": "address"}, {"name": "referralCode", "type": "uint16"}],
+     "name": "supply", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+    {"inputs": [{"name": "asset", "type": "address"}, {"name": "amount", "type": "uint256"},
+                {"name": "to", "type": "address"}],
+     "name": "withdraw", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "nonpayable", "type": "function"},
+    {"inputs": [{"name": "asset", "type": "address"}], "name": "getReserveData",
+     "outputs": [{"components": [
+         {"components": [{"name": "data", "type": "uint256"}], "name": "configuration", "type": "tuple"},
+         {"name": "liquidityIndex", "type": "uint128"}, {"name": "currentLiquidityRate", "type": "uint128"},
+         {"name": "variableBorrowIndex", "type": "uint128"}, {"name": "currentVariableBorrowRate", "type": "uint128"},
+         {"name": "currentStableBorrowRate", "type": "uint128"}, {"name": "lastUpdateTimestamp", "type": "uint40"},
+         {"name": "id", "type": "uint16"}, {"name": "aTokenAddress", "type": "address"},
+         {"name": "stableDebtTokenAddress", "type": "address"}, {"name": "variableDebtTokenAddress", "type": "address"},
+         {"name": "interestRateStrategyAddress", "type": "address"}, {"name": "accruedToTreasury", "type": "uint128"},
+         {"name": "unbacked", "type": "uint128"}, {"name": "isolationModeTotalDebt", "type": "uint128"}],
+         "name": "", "type": "tuple"}],
+     "stateMutability": "view", "type": "function"},
+]
+
 ERC20_ABI = [
     {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}],
      "stateMutability": "view", "type": "function"},

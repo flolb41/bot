@@ -123,6 +123,9 @@ class _FakeTreasury:
     async def idle_usdc(self):
         return 10.35
 
+    async def deposited_usdc(self):
+        return 8.0
+
 
 class _FakeMarket:
     def __init__(self):
@@ -157,5 +160,25 @@ def test_treasury_config_and_observation_run(tmp_path):
     store = PerpsStore(tmp_path / "treasury-run.db")
     config = TreasuryConfig.from_dict({"wallet_address": "0x032d16Ec1F4382287cBBFbB87Dd8163934A01803", "interval_minutes": 60})
     row = asyncio.run(run_treasury_observation(store, config, _FakeTreasury(), T0))
-    assert row["aave_usdc_apr_pct"] == 4.88 and row["vault_12m_apr_pct"] == 8.9
-    assert store.latest_treasury_observation()["idle_usdc"] == 10.35
+    assert row["aave_usdc_apr_pct"] == 4.88 and row["vault_12m_apr_pct"] == 8.9 and row["deposited_usdc"] == 8.0
+    latest = store.latest_treasury_observation()
+    assert latest["idle_usdc"] == 10.35 and latest["deposited_usdc"] == 8.0
+
+
+def test_treasury_table_migration_adds_deposited_column(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE perps_treasury_observations (observed_at REAL PRIMARY KEY, idle_usdc REAL, aave_usdc_apr_pct REAL, "
+        "vault_7d_apr_pct REAL, vault_30d_apr_pct REAL, vault_12m_apr_pct REAL, best_apr_pct REAL, best_venue TEXT, "
+        "missed_yield_usd REAL NOT NULL DEFAULT 0);"
+        "INSERT INTO perps_treasury_observations (observed_at, idle_usdc, missed_yield_usd) VALUES (1, 10.0, 0.5);"
+    )
+    conn.commit(); conn.close()
+    store = PerpsStore(path)                                    # applique la migration sans perdre la ligne
+    latest = store.latest_treasury_observation()
+    assert latest["idle_usdc"] == 10.0 and latest["deposited_usdc"] is None
+    store.record_treasury_observation({"observed_at": 2, "idle_usdc": 2.0, "deposited_usdc": 8.0, "missed_yield_usd": 0.5})
+    assert store.latest_treasury_observation()["deposited_usdc"] == 8.0
