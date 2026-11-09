@@ -29,7 +29,11 @@ scheduler:
   # de 1 min sans risquer de sauter des ticks ("maximum number of running
   # instances"). Un seul fetch DexScreener partagé par cycle (voir
   # collect_pairs_for_config) évite de surcharger l'API publique.
-  arbitrage_scan_interval_minutes: 1
+  #
+  # Depuis le 08/11/2026 ce tick n'est qu'un REPLI (WebSocket coupé) : il
+  # s'efface si un scan a démarré depuis moins de
+  # `trading.ws_min_scan_interval_seconds` (120 s), qui fixe la cadence réelle.
+  arbitrage_scan_interval_minutes: 2
 
 dashboard:
   enabled: true
@@ -97,6 +101,16 @@ directional_live:
 trading:
   enabled: true
   chain: base
+  # Cadence réelle des scans : intervalle minimal entre deux scans déclenchés
+  # par un nouveau bloc (WebSocket). Passé de 30 s à 120 s le 08/11/2026 :
+  # 1 352 signaux/jour sans un seul rentable réel, ~90 quarantaines Infura
+  # (429) par 3 h et un CPU saturé pour rien — la fenêtre d'un vrai écart
+  # inter-DEX sur Base se ferme en moins d'un bloc, 30 s ou 120 s ne change
+  # rien à ce que ce bot peut capter. Le scan planifié (`scheduler.
+  # arbitrage_scan_interval_minutes`) ne sert plus que de repli quand le
+  # WebSocket est coupé : il s'efface si un scan a démarré depuis moins de
+  # cette durée.
+  ws_min_scan_interval_seconds: 120
   # balancer/curve/maverick ajoutés le 2026-10-08 en DÉTECTION SEULE (jamais
   # ajoutés à `app.trading.routers.EXECUTABLE_DEXES` : toute tentative
   # d'exécution dessus est refusée proprement par `executor.py`/`flashloan.py`,

@@ -303,6 +303,32 @@ def cmd_execute_arbitrage(args: argparse.Namespace) -> None:
             print(f"    détail  : {result['error']}")
 
 
+def cmd_liquidate_inventory(args: argparse.Namespace) -> None:
+    """Revend en USDC (ou WETH) le solde d'un token hérité d'un round-trip
+    interrompu, hors de tout signal — par défaut un aperçu (dry-run) ; la
+    vente réelle exige `--execute` ET le trading live activé. Mêmes garde-fous
+    que la récupération automatique (voir `executor.sell_token_balance`)."""
+    from app.trading.executor import USDC_ADDRESS, sell_token_balance
+
+    config, db, _ = _build_components(args.config)
+    for token in args.tokens:
+        result = sell_token_balance(
+            db, config.raw, token, args.quote or USDC_ADDRESS, dry_run=not args.execute,
+        )
+        label = "DRY-RUN" if result["dry_run"] else ("✅ VENDU" if result["sold"] else "⚪ non vendu")
+        print(f"- {token} : {label} — solde {result['balance']:.6f} ≈ {result['estimated_value_usd']:.2f}$")
+        plan = result.get("plan")
+        if plan:
+            print(f"    DEX {plan['dex']} @ {plan['price_usd']:.6f}$ (profondeur {plan['depth_usd']:.0f}$), "
+                  f"minimum reçu {plan['min_quote_out']:.6f}")
+            if plan["alternatives"]:
+                print("    alternatives : " + ", ".join(f"{d} @ {p:.6f}$" for d, p in plan["alternatives"]))
+        if result["tx_hash"]:
+            print(f"    tx : {result['tx_hash']} — reçu {result['received_quote']}")
+        if result["error"]:
+            print(f"    détail : {result['error']}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Crypto Reward Hunter - bot d'arbitrage inter-DEX")
     parser.add_argument("--config", default="config/config.yaml", help="Chemin du fichier de config YAML")
@@ -339,6 +365,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scanne et tente d'exécuter réellement les opportunités rentables "
              "(sans effet tant que le trading live n'est pas explicitement activé).",
     ).set_defaults(func=cmd_execute_arbitrage)
+
+    liquidate_parser = sub.add_parser(
+        "liquidate-inventory",
+        help="Revend en USDC le solde de tokens hérités d'un round-trip interrompu "
+             "(aperçu par défaut ; --execute pour vendre réellement).",
+    )
+    liquidate_parser.add_argument("tokens", nargs="+", help="Adresse(s) du/des token(s) à revendre")
+    liquidate_parser.add_argument("--quote", default=None, help="Token reçu (défaut : USDC)")
+    liquidate_parser.add_argument("--execute", action="store_true", help="Envoie réellement les transactions")
+    liquidate_parser.set_defaults(func=cmd_liquidate_inventory)
     return parser
 
 

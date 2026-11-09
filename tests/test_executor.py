@@ -651,3 +651,73 @@ def test_execute_signal_sizes_buy_min_amount_out_with_pool_fee(tmp_path, monkeyp
     expected = int(0.54 / 0.50 * 10 ** 18 * (1 - 0.0005) * (1 - 0.01))
     assert captured["min_amount_out"] == expected
     assert captured["dex"] == "uniswap"
+
+
+# --- Liquidation manuelle d'inventaire -------------------------------------------
+
+def test_sell_token_balance_dry_run_plans_best_dex_without_sending(tmp_path, monkeypatch):
+    from app.database import Database
+
+    db = Database(tmp_path / "liq.db")
+    _stub_live_execution_environment(monkeypatch, quote_balance_units=5 * 10 ** 18)
+    monkeypatch.setattr(executor, "is_trading_live", lambda _config: False)   # dry-run possible même hors live
+    prices = {"uniswap": 0.36, "pancakeswap": 0.355, "aerodrome": 0.34}
+    monkeypatch.setattr(
+        executor, "_refresh_price_usd",
+        lambda _chain, _token, _quote, dex, reference_price_usd=None: prices.get(dex),
+    )
+    depths = {"uniswap": 3.0, "pancakeswap": 150_000.0, "aerodrome": 0.2}   # uniswap : pool fantôme
+    monkeypatch.setattr(executor, "_onchain_quote_depth_usd", lambda dex, _t, _q: depths.get(dex))
+    monkeypatch.setattr(executor, "_pool_fee_pct", lambda *_args, **_kwargs: 0.05)
+    monkeypatch.setattr(
+        executor, "send_trading_transaction",
+        lambda *_args, **_kwargs: pytest.fail("un dry-run ne doit rien envoyer"),
+    )
+
+    result = executor.sell_token_balance(db, {"trading": {}}, ICNT, USDC.lower(), dry_run=True)
+
+    assert result["dry_run"] is True and result["sold"] is False and result["error"] is None
+    assert result["balance"] == 5.0 and result["estimated_value_usd"] == pytest.approx(1.8)
+    assert result["dex"] == "pancakeswap"                       # uniswap écarté : 3 $ de profondeur
+    assert result["plan"]["min_quote_out"] == pytest.approx(5 * 0.355 * (1 - 0.0005) * (1 - 0.01))
+
+
+def test_sell_token_balance_executes_and_records_received_quote(tmp_path, monkeypatch):
+    from app.database import Database
+
+    db = Database(tmp_path / "liq-exec.db")
+    _stub_live_execution_environment(monkeypatch, quote_balance_units=5 * 10 ** 18)
+    monkeypatch.setattr(executor, "_refresh_price_usd", lambda *_args, **_kwargs: 0.36)
+    monkeypatch.setattr(executor, "_onchain_quote_depth_usd", lambda *_args: 100_000.0)
+    monkeypatch.setattr(executor, "_pool_fee_pct", lambda *_args, **_kwargs: 0.05)
+    monkeypatch.setattr(
+        executor, "_build_swap_call_and_ensure_allowance",
+        lambda *_args, **_kwargs: ("0x" + "9" * 40, [], "swap", (), {"error": None, "gas_cost_wei": 0}),
+    )
+    receipt = {"logs": [_transfer_log(USDC, "0x" + "2" * 40, WALLET, 1_790_000)]}
+    sent = {}
+
+    def fake_send(*_args, **kwargs):
+        sent.update(kwargs)
+        return {"sent": True, "tx_hash": "sellhash", "error": None, "gas_cost_wei": 10 ** 12, "receipt": receipt}
+
+    monkeypatch.setattr(executor, "send_trading_transaction", fake_send)
+
+    result = executor.sell_token_balance(db, {"trading": {}}, ICNT, USDC.lower())
+
+    assert result["sold"] is True and result["tx_hash"] == "sellhash"
+    assert result["received_quote"] == pytest.approx(1.79)
+    assert sent["count_against_daily_limit"] is False                   # clôture d'exposition, pas un nouveau risque
+    assert db.list_notifications(limit=1)[0]["title"] == "🧹 Inventaire liquidé"
+
+
+def test_sell_token_balance_refuses_dust_and_unknown_quote(tmp_path, monkeypatch):
+    from app.database import Database
+
+    db = Database(tmp_path / "liq-dust.db")
+    assert "non exécutable" in executor.sell_token_balance(db, {}, ICNT, "0x" + "c" * 40, dry_run=True)["error"]
+
+    _stub_live_execution_environment(monkeypatch, quote_balance_units=10 ** 18)   # 1 token ≈ 0,36 $
+    monkeypatch.setattr(executor, "_refresh_price_usd", lambda *_args, **_kwargs: 0.36)
+    result = executor.sell_token_balance(db, {"trading": {}}, ICNT, USDC.lower(), dry_run=True)
+    assert result["sold"] is False and "sous le minimum" in result["error"]

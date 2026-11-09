@@ -337,6 +337,39 @@ Hypothèses de modélisation : le spread joue contre le trader à l'ouverture et
 ordre déclencheur côté venue. Les résultats papier ne préjugent pas d'une
 exécution live, qui n'est pas implémentée.
 
+## Analyse : persistance des écarts
+
+`scripts/spread_persistence.py` (lecture seule) mesure, sur les N derniers
+jours, combien de temps chaque écart ≥ seuil persiste d'un scan à l'autre et
+croise avec les tentatives live (écart détecté vs écart revérifié on-chain au
+moment d'agir, P&L réalisé). Un écart réel capté par un bot lent n'apparaît
+que dans un scan ; un écart présent des heures à valeur figée est structurel
+(pool quasi vide, prix DexScreener périmé, frais non couverts).
+
+```bash
+.venv/bin/python scripts/spread_persistence.py --days 30 --threshold 0.7 [--json rapport.json]
+```
+
+Résultat du 08/11/2026 (30 j, 135 017 signaux) : les 12 routes les plus
+fréquentes ≥ 0,7 % étaient toutes structurelles (jusqu'à 14 h d'affilée, CV de
+l'écart ≈ 0), les signaux « rentables » survivaient à 100 % au scan suivant,
+et à l'exécution l'écart réel était systématiquement sous les frais. La
+latence n'était donc pas le facteur limitant : les écarts affichés n'existaient
+pas on-chain (cf. le correctif ABI PancakeSwap V3 du même jour).
+
+## Liquidation manuelle d'inventaire
+
+```bash
+.venv/bin/python main.py liquidate-inventory 0x<token> [0x<token2>]   # aperçu (dry-run)
+.venv/bin/python main.py liquidate-inventory 0x<token> --execute       # vente réelle en USDC
+```
+
+Revend tout le solde d'un token hérité d'un round-trip interrompu sur le DEX
+exécutable au meilleur prix on-chain, avec les garde-fous de la récupération
+automatique (profondeur de pool ≥ 20× la taille, `amountOutMinimum` net des
+frais, routeur whitelisté, killswitch) ; la vente n'est pas décomptée du
+plafond quotidien de transactions.
+
 ## Docker
 
 ```bash

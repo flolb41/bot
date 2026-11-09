@@ -2132,3 +2132,137 @@ def recover_open_positions(db: Database, config: dict) -> list[dict]:
             results.append(outcome)
 
     return results
+
+
+def sell_token_balance(db: Database, config: dict, token_address: str, quote_address: str, *,
+                       dry_run: bool = False) -> dict:
+    """Revend TOUT le solde de `token_address` contre `quote_address` (USDC/WETH)
+    sur le DEX exécutable offrant le meilleur prix on-chain — liquidation
+    manuelle d'un inventaire (`main.py liquidate-inventory`), hors de tout
+    signal d'arbitrage. Mêmes garde-fous que `recover_open_positions` :
+    trading live requis, prix on-chain obligatoire, profondeur de pool
+    vérifiée, `amountOutMinimum` net des frais de la pool, routeur whitelisté,
+    killswitch. `dry_run=True` calcule et renvoie le plan sans rien envoyer.
+
+    Retourne `{"sold": bool, "dry_run": bool, "dex": str|None, "balance": float,
+    "estimated_value_usd": float, "received_quote": float|None, "tx_hash": str|None,
+    "error": str|None}`."""
+    result: dict = {
+        "sold": False, "dry_run": dry_run, "dex": None, "balance": 0.0, "estimated_value_usd": 0.0,
+        "received_quote": None, "tx_hash": None, "error": None,
+    }
+    if quote_address.lower() not in EXECUTABLE_QUOTE_TOKENS:
+        result["error"] = f"Quote {quote_address} non exécutable — seuls {sorted(EXECUTABLE_QUOTE_TOKENS)} sont supportés."
+        return result
+    if not dry_run and not is_trading_live(config):
+        result["error"] = "Trading live désactivé (voir app.trading.guardrails.is_trading_live) — utiliser dry_run."
+        return result
+    try:
+        from web3 import Web3
+        w3 = make_w3(timeout=15)
+        if not _is_connected_with_retry(w3):
+            result["error"] = "RPC Base injoignable."
+            return result
+        from app.trading.guardrails import trading_keystore_path
+        from app.wallet.signer import load_signer
+        signer_account = load_signer(
+            keystore_path=trading_keystore_path(), passphrase=os.environ.get("WALLET_TRADING_PASSPHRASE")
+        )
+        wallet_address = signer_account.address
+        signer_account = None
+
+        token_contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
+        balance_units = _balance_of_with_retry(token_contract, wallet_address)
+        token_decimals = _get_decimals(w3, token_address)
+        quote_decimals = _get_decimals(w3, quote_address)
+        result["balance"] = balance_units / (10 ** token_decimals)
+        if balance_units <= 0:
+            result["error"] = "Solde nul : rien à vendre."
+            return result
+        quote_usd_price = _quote_token_usd_price(quote_address)
+        if not quote_usd_price or quote_usd_price <= 0:
+            result["error"] = "Prix USD du quote indisponible — refus par prudence."
+            return result
+
+        dex_prices = []
+        for dex in EXECUTABLE_DEXES:
+            price = _refresh_price_usd("base", token_address, quote_address, dex)
+            if price:
+                dex_prices.append((dex, price))
+        if not dex_prices:
+            result["error"] = "Aucun prix on-chain disponible sur les DEX exécutables."
+            return result
+        dex_prices.sort(key=lambda dp: dp[1], reverse=True)
+        best_price = dex_prices[0][1]
+        estimated_value_usd = result["balance"] * best_price
+        result["estimated_value_usd"] = estimated_value_usd
+        if estimated_value_usd < _MIN_RECOVERY_VALUE_USD:
+            result["error"] = f"Valeur ~{estimated_value_usd:.2f}$ sous le minimum de {_MIN_RECOVERY_VALUE_USD:.2f}$ : le gas coûterait plus cher."
+            return result
+
+        slip = slippage_pct() / 100.0
+        deadline = int(time.time()) + 180
+        last_error = None
+        for dex, price in dex_prices:
+            depth_usd = _onchain_quote_depth_usd(dex, token_address, quote_address)
+            # Au moins 20x la taille vendue en profondeur côté quote : évite les
+            # pools fantômes (ex. Uniswap BRETT/USDC ≈ 3 $) et un impact de prix
+            # que la tolérance de slippage ne couvrirait pas.
+            if depth_usd is None or depth_usd < 20 * estimated_value_usd:
+                last_error = f"{dex} : profondeur on-chain insuffisante ({depth_usd if depth_usd is None else round(depth_usd, 2)}$)."
+                continue
+            min_quote_out_units = _min_amount_out_units(
+                balance_units / (10 ** token_decimals) * price / quote_usd_price * (10 ** quote_decimals),
+                fee_pct=_pool_fee_pct(w3, dex, token_address, quote_address, quote_address),
+                slippage_pct=slip * 100,
+            )
+            result["dex"] = dex
+            result["plan"] = {
+                "dex": dex, "price_usd": price, "depth_usd": depth_usd,
+                "min_quote_out": min_quote_out_units / (10 ** quote_decimals),
+                "alternatives": [(d, p) for d, p in dex_prices if d != dex],
+            }
+            if dry_run:
+                return result
+            contract_address, abi, fn_name, args, approve_result = _build_swap_call_and_ensure_allowance(
+                db, w3, dex=dex, token_in=token_address, token_out=quote_address,
+                amount_in=balance_units, min_amount_out=min_quote_out_units,
+                recipient=wallet_address, deadline=deadline, quote_address=quote_address,
+                allowance_token_address=token_address, owner=wallet_address,
+                allowance_amount=balance_units, count_against_daily_limit=False,
+            )
+            if approve_result["error"]:
+                last_error = f"Approve échoué sur {dex} : {approve_result['error']}"
+                logger.warning("Liquidation %s : %s", token_address, last_error)
+                continue
+            sell_result = send_trading_transaction(
+                db, rpc_url=_resolve_rpc_url(), contract_address=contract_address, abi=abi,
+                function_name=fn_name, args=args, whitelist_target=contract_address,
+                action_label=f"liquidation inventaire {token_address[:10]} sur {dex}",
+                count_against_daily_limit=False,
+            )
+            if sell_result["error"]:
+                last_error = f"Vente échouée sur {dex} : {sell_result['error']}"
+                logger.warning("Liquidation %s : %s", token_address, last_error)
+                continue
+            result["sold"] = True
+            result["tx_hash"] = sell_result["tx_hash"]
+            received_units = _net_token_transfer_from_receipts(quote_address, wallet_address, [sell_result.get("receipt")])
+            result["received_quote"] = received_units / (10 ** quote_decimals) if received_units is not None else None
+            message = (
+                f"Inventaire liquidé : {result['balance']:.6f} {token_address[:10]} → "
+                f"{result['received_quote'] if result['received_quote'] is not None else '?'} quote sur {dex} "
+                f"(~{estimated_value_usd:.2f}$) — tx {result['tx_hash']}"
+            )
+            logger.warning(message)
+            db.add_notification(title="🧹 Inventaire liquidé", message=message, level="info")
+            return result
+        result["error"] = last_error or "Vente impossible sur tous les DEX exécutables."
+        return result
+    except TradingRefused as exc:
+        result["error"] = f"Refusé par un garde-fou : {exc}"
+        return result
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Erreur inattendue pendant sell_token_balance")
+        result["error"] = f"Erreur inattendue : {exc}"
+        return result

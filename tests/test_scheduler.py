@@ -1,4 +1,4 @@
-"""Tests de la logique pure (pas de réseau/RPC/scheduler APScheduler réel) de
+﻿"""Tests de la logique pure (pas de réseau/RPC/scheduler APScheduler réel) de
 app.scheduler : calcul du profit effectif utilisé pour classer les signaux
 rentables entre eux (quel candidat tenter en premier dans un cycle)."""
 from pathlib import Path
@@ -381,3 +381,35 @@ def test_successful_live_execution_is_logged(tmp_path: Path, monkeypatch, caplog
 
     messages = [record.getMessage() for record in caplog.records]
     assert any("Exécution LIVE réussie : ICNT/USDC" in m and "buyhash" in m for m in messages)
+
+
+def test_fallback_scan_yields_to_recent_websocket_scan(tmp_path: Path, monkeypatch):
+    import app.scheduler as scheduler
+
+    calls = []
+    monkeypatch.setattr(scheduler, "run_arbitrage_scan_job", lambda *_args: calls.append(True))
+
+    class _Listener:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(scheduler, "BlockWebSocketListener", _Listener)
+    db = Database(tmp_path / "fallback.db")
+    config = {"trading": {"ws_min_scan_interval_seconds": 120}, "system_health": {"enabled": False}, "database": {"retention_days": 0}}
+    sched = scheduler.build_scheduler(db, None, arbitrage_scan_interval_minutes=2, config=config)
+    fallback = sched.get_job("arbitrage_scan").func
+    assert sched.ws_listener.kwargs["min_scan_interval_seconds"] == 120.0
+
+    import time as _time
+    db.set_state("last_scan_started_at", str(_time.time() - 30))     # scan WebSocket il y a 30 s
+    fallback()
+    assert calls == []
+    db.set_state("last_scan_started_at", str(_time.time() - 130))    # plus vieux que l'intervalle minimal
+    fallback()
+    assert calls == [True]
+    db.set_state("last_scan_started_at", "invalide")
+    fallback()
+    assert calls == [True, True]

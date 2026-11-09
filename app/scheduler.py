@@ -488,10 +488,24 @@ def build_scheduler(
     ws_urls: Optional[list[str]] = None,
 ) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="UTC")
+    min_scan_interval_seconds = float((config or {}).get("trading", {}).get("ws_min_scan_interval_seconds", 30.0))
+
+    def _fallback_scan() -> None:
+        """Scan planifié = REPLI quand le WebSocket est coupé : s'efface si un
+        scan a démarré il y a moins de `ws_min_scan_interval_seconds`. Sans ce
+        garde, le tick planifié s'ajoutait aux scans déclenchés par bloc et la
+        cadence réelle dépassait celle configurée (RPC 429 en continu)."""
+        last_started = db.get_state("last_scan_started_at")
+        try:
+            if last_started and time.time() - float(last_started) < min_scan_interval_seconds:
+                return
+        except ValueError:
+            pass
+        run_arbitrage_scan_job(db, telegram, config)
 
     scheduler.add_job(
-        run_arbitrage_scan_job, IntervalTrigger(minutes=arbitrage_scan_interval_minutes),
-        args=[db, telegram, config], id="arbitrage_scan", replace_existing=True,
+        _fallback_scan, IntervalTrigger(minutes=arbitrage_scan_interval_minutes),
+        id="arbitrage_scan", replace_existing=True,
     )
 
     # --- WebSocket newHeads : déclenche un scan dès un nouveau bloc, avec
@@ -507,7 +521,7 @@ def build_scheduler(
     ws_listener = BlockWebSocketListener(
         on_new_block=_on_new_block,
         ws_urls=ws_urls,
-        min_scan_interval_seconds=float((config or {}).get("trading", {}).get("ws_min_scan_interval_seconds", 30.0)),
+        min_scan_interval_seconds=min_scan_interval_seconds,
     )
     ws_listener.start()
     scheduler.ws_listener = ws_listener  # type: ignore[attr-defined] — pour arrêt propre dans main.py
