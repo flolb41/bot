@@ -75,6 +75,30 @@ CREATE TABLE IF NOT EXISTS perps_state (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS perps_funding_scan (
+    observed_at REAL NOT NULL,
+    symbol TEXT NOT NULL,
+    funding_long_pct_h REAL,
+    funding_short_pct_h REAL,
+    rollover_pct_h REAL,
+    oi_long_usd REAL,
+    oi_short_usd REAL,
+    market_open INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (symbol, observed_at)
+);
+
+CREATE TABLE IF NOT EXISTS perps_treasury_observations (
+    observed_at REAL PRIMARY KEY,
+    idle_usdc REAL,
+    aave_usdc_apr_pct REAL,
+    vault_7d_apr_pct REAL,
+    vault_30d_apr_pct REAL,
+    vault_12m_apr_pct REAL,
+    best_apr_pct REAL,
+    best_venue TEXT,
+    missed_yield_usd REAL NOT NULL DEFAULT 0
+);
 """
 
 
@@ -147,6 +171,14 @@ class PerpsStore:
             "SELECT o.* FROM perps_observations o JOIN ("
             "  SELECT symbol, MAX(observed_at) AS observed_at FROM perps_observations GROUP BY symbol"
             ") latest ON latest.symbol = o.symbol AND latest.observed_at = o.observed_at ORDER BY o.symbol"
+        )
+
+    def carry_apr_history(self, symbol: str, since: float) -> list[dict[str, Any]]:
+        """Observations (funding short, rollover) d'une paire depuis `since`, par ordre chronologique."""
+        return self.fetch_all(
+            "SELECT observed_at, funding_short_pct_h, rollover_pct_h FROM perps_observations "
+            "WHERE symbol = ? AND observed_at >= ? ORDER BY observed_at",
+            (symbol, since),
         )
 
     def prune_observations(self, older_than: float) -> int:
@@ -246,3 +278,48 @@ class PerpsStore:
 
     def recent_events(self, limit: int = 50) -> list[dict[str, Any]]:
         return self.fetch_all("SELECT * FROM perps_events ORDER BY created_at DESC, id DESC LIMIT ?", (limit,))
+
+    # --- scan de funding (toutes paires) ----------------------------------------------
+    def record_funding_scan(self, rows: list[dict[str, Any]]) -> None:
+        with self.connection() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO perps_funding_scan (observed_at, symbol, funding_long_pct_h, funding_short_pct_h, "
+                "rollover_pct_h, oi_long_usd, oi_short_usd, market_open) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (r["observed_at"], r["symbol"], r["funding_long_pct_h"], r["funding_short_pct_h"],
+                     r["rollover_pct_h"], r["oi_long_usd"], r["oi_short_usd"], int(r["market_open"]))
+                    for r in rows
+                ],
+            )
+
+    def latest_funding_scan(self) -> list[dict[str, Any]]:
+        return self.fetch_all(
+            "SELECT f.* FROM perps_funding_scan f JOIN (SELECT MAX(observed_at) AS observed_at FROM perps_funding_scan) "
+            "latest ON latest.observed_at = f.observed_at ORDER BY f.symbol"
+        )
+
+    def prune_funding_scan(self, older_than: float) -> int:
+        with self.connection() as conn:
+            return conn.execute("DELETE FROM perps_funding_scan WHERE observed_at < ?", (older_than,)).rowcount
+
+    # --- trésorerie ---------------------------------------------------------------------
+    def record_treasury_observation(self, row: dict[str, Any]) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO perps_treasury_observations (observed_at, idle_usdc, aave_usdc_apr_pct, "
+                "vault_7d_apr_pct, vault_30d_apr_pct, vault_12m_apr_pct, best_apr_pct, best_venue, missed_yield_usd) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row["observed_at"], row.get("idle_usdc"), row.get("aave_usdc_apr_pct"), row.get("vault_7d_apr_pct"),
+                    row.get("vault_30d_apr_pct"), row.get("vault_12m_apr_pct"), row.get("best_apr_pct"),
+                    row.get("best_venue"), float(row.get("missed_yield_usd") or 0.0),
+                ),
+            )
+
+    def latest_treasury_observation(self) -> dict[str, Any] | None:
+        return self.fetch_one("SELECT * FROM perps_treasury_observations ORDER BY observed_at DESC LIMIT 1")
+
+    def treasury_history(self, since: float) -> list[dict[str, Any]]:
+        return self.fetch_all(
+            "SELECT * FROM perps_treasury_observations WHERE observed_at >= ? ORDER BY observed_at", (since,),
+        )

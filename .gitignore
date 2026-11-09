@@ -6,6 +6,7 @@ __pycache__/
 data/*.db
 data/*.db.lock
 data/ohlcv_cache/
+data/perps_candles/
 data/*.db-journal
 data/keystore.json
 data/keystore_vault.json

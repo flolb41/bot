@@ -48,13 +48,48 @@ async def run_tick(engine: PaperEngine, provider: MarketDataProvider, config: Pe
     return summary
 
 
+async def run_periodic_jobs(store: PerpsStore, config: PerpsConfig, provider: MarketDataProvider,
+                            treasury_provider, now: float | None = None) -> dict[str, Any]:
+    """Tâches lentes exécutées à leur propre cadence depuis la boucle principale :
+    balayage du funding de toutes les paires et observation de trésorerie."""
+    now = now if now is not None else time.time()
+    done: dict[str, Any] = {}
+    if config.funding_scan.enabled:
+        last = store.get_state("last_funding_scan_at")
+        if not last or now - float(last) >= config.funding_scan.interval_minutes * 60:
+            from app.perps.funding_scan import run_funding_scan
+
+            try:
+                rows = await provider.funding_snapshot()
+                done["funding_alerts"] = run_funding_scan(store, config.funding_scan, rows, now)
+                done["funding_pairs"] = len(rows)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Balayage du funding impossible : %s: %s", type(exc).__name__, str(exc)[:160])
+    if config.treasury.enabled and treasury_provider is not None:
+        last = store.get_state("last_treasury_at")
+        if not last or now - float(last) >= config.treasury.interval_minutes * 60:
+            from app.perps.treasury import run_treasury_observation
+
+            try:
+                done["treasury"] = await run_treasury_observation(store, config.treasury, treasury_provider, now)
+                store.set_state("last_treasury_at", str(now))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Observation de trésorerie impossible : %s: %s", type(exc).__name__, str(exc)[:160])
+    return done
+
+
 async def run_forever(config: PerpsConfig, provider: MarketDataProvider | None = None,
-                      stop_event: asyncio.Event | None = None) -> None:
+                      stop_event: asyncio.Event | None = None, treasury_provider=None) -> None:
     store = PerpsStore(config.database_path)
     engine = PaperEngine(store, config)
-    provider = provider or VerantaMarketData(
-        reference_notional_usd=config.trend.notional_usd, reference_leverage=config.trend.leverage,
-    )
+    if provider is None:
+        provider = VerantaMarketData(
+            reference_notional_usd=config.trend.notional_usd, reference_leverage=config.trend.leverage,
+        )
+        if treasury_provider is None and config.treasury.enabled:
+            from app.perps.treasury import VerantaTreasuryData
+
+            treasury_provider = VerantaTreasuryData(config.treasury, market_data=provider)
     stop_event = stop_event or asyncio.Event()
     tasks: list[asyncio.Task] = []
 
@@ -78,6 +113,10 @@ async def run_forever(config: PerpsConfig, provider: MarketDataProvider | None =
                 await run_tick(engine, provider, config)
             except Exception:  # noqa: BLE001 - le service ne doit jamais mourir sur un tick
                 logger.exception("Tick perps en échec.")
+            try:
+                await run_periodic_jobs(store, config, provider, treasury_provider)
+            except Exception:  # noqa: BLE001
+                logger.exception("Tâches périodiques perps en échec.")
             delay = max(5.0, interval - (time.time() - started))
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=delay)

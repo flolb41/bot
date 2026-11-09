@@ -18,6 +18,8 @@ logger = logging.getLogger("app.perps.market_data")
 class MarketDataProvider(Protocol):
     async def pair_state(self, symbol: str) -> PairState: ...
 
+    async def funding_snapshot(self) -> list[dict]: ...
+
     async def close(self) -> None: ...
 
 
@@ -26,6 +28,32 @@ def _as_float(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def funding_rows_from_snapshot(snapshot, observed_at: float | None = None) -> list[dict]:
+    """Aplatit `markets.snapshot()` en lignes de funding/rollover/OI par paire
+    (fonction pure, testable). Les paires sans `funding_rate` sont ignorées."""
+    pairs = getattr(snapshot, "pairs", None) or getattr(snapshot, "pair_infos", None) or []
+    items = pairs.values() if isinstance(pairs, dict) else pairs
+    now = observed_at if observed_at is not None else time.time()
+    rows: list[dict] = []
+    for pair in items:
+        funding = getattr(pair, "funding_rate", None)
+        if funding is None or not getattr(pair, "symbol", None):
+            continue
+        rollover = getattr(pair, "margin_fee", None)
+        oi = getattr(pair, "coin_oi", None) or getattr(pair, "open_interest", None)
+        rows.append({
+            "observed_at": now,
+            "symbol": str(pair.symbol),
+            "funding_long_pct_h": _as_float(getattr(funding, "long", 0)),
+            "funding_short_pct_h": _as_float(getattr(funding, "short", 0)),
+            "rollover_pct_h": max(_as_float(getattr(rollover, "long", 0)), _as_float(getattr(rollover, "short", 0))),
+            "oi_long_usd": _as_float(getattr(oi, "long", 0)),
+            "oi_short_usd": _as_float(getattr(oi, "short", 0)),
+            "market_open": bool(getattr(pair, "is_market_open", True)),
+        })
+    return rows
 
 
 def pair_state_from_sdk(symbol: str, pair, price, spread_pct: float | None, observed_at: float | None = None) -> PairState:
@@ -90,6 +118,10 @@ class VerantaMarketData:
         except Exception as exc:  # noqa: BLE001 - le spread statique de la paire reste un repli acceptable
             logger.info("Spread dynamique indisponible pour %s (%s) — spread statique de la paire utilisé.", symbol, exc)
         return pair_state_from_sdk(symbol, pair, price, spread_pct)
+
+    async def funding_snapshot(self) -> list[dict]:
+        client = await self._get_client()
+        return funding_rows_from_snapshot(await client.markets.snapshot())
 
     async def close(self) -> None:
         if self._client is not None:

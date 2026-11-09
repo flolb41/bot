@@ -439,12 +439,14 @@ perps:
   # = funding reçu par le côté short ; le funding Veranta est exprimé par heure.
   funding_carry:
     enabled: true
-    markets: [ETH/USD, BTC/USD]   # spot profond sur Base (WETH, cbBTC)
+    markets: [ETH/USD, BTC/USD]   # spot profond sur Base (WETH, cbBTC) ET rollover nul (les alts paient 5–15 %/an)
     notional_usd: 100
-    entry_min_apr_pct: 6          # entrer si le short encaisse ≥ 6 %/an de funding
-    exit_min_apr_pct: 0           # sortir si le funding devient un coût pour le short…
-    exit_confirm_ticks: 6         # … pendant 6 ticks consécutifs (30 min)
-    max_hold_hours: 336           # 14 jours
+    entry_min_apr_pct: 6          # rendement NET (funding encaissé − rollover) minimal pour entrer
+    entry_persistence_hours: 6    # … tenu (médiane) sur les 6 dernières heures d'observations
+    entry_min_edge_ratio: 2       # gain attendu sur max_hold_hours ≥ 2 × coût d'une rotation (~0,29 %)
+    exit_min_apr_pct: 0           # sortir si le funding net devient un coût pour le short…
+    exit_confirm_hours: 12        # … pendant 12 h d'affilée (30 min = 2 rotations inutiles le 09/11)
+    max_hold_hours: 720           # 30 jours : à 10 %/an, 10 jours suffisent à amortir l'entrée
     spot_cost_pct: 0.07           # 0,05 % de frais DEX + ~0,02 % de glissement par jambe spot
     spot_gas_usd: 0.02
   # Tendance basse fréquence, levier faible, stop/objectif/durée max, cooldown
@@ -464,3 +466,21 @@ perps:
     reentry_cooldown_minutes: 120
     max_open_positions: 3
     daily_loss_limit_usd: 5
+  # Balayage du funding de TOUTES les paires Veranta (un seul appel snapshot) :
+  # classement par rendement net (funding encaissé − rollover) et alerte sur
+  # les extrêmes. Les paires sans jambe spot sur Base (XMR short +110 %/an le
+  # 09/11/2026) sont signalées comme « biais directionnel seulement ».
+  funding_scan:
+    enabled: true
+    interval_minutes: 30
+    alert_min_net_apr_pct: 15
+    alert_cooldown_hours: 12
+    retention_days: 30
+  # Trésorerie (papier) : taux Aave V3 USDC lu on-chain, rendements du vault LP
+  # Veranta via le SDK, solde USDC oisif du wallet et manque à gagner cumulé.
+  # Aucun dépôt réel : c'est la référence que toute stratégie doit battre.
+  treasury:
+    enabled: true
+    interval_minutes: 60
+    wallet_address: "0x032d16Ec1F4382287cBBFbB87Dd8163934A01803"   # adresse publique (lecture seule)
+    # rpc_url: https://mainnet.base.org   # défaut : première URL de RPC_BASE, sinon le RPC public

@@ -312,13 +312,28 @@ papier avec ces coûts réels. Synthetix V3 sur Base a été écarté le 08/11/2
 (`maxOpenInterest = 0` sur ETH/BTC/SOL : marchés en extinction).
 
 - **`funding_carry`** : short perp + long spot modélisé (frais DEX, glissement,
-  gas) quand le côté short encaisse ≥ `entry_min_apr_pct` de funding ; sortie
-  quand le funding redevient un coût pendant `exit_confirm_ticks` ticks ou
-  après `max_hold_hours`.
+  gas) quand le rendement **net** du short (funding encaissé − rollover) tient
+  ≥ `entry_min_apr_pct` en médiane sur `entry_persistence_hours` et que le gain
+  attendu sur `max_hold_hours` couvre `entry_min_edge_ratio` fois le coût d'une
+  rotation ; sortie quand le funding net redevient un coût pendant
+  `exit_confirm_hours` d'affilée ou après `max_hold_hours`. Les alts Veranta
+  paient 5–15 %/an de rollover : seuls ETH/BTC (rollover nul) portent vraiment.
 - **`trend`** : tendance sur `lookback_minutes` confirmée par la dernière heure,
   levier faible, stop/objectif/durée max, cooldown de ré-entrée, plafond de
   positions et de perte journalière ; liquidation simulée à 85 % du collatéral
   (seuil Veranta).
+- **`funding_scan`** : toutes les 30 min, un seul appel `snapshot` lit le
+  funding, le rollover et l'intérêt ouvert des ~200 paires Veranta ; le
+  dashboard classe les paires par rendement net du meilleur côté et une alerte
+  (événement, 1 par paire/côté et par 12 h) signale les extrêmes
+  ≥ `alert_min_net_apr_pct`. Les paires sans jambe spot sur Base
+  (`spot_hedgeable`) sont marquées « biais directionnel seulement ».
+- **`treasury`** : toutes les heures, observe (papier) ce que le capital oisif
+  pourrait toucher : taux de dépôt USDC d'Aave V3 Base lu on-chain
+  (`getReserveData`, `eth_call` brut), rendements du vault LP Veranta via le
+  SDK, solde USDC du wallet (`wallet_address`, lecture seule) et manque à
+  gagner cumulé. Aucun dépôt réel : c'est la référence que toute stratégie
+  doit battre.
 
 Service **séparé** du bot d'arbitrage : process `perps_main.py`, venv
 `.venv-perps` (le SDK Veranta impose des versions d'`eth-account`/`websockets`
@@ -328,8 +343,30 @@ incompatibles avec web3), base `data/perps_paper.db`, journal
 
 ```bash
 bash ~/bot/scripts/install_perps_paper.sh   # une fois, sans sudo
-.venv-perps/bin/python perps_main.py status # résumé texte
+.venv-perps/bin/python perps_main.py status # résumé texte (marchés, stratégies, funding, trésorerie)
 ```
+
+### Backtest de la stratégie tendance
+
+Le papier produit ~3 trades par semaine : il faudrait des mois pour juger.
+`perps_main.py backtest` rejoue la stratégie sur les bougies du feed Veranta
+(1 an en 1 h, 2 ans en 4 h, 4 ans en journalier ; cache JSON dans
+`data/perps_candles/`) avec le **même modèle de coûts et les mêmes règles**
+que le moteur papier — un test de parité le garantit en mode `--close-only`.
+Par défaut, stop et objectif sont évalués sur les plus haut/plus bas de la
+bougie (stop d'abord si les deux sont touchés, gap exécuté à l'ouverture).
+
+```bash
+.venv-perps/bin/python perps_main.py backtest --symbol ETH/USD --resolution 60 --days 365
+.venv-perps/bin/python perps_main.py backtest --resolution 240 --days 730 --grid     # grille + walk-forward 70/30
+.venv-perps/bin/python perps_main.py backtest --symbol BTC/USD --live-costs --json    # coûts actuels du marché
+```
+
+`--grid` optimise sur les premiers 70 % de l'historique et juge les meilleures
+combinaisons sur les 30 % restants : seule la ligne « test » compte ; si elle
+est négative alors que l'entraînement était positif, la grille a sur-appris.
+Limites : un marché par simulation, coûts constants sur la période, pas de
+glissement au-delà du spread coté.
 
 Hypothèses de modélisation : le spread joue contre le trader à l'ouverture et
 à la clôture ; la jambe spot du carry est exécutée au prix d'index majoré de

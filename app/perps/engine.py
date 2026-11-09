@@ -148,16 +148,20 @@ class PaperEngine:
     def _evaluate_carry_exit(self, position: dict[str, Any], state: PairState, now: float) -> str | None:
         if not state.market_open:
             return None
-        key = f"carry_low_funding_ticks:{position['symbol']}"
-        apr = state.funding_income_apr_pct("short")
-        if apr < self.carry_cfg.exit_min_apr_pct:
-            ticks = int(self.store.get_state(key, "0") or 0) + 1
-            self.store.set_state(key, str(ticks))
-            if ticks >= self.carry_cfg.exit_confirm_ticks:
-                self.store.set_state(key, "0")
-                return self._close_carry(position, state, now, reason=f"funding_faible ({apr:+.1f} %/an)")
+        key = f"carry_low_since:{position['symbol']}"
+        net_apr = state.net_carry_apr_pct("short")
+        if net_apr < self.carry_cfg.exit_min_apr_pct:
+            since = self.store.get_state(key)
+            if not since:
+                self.store.set_state(key, str(now))
+            elif now - float(since) >= self.carry_cfg.exit_confirm_hours * 3600:
+                self.store.set_state(key, "")
+                return self._close_carry(
+                    position, state, now,
+                    reason=f"funding_faible ({net_apr:+.1f} %/an net depuis {(now - float(since)) / 3600:.0f} h)",
+                )
         else:
-            self.store.set_state(key, "0")
+            self.store.set_state(key, "")
         if (now - float(position["opened_at"])) / 3600 >= self.carry_cfg.max_hold_hours:
             return self._close_carry(position, state, now, reason="duree_max")
         return None
@@ -196,10 +200,21 @@ class PaperEngine:
             state = states.get(symbol)
             if state is None or symbol in open_symbols or not state.market_open:
                 continue
-            apr = state.funding_income_apr_pct("short")
-            if apr < self.carry_cfg.entry_min_apr_pct:
+            net_apr = state.net_carry_apr_pct("short")
+            if net_apr < self.carry_cfg.entry_min_apr_pct:
+                continue
+            if not self._carry_funding_persistent(symbol, now):
                 continue
             notional = max(self.carry_cfg.notional_usd, state.min_notional_usd)
+            costs = self.carry_cfg.round_trip_costs_usd(notional, state.open_fee_pct, state.close_fee_pct)
+            expected_income = notional * net_apr / 100 * self.carry_cfg.max_hold_hours / 8760
+            if expected_income < self.carry_cfg.entry_min_edge_ratio * costs:
+                logger.debug(
+                    "carry %s : gain attendu %.3f $ sur %.0f h < %.1f × coûts %.3f $ — pas d'entrée.",
+                    symbol, expected_income, self.carry_cfg.max_hold_hours, self.carry_cfg.entry_min_edge_ratio, costs,
+                )
+                continue
+            breakeven_hours = costs / (notional * net_apr / 100 / 8760) if net_apr > 0 else float("inf")
             entry_price = state.execution_price("short", opening=True)
             open_fee = notional * state.open_fee_pct / 100
             spot_costs = notional * self.carry_cfg.spot_cost_pct / 100 + self.carry_cfg.spot_gas_usd
@@ -211,18 +226,40 @@ class PaperEngine:
                 "open_fee_usd": open_fee, "spot_qty": spot_qty, "spot_entry_price": state.price,
                 "spot_costs_usd": spot_costs, "funding_usd": 0.0, "rollover_usd": 0.0, "last_accrual_at": now,
                 "liquidation_price": liquidation_price("short", entry_price, notional, notional, open_fee),
-                "entry_reason": f"funding short {apr:+.1f} %/an ≥ {self.carry_cfg.entry_min_apr_pct:.1f} %",
+                "entry_reason": (
+                    f"funding net {net_apr:+.1f} %/an (brut {state.funding_income_apr_pct('short'):+.1f}, "
+                    f"rollover {state.rollover_apr_pct():.1f}) ≥ {self.carry_cfg.entry_min_apr_pct:.1f} % ; "
+                    f"amortissement {breakeven_hours / 24:.1f} j"
+                ),
             })
             if position_id is None:
                 continue
             message = (
                 f"funding_carry {symbol} ouvert : short perp {notional:.0f} $ @ {entry_price:.4f} + spot long "
-                f"{spot_qty:.6f} @ {state.price:.4f} — funding {apr:+.1f} %/an, frais initiaux {open_fee + spot_costs:.4f} $"
+                f"{spot_qty:.6f} @ {state.price:.4f} — funding net {net_apr:+.1f} %/an, coûts de rotation "
+                f"{costs:.3f} $ amortis en {breakeven_hours / 24:.1f} j, gain attendu {expected_income:.2f} $ sur "
+                f"{self.carry_cfg.max_hold_hours / 24:.0f} j"
             )
             self.store.add_event(message, strategy=STRATEGY_CARRY, symbol=symbol, created_at=now)
             logger.info(message)
             actions.append(message)
         return actions
+
+    def _carry_funding_persistent(self, symbol: str, now: float) -> bool:
+        """Le rendement net doit avoir tenu sur les `entry_persistence_hours`
+        dernières observations (médiane ≥ seuil, fenêtre couverte à 80 %) :
+        un pic de funding d'un quart d'heure ne justifie pas 0,29 % de frais."""
+        window_hours = self.carry_cfg.entry_persistence_hours
+        if window_hours <= 0:
+            return True
+        history = self.store.carry_apr_history(symbol, now - window_hours * 3600)
+        if len(history) < 3 or history[0]["observed_at"] > now - 0.8 * window_hours * 3600:
+            return False
+        net_aprs = sorted(
+            (-row["funding_short_pct_h"] - row["rollover_pct_h"]) * 8760 for row in history
+        )
+        median = net_aprs[len(net_aprs) // 2]
+        return median >= self.carry_cfg.entry_min_apr_pct
 
     def _trend_entries(self, states: dict[str, PairState], now: float) -> list[str]:
         actions: list[str] = []

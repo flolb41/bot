@@ -1,0 +1,139 @@
+"""Tests du balayage de funding et de l'observation de trésorerie (perps papier)."""
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
+from app.perps.funding_scan import rank_funding, run_funding_scan
+from app.perps.market_data import funding_rows_from_snapshot
+from app.perps.models import FundingScanConfig, PerpsConfig, TreasuryConfig
+from app.perps.service import run_periodic_jobs
+from app.perps.storage import PerpsStore
+from app.perps.treasury import build_observation, decode_aave_liquidity_rate, decode_uint, run_treasury_observation
+
+T0 = 1_800_000_000.0
+H = 24 * 365
+
+
+def _row(symbol, short_h, long_h, rollover_h=0.0, oi=(1000.0, 1000.0), market_open=True, at=T0):
+    return {
+        "observed_at": at, "symbol": symbol, "funding_long_pct_h": long_h, "funding_short_pct_h": short_h,
+        "rollover_pct_h": rollover_h, "oi_long_usd": oi[0], "oi_short_usd": oi[1], "market_open": market_open,
+    }
+
+
+def test_funding_rows_from_snapshot_flattens_sdk_pairs():
+    pair = SimpleNamespace(
+        symbol="ETH/USD", funding_rate=SimpleNamespace(long=0.0012, short=-0.0012),
+        margin_fee=SimpleNamespace(long=0.0, short=0.0), coin_oi=SimpleNamespace(long=347_168.0, short=356_805.0),
+        is_market_open=True,
+    )
+    broken = SimpleNamespace(symbol="X/USD")   # pas de funding_rate -> ignoré
+    rows = funding_rows_from_snapshot(SimpleNamespace(pairs=[pair, broken]), observed_at=T0)
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "ETH/USD" and rows[0]["funding_short_pct_h"] == -0.0012 and rows[0]["oi_long_usd"] == 347_168.0
+
+
+def test_rank_funding_uses_net_apr_and_flags_spot_hedgeable():
+    config = FundingScanConfig(spot_hedgeable=("ETH/USD", "AERO/USD"))
+    rows = [
+        _row("ETH/USD", short_h=-0.0012, long_h=0.0012),                       # short +10,5 % net
+        _row("AERO/USD", short_h=-0.00125, long_h=0.00125, rollover_h=0.0017),  # 11 % − 15 % = −4 % net
+        _row("XMR/USD", short_h=-0.0126, long_h=0.011),                         # short +110 %, pas de spot
+    ]
+    ranked = rank_funding(rows, config)
+    assert [r["symbol"] for r in ranked] == ["XMR/USD", "ETH/USD", "AERO/USD"]
+    assert ranked[0]["spot_hedgeable"] is False and ranked[1]["spot_hedgeable"] is True
+    assert ranked[2]["best_net_apr_pct"] == pytest.approx((0.00125 - 0.0017) * H)
+    assert ranked[1]["best_side"] == "short"
+
+
+def test_run_funding_scan_alerts_once_per_cooldown(tmp_path):
+    store = PerpsStore(tmp_path / "scan.db")
+    config = FundingScanConfig(alert_min_net_apr_pct=15, alert_cooldown_hours=12, spot_hedgeable=("ETH/USD",))
+    rows = [_row("XMR/USD", short_h=-0.0126, long_h=0.011), _row("ETH/USD", short_h=-0.0012, long_h=0.0012),
+            _row("CLOSED/USD", short_h=-0.05, long_h=0.05, market_open=False)]
+
+    alerts = run_funding_scan(store, config, rows, T0)
+    assert len(alerts) == 1 and "XMR/USD" in alerts[0] and "biais directionnel" in alerts[0]
+    assert run_funding_scan(store, config, rows, T0 + 3600) == []                    # cooldown
+    assert len(run_funding_scan(store, config, rows, T0 + 13 * 3600)) == 1           # expiré
+    assert len(store.latest_funding_scan()) == 3
+    assert store.get_state("last_funding_scan_at") == str(T0 + 13 * 3600)
+    assert len([e for e in store.recent_events() if e["strategy"] == "funding_scan"]) == 2
+
+
+def test_aave_and_balance_decoders():
+    rate_ray = 48786662290443916770045446
+    data = "0x" + "00" * 32 + "00" * 32 + rate_ray.to_bytes(32, "big").hex() + "00" * 32 * 12
+    assert decode_aave_liquidity_rate(data) == pytest.approx(4.8787, rel=1e-3)
+    assert decode_uint("0x" + (10_347_899).to_bytes(32, "big").hex()) == 10_347_899
+    with pytest.raises(ValueError):
+        decode_aave_liquidity_rate("0x00")
+
+
+def test_build_observation_accumulates_missed_yield(tmp_path):
+    store = PerpsStore(tmp_path / "treasury.db")
+    first = build_observation(store, T0, idle_usdc=10.0, aave_apr=4.88, vault={"7d": 25.6, "30d": 25.5, "12m": 8.9},
+                              max_gap_seconds=7200)
+    assert first["best_venue"] == "veranta_vault_30d" and first["missed_yield_usd"] == 0.0
+    store.record_treasury_observation(first)
+    second = build_observation(store, T0 + 3600, idle_usdc=10.0, aave_apr=4.88, vault={"7d": None, "30d": None, "12m": None},
+                               max_gap_seconds=7200)
+    # Une heure à 4,88 % sur 10 USDC (le vault est indisponible : Aave devient la référence).
+    assert second["best_venue"] == "aave_usdc"
+    assert second["missed_yield_usd"] == pytest.approx(10 * 0.0488 * 3600 / (365 * 86400))
+    store.record_treasury_observation(second)
+    # Coupure de 3 jours : l'écart est plafonné à max_gap pour ne pas gonfler le cumul.
+    third = build_observation(store, T0 + 3600 + 3 * 86400, idle_usdc=10.0, aave_apr=4.88, vault={}, max_gap_seconds=7200)
+    assert third["missed_yield_usd"] - second["missed_yield_usd"] == pytest.approx(10 * 0.0488 * 7200 / (365 * 86400))
+
+
+class _FakeTreasury:
+    async def aave_usdc_apr_pct(self):
+        return 4.88
+
+    async def vault_returns_pct(self):
+        return {"7d": 25.6, "30d": 25.5, "12m": 8.9}
+
+    async def idle_usdc(self):
+        return 10.35
+
+
+class _FakeMarket:
+    def __init__(self):
+        self.snapshot_calls = 0
+
+    async def pair_state(self, symbol):
+        raise AssertionError("non utilisé ici")
+
+    async def funding_snapshot(self):
+        self.snapshot_calls += 1
+        return [_row("ETH/USD", short_h=-0.0012, long_h=0.0012)]
+
+    async def close(self):
+        pass
+
+
+def test_periodic_jobs_respect_their_own_cadence(tmp_path):
+    store = PerpsStore(tmp_path / "periodic.db")
+    config = PerpsConfig.from_config({"perps": {"funding_scan": {"interval_minutes": 30}, "treasury": {"interval_minutes": 60}}})
+    market = _FakeMarket()
+
+    first = asyncio.run(run_periodic_jobs(store, config, market, _FakeTreasury(), now=T0))
+    assert first["funding_pairs"] == 1 and first["treasury"]["idle_usdc"] == 10.35
+    again = asyncio.run(run_periodic_jobs(store, config, market, _FakeTreasury(), now=T0 + 600))
+    assert again == {} and market.snapshot_calls == 1                       # trop tôt pour les deux
+    later = asyncio.run(run_periodic_jobs(store, config, market, _FakeTreasury(), now=T0 + 1900))
+    assert "funding_pairs" in later and "treasury" not in later             # 31 min : funding oui, trésorerie non
+    assert store.latest_treasury_observation()["best_venue"] == "veranta_vault_30d"
+
+
+def test_treasury_config_and_observation_run(tmp_path):
+    store = PerpsStore(tmp_path / "treasury-run.db")
+    config = TreasuryConfig.from_dict({"wallet_address": "0x032d16Ec1F4382287cBBFbB87Dd8163934A01803", "interval_minutes": 60})
+    row = asyncio.run(run_treasury_observation(store, config, _FakeTreasury(), T0))
+    assert row["aave_usdc_apr_pct"] == 4.88 and row["vault_12m_apr_pct"] == 8.9
+    assert store.latest_treasury_observation()["idle_usdc"] == 10.35

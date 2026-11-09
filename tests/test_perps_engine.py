@@ -1,4 +1,4 @@
-"""Tests du moteur perps papier (app.perps.engine) — aucune dépendance au SDK."""
+﻿"""Tests du moteur perps papier (app.perps.engine) — aucune dépendance au SDK."""
 from __future__ import annotations
 
 import pytest
@@ -29,7 +29,8 @@ def _config(**overrides) -> PerpsConfig:
         "perps": {
             "enabled": True, "interval_minutes": 5, "markets": ["ETH/USD", "BTC/USD", "SOL/USD"],
             "funding_carry": {"markets": ["ETH/USD"], "notional_usd": 100, "entry_min_apr_pct": 6,
-                              "exit_min_apr_pct": 0, "exit_confirm_ticks": 3, "max_hold_hours": 48,
+                              "entry_persistence_hours": 0, "entry_min_edge_ratio": 0,
+                              "exit_min_apr_pct": 0, "exit_confirm_hours": 0.25, "max_hold_hours": 48,
                               "spot_cost_pct": 0.07, "spot_gas_usd": 0.02},
             "trend": {"markets": ["ETH/USD", "BTC/USD", "SOL/USD"], "notional_usd": 100, "leverage": 2,
                       "lookback_minutes": 240, "confirm_minutes": 60, "entry_pct": 1.0, "stop_loss_pct": 1.5,
@@ -110,11 +111,12 @@ def test_carry_accrues_funding_income_then_closes_after_confirmed_low_funding(en
     position = engine.store.open_positions(STRATEGY_CARRY)[0]
     assert position["funding_usd"] == pytest.approx(100 * -0.0012 / 100 * 1)  # revenu : négatif = encaissé
 
-    # Le funding devient un coût pour le short : 2 ticks ne suffisent pas, le 3e ferme.
-    for i in range(1, 3):
+    # Le funding devient un coût pour le short : l'hystérésis (15 min ici) retient la
+    # sortie tant que la condition n'a pas tenu assez longtemps, puis ferme.
+    for i in range(1, 4):
         engine.process_tick({"ETH/USD": _state(funding_short=0.001, at=T0 + HOUR + i * 300)}, T0 + HOUR + i * 300)
         assert engine.store.open_positions(STRATEGY_CARRY)
-    engine.process_tick({"ETH/USD": _state(funding_short=0.001, at=T0 + HOUR + 900)}, T0 + HOUR + 900)
+    engine.process_tick({"ETH/USD": _state(funding_short=0.001, at=T0 + HOUR + 1200)}, T0 + HOUR + 1200)
 
     assert engine.store.open_positions(STRATEGY_CARRY) == []
     closed = engine.store.closed_positions(STRATEGY_CARRY)[0]
@@ -284,3 +286,63 @@ def test_position_snapshot_values_open_positions(engine):
     assert snapshot["hours_open"] == pytest.approx(1.0)
     assert snapshot["unrealized_net_usd"] < 0   # frais de clôture + coûts spot de sortie non encore couverts
     assert snapshot["funding_income_apr_pct"] == pytest.approx(0.0012 * 8760)
+
+
+# ---------------------------------------------------------------- carry : économie
+
+def test_carry_uses_net_apr_funding_minus_rollover(tmp_path):
+    engine = PaperEngine(PerpsStore(tmp_path / "net.db"), _config())
+    # AERO-like : funding +11 %/an encaissé mais rollover 15 %/an payé -> net négatif, pas d'entrée.
+    state = _state(funding_short=-0.00125, rollover=0.0017)
+    assert state.net_carry_apr_pct("short") == pytest.approx((0.00125 - 0.0017) * 8760)
+    engine.process_tick({"ETH/USD": state}, T0)
+    assert engine.store.open_positions(STRATEGY_CARRY) == []
+    # ETH-like : rollover nul -> entrée.
+    engine.process_tick({"ETH/USD": _state(rollover=0.0)}, T0 + 300)
+    assert len(engine.store.open_positions(STRATEGY_CARRY)) == 1
+
+
+def test_carry_requires_persistent_funding_before_entering(tmp_path):
+    engine = PaperEngine(PerpsStore(tmp_path / "persist.db"), _config(funding_carry={"entry_persistence_hours": 1}))
+    # Premier tick : pas d'historique -> pas d'entrée malgré 10,5 %/an.
+    engine.process_tick({"ETH/USD": _state(at=T0)}, T0)
+    assert engine.store.open_positions(STRATEGY_CARRY) == []
+    # 55 min d'observations à funding élevé (fenêtre couverte à > 80 %) -> entrée au tick suivant.
+    for minutes in range(5, 60, 5):
+        engine.process_tick({"ETH/USD": _state(at=T0 + minutes * 60)}, T0 + minutes * 60)
+    assert len(engine.store.open_positions(STRATEGY_CARRY)) == 1
+
+    engine2 = PaperEngine(PerpsStore(tmp_path / "spike.db"), _config(funding_carry={"entry_persistence_hours": 1}))
+    # Funding faible pendant 50 min puis pic sur les 10 dernières : médiane sous le seuil -> refus.
+    for minutes in range(0, 50, 5):
+        engine2.process_tick({"ETH/USD": _state(funding_short=-0.0002, at=T0 + minutes * 60)}, T0 + minutes * 60)
+    for minutes in (50, 55, 60):
+        engine2.process_tick({"ETH/USD": _state(funding_short=-0.005, at=T0 + minutes * 60)}, T0 + minutes * 60)
+    assert engine2.store.open_positions(STRATEGY_CARRY) == []
+
+
+def test_carry_requires_expected_income_to_cover_costs_with_margin(tmp_path):
+    # 48 h de détention max à 10,5 %/an sur 100 $ = 0,058 $ attendus, pour 0,27 $ de rotation -> refus.
+    engine = PaperEngine(PerpsStore(tmp_path / "edge.db"), _config(funding_carry={"entry_min_edge_ratio": 2, "max_hold_hours": 48}))
+    engine.process_tick({"ETH/USD": _state()}, T0)
+    assert engine.store.open_positions(STRATEGY_CARRY) == []
+    # 30 jours : 0,86 $ attendus >= 2 × 0,27 $ -> entrée, avec l'amortissement dans le motif.
+    engine = PaperEngine(PerpsStore(tmp_path / "edge30.db"), _config(funding_carry={"entry_min_edge_ratio": 2, "max_hold_hours": 720}))
+    engine.process_tick({"ETH/USD": _state()}, T0)
+    position = engine.store.open_positions(STRATEGY_CARRY)[0]
+    assert "amortissement" in position["entry_reason"]
+    costs = _config().carry.round_trip_costs_usd(100.0, 0.045, 0.045)
+    assert costs == pytest.approx(0.09 + 2 * (0.07 + 0.02))
+
+
+def test_carry_exit_hysteresis_resets_when_funding_recovers(engine):
+    engine.process_tick({"ETH/USD": _state()}, T0)
+    # 10 min de funding négatif, puis retour positif : le compteur repart de zéro.
+    engine.process_tick({"ETH/USD": _state(funding_short=0.001, at=T0 + 300)}, T0 + 300)
+    engine.process_tick({"ETH/USD": _state(funding_short=0.001, at=T0 + 600)}, T0 + 600)
+    engine.process_tick({"ETH/USD": _state(at=T0 + 900)}, T0 + 900)
+    engine.process_tick({"ETH/USD": _state(funding_short=0.001, at=T0 + 1200)}, T0 + 1200)
+    engine.process_tick({"ETH/USD": _state(funding_short=0.001, at=T0 + 1500)}, T0 + 1500)
+    assert len(engine.store.open_positions(STRATEGY_CARRY)) == 1          # 5 min < 15 min d'hystérésis
+    engine.process_tick({"ETH/USD": _state(funding_short=0.001, at=T0 + 2400)}, T0 + 2400)
+    assert engine.store.open_positions(STRATEGY_CARRY) == []

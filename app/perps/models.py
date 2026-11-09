@@ -39,6 +39,15 @@ class PairState:
         """Revenu de funding annualisé pour `side` (positif = le trader encaisse)."""
         return -self.funding_pct_h(side) * HOURS_PER_YEAR
 
+    def rollover_apr_pct(self) -> float:
+        return self.rollover_pct_h * HOURS_PER_YEAR
+
+    def net_carry_apr_pct(self, side: str) -> float:
+        """Rendement net annualisé d'un portage : funding encaissé − rollover
+        payé. Les alts Veranta ont 5–15 %/an de rollover : AERO à 11 % de
+        funding est une perte nette, seuls ETH/BTC (rollover 0) portent."""
+        return self.funding_income_apr_pct(side) - self.rollover_apr_pct()
+
     def execution_price(self, side: str, *, opening: bool) -> float:
         """Prix d'exécution modélisé : le spread joue toujours contre le trader,
         à l'ouverture comme à la clôture (hypothèse prudente)."""
@@ -66,14 +75,24 @@ def _non_negative(value: Any, default: float) -> float:
 
 @dataclass(frozen=True)
 class CarryConfig:
-    """Cash-and-carry : long spot (modélisé) + short perp, revenu = funding reçu."""
+    """Cash-and-carry : long spot (modélisé) + short perp, revenu = funding reçu.
+
+    Économie : une rotation coûte ≈ 0,29 % du notionnel (frais perp aller-
+    retour + jambe spot) alors que le funding rapporte ≈ 10 %/an → ~10 jours
+    pour amortir l'entrée. D'où (1) un critère d'entrée sur le rendement NET
+    (funding − rollover), (2) une exigence de persistance du funding sur les
+    dernières heures, (3) un gain attendu sur la durée maximale ≥ un multiple
+    des coûts, (4) une sortie sur funding négatif confirmée pendant des heures
+    et non des minutes (deux rotations inutiles en 18 h le 09/11/2026)."""
     enabled: bool = True
     markets: tuple[str, ...] = ("ETH/USD", "BTC/USD")
     notional_usd: float = 100.0
     entry_min_apr_pct: float = 6.0
+    entry_persistence_hours: float = 6.0
+    entry_min_edge_ratio: float = 2.0
     exit_min_apr_pct: float = 0.0
-    exit_confirm_ticks: int = 6
-    max_hold_hours: float = 14 * 24
+    exit_confirm_hours: float = 12.0
+    max_hold_hours: float = 30 * 24
     spot_cost_pct: float = 0.07   # frais DEX 0,05 % + glissement ~0,02 % par jambe spot
     spot_gas_usd: float = 0.02    # gas Base par transaction spot
 
@@ -85,12 +104,20 @@ class CarryConfig:
             markets=tuple(raw.get("markets") or cls.markets),
             notional_usd=_positive(raw.get("notional_usd"), cls.notional_usd),
             entry_min_apr_pct=_non_negative(raw.get("entry_min_apr_pct"), cls.entry_min_apr_pct),
+            entry_persistence_hours=_non_negative(raw.get("entry_persistence_hours"), cls.entry_persistence_hours),
+            entry_min_edge_ratio=_non_negative(raw.get("entry_min_edge_ratio"), cls.entry_min_edge_ratio),
             exit_min_apr_pct=float(raw.get("exit_min_apr_pct", cls.exit_min_apr_pct)),
-            exit_confirm_ticks=max(1, int(_positive(raw.get("exit_confirm_ticks"), cls.exit_confirm_ticks))),
+            exit_confirm_hours=_non_negative(raw.get("exit_confirm_hours"), cls.exit_confirm_hours),
             max_hold_hours=_positive(raw.get("max_hold_hours"), cls.max_hold_hours),
             spot_cost_pct=_non_negative(raw.get("spot_cost_pct"), cls.spot_cost_pct),
             spot_gas_usd=_non_negative(raw.get("spot_gas_usd"), cls.spot_gas_usd),
         )
+
+    def round_trip_costs_usd(self, notional_usd: float, open_fee_pct: float, close_fee_pct: float) -> float:
+        """Coût complet d'une rotation : frais perp aller-retour + deux jambes spot."""
+        perp = notional_usd * (open_fee_pct + close_fee_pct) / 100
+        spot = 2 * (notional_usd * self.spot_cost_pct / 100 + self.spot_gas_usd)
+        return perp + spot
 
 
 @dataclass(frozen=True)
@@ -131,6 +158,59 @@ class TrendConfig:
 
 
 @dataclass(frozen=True)
+class FundingScanConfig:
+    """Balayage du funding de TOUTES les paires Veranta (un appel `snapshot`)
+    pour repérer où le portage paie le plus — et alerter sur les extrêmes."""
+    enabled: bool = True
+    interval_minutes: float = 30.0
+    alert_min_net_apr_pct: float = 15.0
+    alert_cooldown_hours: float = 12.0
+    retention_days: float = 30.0
+    # Paires dont la jambe spot existe sur Base (portage couvert possible) ;
+    # les autres extrêmes ne sont que des biais directionnels.
+    spot_hedgeable: tuple[str, ...] = (
+        "ETH/USD", "BTC/USD", "SOL/USD", "AERO/USD", "LINK/USD", "DOGE/USD", "VIRTUAL/USD", "AAVE/USD",
+        "MORPHO/USD", "ENA/USD", "ONDO/USD", "PENDLE/USD", "LDO/USD", "UNI/USD",
+    )
+
+    @classmethod
+    def from_dict(cls, raw: dict | None) -> "FundingScanConfig":
+        raw = raw or {}
+        return cls(
+            enabled=bool(raw.get("enabled", True)),
+            interval_minutes=_positive(raw.get("interval_minutes"), cls.interval_minutes),
+            alert_min_net_apr_pct=_non_negative(raw.get("alert_min_net_apr_pct"), cls.alert_min_net_apr_pct),
+            alert_cooldown_hours=_non_negative(raw.get("alert_cooldown_hours"), cls.alert_cooldown_hours),
+            retention_days=_positive(raw.get("retention_days"), cls.retention_days),
+            spot_hedgeable=tuple(raw.get("spot_hedgeable") or cls.spot_hedgeable),
+        )
+
+
+@dataclass(frozen=True)
+class TreasuryConfig:
+    """Observation (papier) du rendement que le capital oisif pourrait toucher."""
+    enabled: bool = True
+    interval_minutes: float = 60.0
+    wallet_address: str | None = None
+    rpc_url: str | None = None
+    aave_pool_address: str = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
+    usdc_address: str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+
+    @classmethod
+    def from_dict(cls, raw: dict | None) -> "TreasuryConfig":
+        raw = raw or {}
+        wallet = raw.get("wallet_address")
+        return cls(
+            enabled=bool(raw.get("enabled", True)),
+            interval_minutes=_positive(raw.get("interval_minutes"), cls.interval_minutes),
+            wallet_address=str(wallet) if wallet else None,
+            rpc_url=str(raw["rpc_url"]) if raw.get("rpc_url") else None,
+            aave_pool_address=str(raw.get("aave_pool_address", cls.aave_pool_address)),
+            usdc_address=str(raw.get("usdc_address", cls.usdc_address)),
+        )
+
+
+@dataclass(frozen=True)
 class PerpsConfig:
     enabled: bool = False
     mode: str = "paper"
@@ -146,6 +226,8 @@ class PerpsConfig:
     observation_retention_days: float = 30.0
     carry: CarryConfig = field(default_factory=CarryConfig)
     trend: TrendConfig = field(default_factory=TrendConfig)
+    funding_scan: FundingScanConfig = field(default_factory=FundingScanConfig)
+    treasury: TreasuryConfig = field(default_factory=TreasuryConfig)
 
     @classmethod
     def from_config(cls, config: dict | None) -> "PerpsConfig":
@@ -173,4 +255,6 @@ class PerpsConfig:
             observation_retention_days=_positive(raw.get("observation_retention_days"), cls.observation_retention_days),
             carry=carry,
             trend=trend,
+            funding_scan=FundingScanConfig.from_dict(raw.get("funding_scan")),
+            treasury=TreasuryConfig.from_dict(raw.get("treasury")),
         )

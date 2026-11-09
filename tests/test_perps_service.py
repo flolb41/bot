@@ -44,7 +44,7 @@ class FakeProvider:
 def _config() -> PerpsConfig:
     return PerpsConfig.from_config({"perps": {
         "enabled": True, "interval_minutes": 5, "markets": ["ETH/USD", "BTC/USD"],
-        "funding_carry": {"markets": ["ETH/USD"]}, "trend": {"markets": ["BTC/USD"]},
+        "funding_carry": {"markets": ["ETH/USD"], "entry_persistence_hours": 0}, "trend": {"markets": ["BTC/USD"]},
     }})
 
 
@@ -56,7 +56,7 @@ def test_perps_config_defaults_and_market_union():
     assert config.mode == "paper"
     assert config.markets == ("ETH/USD", "BTC/USD", "SOL/USD")   # + marchés des stratégies (carry par défaut : ETH, BTC)
     assert config.trend.leverage == 3.0
-    assert config.carry.exit_confirm_ticks == 6
+    assert config.carry.exit_confirm_hours == 12.0 and config.carry.entry_persistence_hours == 6.0
     assert PerpsConfig.from_config({}).enabled is False
 
 

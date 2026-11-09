@@ -3,6 +3,7 @@
 # websockets<15, incompatibles avec le web3 du bot d'arbitrage : ne JAMAIS
 # installer ce fichier dans `.venv`.
 veranta-sdk==2.2.1
+httpx>=0.27          # déjà requis par le SDK ; utilisé directement par app/perps/treasury.py (eth_call brut)
 PyYAML>=6.0.1
 python-dotenv>=1.0.1
 fastapi>=0.111.0
