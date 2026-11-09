@@ -27,13 +27,17 @@ def _row(symbol, short_h, long_h, rollover_h=0.0, oi=(1000.0, 1000.0), market_op
 def test_funding_rows_from_snapshot_flattens_sdk_pairs():
     pair = SimpleNamespace(
         symbol="ETH/USD", funding_rate=SimpleNamespace(long=0.0012, short=-0.0012),
-        margin_fee=SimpleNamespace(long=0.0, short=0.0), coin_oi=SimpleNamespace(long=347_168.0, short=356_805.0),
+        margin_fee=SimpleNamespace(long=0.0, short=0.0), open_interest=SimpleNamespace(long=347_168.0, short=356_805.0),
+        coin_oi=SimpleNamespace(long=164.0, short=168.0),
         is_market_open=True,
     )
     broken = SimpleNamespace(symbol="X/USD")   # pas de funding_rate -> ignoré
-    rows = funding_rows_from_snapshot(SimpleNamespace(pairs=[pair, broken]), observed_at=T0)
-    assert len(rows) == 1
+    coins_only = SimpleNamespace(symbol="Y/USD", funding_rate=SimpleNamespace(long=0.0, short=0.0),
+                                 coin_oi=SimpleNamespace(long=1.0, short=1.0))   # pas de prix dans le snapshot -> 0 $
+    rows = funding_rows_from_snapshot(SimpleNamespace(pairs=[pair, broken, coins_only]), observed_at=T0)
+    assert len(rows) == 2
     assert rows[0]["symbol"] == "ETH/USD" and rows[0]["funding_short_pct_h"] == -0.0012 and rows[0]["oi_long_usd"] == 347_168.0
+    assert rows[1]["oi_long_usd"] == 0.0
 
 
 def test_rank_funding_uses_net_apr_and_flags_spot_hedgeable():

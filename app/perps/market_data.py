@@ -42,18 +42,30 @@ def funding_rows_from_snapshot(snapshot, observed_at: float | None = None) -> li
         if funding is None or not getattr(pair, "symbol", None):
             continue
         rollover = getattr(pair, "margin_fee", None)
-        oi = getattr(pair, "coin_oi", None) or getattr(pair, "open_interest", None)
+        oi_long, oi_short = _open_interest_usd(pair, None)
         rows.append({
             "observed_at": now,
             "symbol": str(pair.symbol),
             "funding_long_pct_h": _as_float(getattr(funding, "long", 0)),
             "funding_short_pct_h": _as_float(getattr(funding, "short", 0)),
             "rollover_pct_h": max(_as_float(getattr(rollover, "long", 0)), _as_float(getattr(rollover, "short", 0))),
-            "oi_long_usd": _as_float(getattr(oi, "long", 0)),
-            "oi_short_usd": _as_float(getattr(oi, "short", 0)),
+            "oi_long_usd": oi_long,
+            "oi_short_usd": oi_short,
             "market_open": bool(getattr(pair, "is_market_open", True)),
         })
     return rows
+
+
+def _open_interest_usd(pair, price: float | None) -> tuple[float, float]:
+    """Intérêt ouvert par côté en dollars : `open_interest` (déjà en $) de
+    préférence ; `coin_oi` est en unités de coin (164 ETH, pas 164 $) et n'est
+    utilisé, converti au prix, qu'en repli."""
+    usd = getattr(pair, "open_interest", None)
+    if usd is not None and (getattr(usd, "long", None) is not None or getattr(usd, "short", None) is not None):
+        return _as_float(getattr(usd, "long", 0)), _as_float(getattr(usd, "short", 0))
+    coins = getattr(pair, "coin_oi", None)
+    scale = price if price else 0.0
+    return _as_float(getattr(coins, "long", 0)) * scale, _as_float(getattr(coins, "short", 0)) * scale
 
 
 def pair_state_from_sdk(symbol: str, pair, price, spread_pct: float | None, observed_at: float | None = None) -> PairState:
@@ -62,20 +74,21 @@ def pair_state_from_sdk(symbol: str, pair, price, spread_pct: float | None, obse
     leverages = getattr(pair, "leverages", None)
     funding = getattr(pair, "funding_rate", None)
     rollover = getattr(pair, "margin_fee", None)
-    oi = getattr(pair, "coin_oi", None) or getattr(pair, "open_interest", None)
+    price_value = _as_float(price)
+    oi_long, oi_short = _open_interest_usd(pair, price_value)
     # Le rollover est symétrique chez Veranta ; on retient le pire des deux côtés par prudence.
     rollover_pct_h = max(_as_float(getattr(rollover, "long", 0)), _as_float(getattr(rollover, "short", 0)))
     return PairState(
         symbol=symbol,
-        price=_as_float(price),
+        price=price_value,
         spread_pct=_as_float(spread_pct, _as_float(getattr(pair, "spread_p", 0))),
         open_fee_pct=_as_float(getattr(pair, "open_fee_p", 0)),
         close_fee_pct=_as_float(getattr(pair, "close_fee_p", 0)),
         funding_long_pct_h=_as_float(getattr(funding, "long", 0)),
         funding_short_pct_h=_as_float(getattr(funding, "short", 0)),
         rollover_pct_h=rollover_pct_h,
-        oi_long_usd=_as_float(getattr(oi, "long", 0)),
-        oi_short_usd=_as_float(getattr(oi, "short", 0)),
+        oi_long_usd=oi_long,
+        oi_short_usd=oi_short,
         min_notional_usd=_as_float(getattr(pair, "min_lev_pos_usdc", 0)),
         max_leverage=_as_float(getattr(leverages, "max_leverage", 0)),
         market_open=bool(getattr(pair, "is_market_open", True)),

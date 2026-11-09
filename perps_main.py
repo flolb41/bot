@@ -5,6 +5,7 @@ Usage:
     python perps_main.py run       # boucle de simulation + dashboard (port 8001)
     python perps_main.py status    # résumé texte des stratégies papier
     python perps_main.py backtest  # backtest tendance sur bougies (voir --help)
+    python perps_main.py live-status  # verrous du mode live (lecture seule, aucun ordre)
 
 Aucune clé, aucun ordre : voir app/perps/__init__.py.
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 
 for _stream in (sys.stdout, sys.stderr):
@@ -37,7 +39,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         logger.warning("perps.enabled est false dans la configuration : rien à faire, arrêt.")
         return
     if config.mode != "paper":
-        logger.error("Seul le mode « paper » est implémenté (perps.mode=%s) — arrêt par prudence.", config.mode)
+        logger.error(
+            "Seul le mode « paper » est câblé dans le moteur (perps.mode=%s) — arrêt par prudence. "
+            "Les prérequis live se vérifient avec `perps_main.py live-status` ; aucun ordre n'est envoyé.", config.mode,
+        )
         raise SystemExit(1)
     if not acquire_single_instance_lock(config.database_path):
         raise SystemExit(1)
@@ -149,6 +154,41 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         print(json.dumps(reports, ensure_ascii=False, indent=2, default=str))
 
 
+def cmd_live_status(args: argparse.Namespace) -> None:
+    """État de la porte live (lecture seule) : verrous, identité, délégation, solde, positions venue."""
+    from app.perps import broker as br
+
+    config = _load(args.config)
+    checks = br.live_gate(config)
+    print(f"Porte live perps : {'OUVERTE' if br.gate_open(checks) else 'FERMÉE'} (mode {config.mode})")
+    for check in checks:
+        print(f"  [{'ok' if check.ok else 'KO'}] {check.name:<22} {check.detail}")
+    print(f"  Phrase attendue dans {br.LIVE_CONFIRMATION_ENV} : {br.LIVE_CONFIRMATION_PHRASE}")
+    if not os.environ.get("VERANTA_PRIVATE_KEY"):
+        print("  Pas de clé : vérification venue sautée. Aucun ordre n'est câblé dans le moteur de toute façon.")
+        return
+    venue = br.VerantaBroker(config.live)
+
+    async def _probe() -> None:
+        try:
+            identity = await venue.verify()
+            print(f"  Venue : signataire {identity['signer']} | trader {identity['trader']} | "
+                  f"délégué {'oui' if identity['delegate_mode'] else 'NON'} | délégation {identity['delegation']} | "
+                  f"{'ok' if identity['ok'] else 'ERREUR ' + str(identity['error'])}")
+            balance = await venue.usdc_balance()
+            print(f"  Solde USDC venue : {'n/a' if balance is None else f'{balance:.2f}'}")
+            positions = await venue.positions()
+            print(f"  Positions ouvertes sur le venue : {len(positions)}")
+            for position in positions:
+                print(f"    {position.symbol} {position.side} {position.notional_usd:.2f} $ ({position.leverage:.1f}x) @ {position.entry_price:.4f} "
+                      f"TP {position.take_profit} SL {position.stop_loss} liq {position.liquidation_price} "
+                      f"funding {position.funding_fee_usd:+.4f} rollover {position.rollover_fee_usd:.4f}")
+        finally:
+            await venue.aclose()
+
+    asyncio.run(_probe())
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Service perps papier (Base / Veranta)")
     parser.add_argument("--config", default="config/config.yaml", help="Chemin du fichier de config YAML")
@@ -168,6 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--cache-dir", default="data/perps_candles")
     backtest.add_argument("--json", action="store_true", help="Sortie JSON complète")
     backtest.set_defaults(func=cmd_backtest)
+    sub.add_parser("live-status", help="Verrous du mode live, identité/délégation et positions venue (lecture seule)").set_defaults(func=cmd_live_status)
     return parser
 
 

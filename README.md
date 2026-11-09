@@ -368,6 +368,30 @@ est négative alors que l'entraînement était positif, la grille a sur-appris.
 Limites : un marché par simulation, coûts constants sur la période, pas de
 glissement au-delà du spread coté.
 
+### Prérequis du mode live (rien n'est câblé)
+
+`app/perps/broker.py` prépare le passage en réel **sans l'activer** : le moteur
+papier n'appelle aucun broker. Avant toute décision, trois verrous
+indépendants doivent être verts (`perps_main.py live-status`, lecture seule) :
+
+1. `perps.mode: live` dans la config **et** des plafonds non nuls dans
+   `perps.live` (`max_collateral_usd`, `max_total_collateral_usd`,
+   `max_leverage`) cohérents avec les stratégies ;
+2. la phrase exacte `JE COMPRENDS QUE LES PERPS LIVE PEUVENT PERDRE TOUT LE
+   COLLATERAL` dans la variable `PERPS_LIVE_CONFIRMED` (`.env`) ;
+3. une **clé déléguée** (`VERANTA_PRIVATE_KEY`) distincte du wallet trader
+   (`VERANTA_TRADER_ADDRESS`) : créer un wallet dédié qui ne détient que le
+   collatéral qu'on accepte de perdre, l'enregistrer comme délégué sur
+   l'interface Veranta (ou `account.register_delegate()`), et ne stocker sur le
+   Pi que la clé déléguée — elle peut signer des ordres, pas retirer les fonds.
+   Le wallet MetaMask principal ne doit jamais servir de trader.
+
+`validate_order` refuse avant envoi tout ce que le venue refuserait après
+avoir fait payer gas et spread (notionnel < 100 USDC, levier, plafonds, stop
+du mauvais côté ou au-delà du prix de liquidation, glissement > 5 %).
+`VerantaBroker` transmet TP/SL au venue à l'ouverture : ils tiennent même si
+le Pi s'éteint, contrairement aux stops du papier évalués au tick.
+
 Hypothèses de modélisation : le spread joue contre le trader à l'ouverture et
 à la clôture ; la jambe spot du carry est exécutée au prix d'index majoré de
 `spot_cost_pct` ; les stops s'exécutent au prix observé au tick (5 min), sans

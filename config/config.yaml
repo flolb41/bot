@@ -484,3 +484,12 @@ perps:
     interval_minutes: 60
     wallet_address: "0x032d16Ec1F4382287cBBFbB87Dd8163934A01803"   # adresse publique (lecture seule)
     # rpc_url: https://mainnet.base.org   # défaut : première URL de RPC_BASE, sinon le RPC public
+  # Garde-fous du FUTUR mode live (aucun ordre n'est câblé dans le moteur).
+  # Les plafonds à 0 ferment la porte ; `perps_main.py live-status` montre les
+  # verrous : mode: live + phrase PERPS_LIVE_CONFIRMED dans .env + clé déléguée
+  # (VERANTA_PRIVATE_KEY) distincte du wallet trader (VERANTA_TRADER_ADDRESS).
+  live:
+    max_collateral_usd: 0           # collatéral maximal par position (0 = bloqué)
+    max_total_collateral_usd: 0     # collatéral maximal engagé au total (0 = bloqué)
+    max_leverage: 3
+    slippage_pct: 1

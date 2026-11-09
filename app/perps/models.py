@@ -211,6 +211,28 @@ class TreasuryConfig:
 
 
 @dataclass(frozen=True)
+class LiveConfig:
+    """Garde-fous du futur mode live (section `perps.live`). Les plafonds à 0
+    (défaut) bloquent la porte : rien ne peut partir sans un choix explicite.
+    Aucun ordre n'est câblé dans le moteur pour l'instant — voir
+    `app/perps/broker.py` et `perps_main.py live-status`."""
+    max_collateral_usd: float = 0.0          # collatéral maximal par position
+    max_total_collateral_usd: float = 0.0    # collatéral maximal engagé toutes positions confondues
+    max_leverage: float = 3.0
+    slippage_pct: float = 1.0                # tolérance de glissement transmise au venue (ordre marché)
+
+    @classmethod
+    def from_dict(cls, raw: dict | None) -> "LiveConfig":
+        raw = raw or {}
+        return cls(
+            max_collateral_usd=_non_negative(raw.get("max_collateral_usd"), cls.max_collateral_usd),
+            max_total_collateral_usd=_non_negative(raw.get("max_total_collateral_usd"), cls.max_total_collateral_usd),
+            max_leverage=_positive(raw.get("max_leverage"), cls.max_leverage),
+            slippage_pct=_positive(raw.get("slippage_pct"), cls.slippage_pct),
+        )
+
+
+@dataclass(frozen=True)
 class PerpsConfig:
     enabled: bool = False
     mode: str = "paper"
@@ -228,6 +250,7 @@ class PerpsConfig:
     trend: TrendConfig = field(default_factory=TrendConfig)
     funding_scan: FundingScanConfig = field(default_factory=FundingScanConfig)
     treasury: TreasuryConfig = field(default_factory=TreasuryConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
 
     @classmethod
     def from_config(cls, config: dict | None) -> "PerpsConfig":
@@ -257,4 +280,5 @@ class PerpsConfig:
             trend=trend,
             funding_scan=FundingScanConfig.from_dict(raw.get("funding_scan")),
             treasury=TreasuryConfig.from_dict(raw.get("treasury")),
+            live=LiveConfig.from_dict(raw.get("live")),
         )

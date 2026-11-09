@@ -72,7 +72,8 @@ def test_pair_state_from_sdk_maps_veranta_objects():
         leverages=SimpleNamespace(min_leverage=1.0, max_leverage=50.0),
         funding_rate=SimpleNamespace(long=0.00120006, short=-0.0012000600929),
         margin_fee=SimpleNamespace(long=0.00057, short=0.00057),
-        coin_oi=SimpleNamespace(long=330264.81, short=339312.54),
+        open_interest=SimpleNamespace(long=348167.52, short=357805.28),   # en $ ; coin_oi (164 ETH) ne doit pas être pris
+        coin_oi=SimpleNamespace(long=164.389, short=164.389),
         spread_p=0.01, open_fee_p=0.045, close_fee_p=0.045, min_lev_pos_usdc=100.0, is_market_open=True,
     )
     state = pair_state_from_sdk("ETH/USD", pair, "2235.4995", 0.0125, observed_at=T0)
@@ -81,8 +82,12 @@ def test_pair_state_from_sdk_maps_veranta_objects():
     assert state.spread_pct == 0.0125                       # spread dynamique prioritaire
     assert state.funding_short_pct_h == pytest.approx(-0.0012000600929)
     assert state.rollover_pct_h == pytest.approx(0.00057)
+    assert state.oi_long_usd == 348167.52 and state.oi_short_usd == 357805.28
     assert state.min_notional_usd == 100.0 and state.max_leverage == 50.0 and state.market_open is True
     assert pair_state_from_sdk("ETH/USD", pair, 1.0, None).spread_pct == 0.01   # repli sur le spread statique
+    # Sans open_interest : coin_oi converti au prix.
+    coins_only = SimpleNamespace(funding_rate=pair.funding_rate, coin_oi=SimpleNamespace(long=2.0, short=1.0))
+    assert pair_state_from_sdk("ETH/USD", coins_only, 2000.0, None).oi_long_usd == 4000.0
 
 
 # ---------------------------------------------------------------- stockage
