@@ -125,11 +125,14 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         if args.live_costs:
             from app.perps.market_data import VerantaMarketData
 
-            provider = VerantaMarketData(reference_notional_usd=config.trend.notional_usd, reference_leverage=config.trend.leverage)
-            try:
-                costs = bt.CostModel.from_pair_state(asyncio.run(provider.pair_state(symbol)))
-            finally:
-                asyncio.run(provider.close())
+            async def _live_costs() -> bt.CostModel:
+                provider = VerantaMarketData(reference_notional_usd=config.trend.notional_usd, reference_leverage=config.trend.leverage)
+                try:
+                    return bt.CostModel.from_pair_state(await provider.pair_state(symbol))
+                finally:
+                    await provider.close()
+
+            costs = asyncio.run(_live_costs())
         if args.grid:
             report = bt.walk_forward(candles, base, costs, symbol=symbol, resolution=args.resolution, intrabar=not args.close_only,
                                      train_ratio=args.train_ratio, min_trades=args.min_trades)
