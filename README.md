@@ -318,16 +318,28 @@ papier avec ces coûts réels. Synthetix V3 sur Base a été écarté le 08/11/2
   rotation ; sortie quand le funding net redevient un coût pendant
   `exit_confirm_hours` d'affilée ou après `max_hold_hours`. Les alts Veranta
   paient 5–15 %/an de rollover : seuls ETH/BTC (rollover nul) portent vraiment.
+  **Vérifié le 09/11/2026** sur ~50 positions réelles d'autres traders (lecture
+  publique `account.positions(trader)`) : le funding est bien crédité aux
+  shorts ETH/BTC (`unrealised_funding_fee` négatif = crédit, égal à
+  taux × notionnel × heures ; rollover 0), mais le taux varie — sur plusieurs
+  jours l'accumulé ne fait que 50–90 % du taux instantané. Compter ~7–9 %/an
+  net, pas 10,5–12,8 ; le dashboard affiche la moyenne glissante à côté de
+  l'instantané pour cette raison.
 - **`trend`** : tendance sur `lookback_minutes` confirmée par la dernière heure,
   levier faible, stop/objectif/durée max, cooldown de ré-entrée, plafond de
   positions et de perte journalière ; liquidation simulée à 85 % du collatéral
-  (seuil Veranta).
+  (seuil Veranta). **Désactivée le 09/11/2026** après backtest (voir plus
+  bas) : aucun avantage mesurable, les frais mangent un signal qui vaut pile
+  ou face. Les positions papier encore ouvertes se ferment seules (stop,
+  objectif ou durée max) ; aucune nouvelle entrée.
 - **`funding_scan`** : toutes les 30 min, un seul appel `snapshot` lit le
   funding, le rollover et l'intérêt ouvert des ~200 paires Veranta ; le
-  dashboard classe les paires par rendement net du meilleur côté et une alerte
-  (événement, 1 par paire/côté et par 12 h) signale les extrêmes
-  ≥ `alert_min_net_apr_pct`. Les paires sans jambe spot sur Base
-  (`spot_hedgeable`) sont marquées « biais directionnel seulement ».
+  dashboard classe les paires par rendement net du meilleur côté (instantané
+  et moyenne sur `average_window_days`) et une alerte (événement, 1 par
+  paire/côté et par 12 h) signale les extrêmes ≥ `alert_min_net_apr_pct` sur
+  les marchés vivants (OI total ≥ `alert_min_oi_usd`). Les paires sans jambe
+  spot sur Base (`spot_hedgeable`) sont marquées « biais directionnel
+  seulement ».
 - **`treasury`** : toutes les heures, observe (papier) ce que le capital oisif
   pourrait toucher : taux de dépôt USDC d'Aave V3 Base lu on-chain
   (`getReserveData`, `eth_call` brut), rendements du vault LP Veranta via le
@@ -367,6 +379,20 @@ combinaisons sur les 30 % restants : seule la ligne « test » compte ; si elle
 est négative alors que l'entraînement était positif, la grille a sur-appris.
 Limites : un marché par simulation, coûts constants sur la période, pas de
 glissement au-delà du spread coté.
+
+Résultats du 09/11/2026 (coûts réels du jour, 100 $ de notionnel à 2x) :
+
+| Marché | 1 h × 1 an | 4 h × 2 ans | Journalier × 4 ans | Walk-forward (meilleure combinaison → test) |
+|---|---|---|---|---|
+| ETH/USD | PF 0,92, −35 $ | PF 0,96, −28 $ | PF 0,89, −56 $ | +34 $ → −24 $ |
+| BTC/USD | PF 0,82, −53 $ | PF 0,98, −7 $ | PF 0,82, −73 $ | +30 $ → +13 $ (seul cas positif, 28 trades) |
+| SOL/USD | PF 0,85, −80 $ | PF 0,92, −66 $ | PF 0,63, −260 $ | +40 $ → −10 $ |
+
+Aucune résolution, aucun marché, aucune des 192–216 combinaisons par marché ne
+donne un avantage robuste : la stratégie tendance est désactivée. La
+rentabilité du module repose sur le carry ETH/BTC (~7–9 %/an net vérifiés) et
+sur la trésorerie (4,9 % Aave sans risque de marché, 25 % en vault LP avec
+risque de drawdown).
 
 ### Prérequis du mode live (rien n'est câblé)
 

@@ -56,17 +56,35 @@ def test_rank_funding_uses_net_apr_and_flags_spot_hedgeable():
 
 def test_run_funding_scan_alerts_once_per_cooldown(tmp_path):
     store = PerpsStore(tmp_path / "scan.db")
-    config = FundingScanConfig(alert_min_net_apr_pct=15, alert_cooldown_hours=12, spot_hedgeable=("ETH/USD",))
+    config = FundingScanConfig(alert_min_net_apr_pct=15, alert_cooldown_hours=12, alert_min_oi_usd=500, spot_hedgeable=("ETH/USD",))
     rows = [_row("XMR/USD", short_h=-0.0126, long_h=0.011), _row("ETH/USD", short_h=-0.0012, long_h=0.0012),
-            _row("CLOSED/USD", short_h=-0.05, long_h=0.05, market_open=False)]
+            _row("CLOSED/USD", short_h=-0.05, long_h=0.05, market_open=False),
+            _row("DEAD/USD", short_h=-0.05, long_h=0.05, oi=(0.0, 0.0))]   # funding énorme mais marché vide
 
     alerts = run_funding_scan(store, config, rows, T0)
     assert len(alerts) == 1 and "XMR/USD" in alerts[0] and "biais directionnel" in alerts[0]
+    assert "moyenne 7 j +110" in alerts[0]                                           # 1 balayage : moyenne = instantané
     assert run_funding_scan(store, config, rows, T0 + 3600) == []                    # cooldown
     assert len(run_funding_scan(store, config, rows, T0 + 13 * 3600)) == 1           # expiré
-    assert len(store.latest_funding_scan()) == 3
+    assert len(store.latest_funding_scan()) == 4
     assert store.get_state("last_funding_scan_at") == str(T0 + 13 * 3600)
     assert len([e for e in store.recent_events() if e["strategy"] == "funding_scan"]) == 2
+
+
+def test_rank_funding_reports_rolling_average_of_best_side(tmp_path):
+    store = PerpsStore(tmp_path / "avg.db")
+    config = FundingScanConfig()
+    # Trois balayages : le short ETH encaissait 0,0006 puis 0,0009 puis 0,0012 %/h.
+    for i, short_h in enumerate((-0.0006, -0.0009, -0.0012)):
+        store.record_funding_scan([_row("ETH/USD", short_h=short_h, long_h=-short_h, at=T0 + i * 1800)])
+    averages = store.funding_scan_averages(T0 - 1)
+    assert averages["ETH/USD"]["samples"] == 3
+    ranked = rank_funding(store.latest_funding_scan(), config, averages)
+    assert ranked[0]["best_net_apr_pct"] == pytest.approx(0.0012 * H)       # instantané : 10,5 %
+    assert ranked[0]["avg_net_apr_pct"] == pytest.approx(0.0009 * H)        # moyenne : 7,9 %
+    assert ranked[0]["avg_samples"] == 3 and ranked[0]["oi_total_usd"] == 2000.0
+    # Fenêtre trop récente : pas de moyenne.
+    assert rank_funding(store.latest_funding_scan(), config, store.funding_scan_averages(T0 + 10 * 86400))[0]["avg_net_apr_pct"] is None
 
 
 def test_aave_and_balance_decoders():

@@ -165,6 +165,10 @@ class FundingScanConfig:
     interval_minutes: float = 30.0
     alert_min_net_apr_pct: float = 15.0
     alert_cooldown_hours: float = 12.0
+    # En dessous de cet intérêt ouvert total, le marché est mort (USELESS/USD :
+    # 0/0 $ le 09/11/2026) et un funding extrême n'est pas exploitable.
+    alert_min_oi_usd: float = 5_000.0
+    average_window_days: float = 7.0
     retention_days: float = 30.0
     # Paires dont la jambe spot existe sur Base (portage couvert possible) ;
     # les autres extrêmes ne sont que des biais directionnels.
@@ -181,6 +185,8 @@ class FundingScanConfig:
             interval_minutes=_positive(raw.get("interval_minutes"), cls.interval_minutes),
             alert_min_net_apr_pct=_non_negative(raw.get("alert_min_net_apr_pct"), cls.alert_min_net_apr_pct),
             alert_cooldown_hours=_non_negative(raw.get("alert_cooldown_hours"), cls.alert_cooldown_hours),
+            alert_min_oi_usd=_non_negative(raw.get("alert_min_oi_usd"), cls.alert_min_oi_usd),
+            average_window_days=_positive(raw.get("average_window_days"), cls.average_window_days),
             retention_days=_positive(raw.get("retention_days"), cls.retention_days),
             spot_hedgeable=tuple(raw.get("spot_hedgeable") or cls.spot_hedgeable),
         )

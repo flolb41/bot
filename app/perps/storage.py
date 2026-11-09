@@ -302,6 +302,19 @@ class PerpsStore:
         with self.connection() as conn:
             return conn.execute("DELETE FROM perps_funding_scan WHERE observed_at < ?", (older_than,)).rowcount
 
+    def funding_scan_averages(self, since: float) -> dict[str, dict[str, float]]:
+        """Moyennes par paire depuis `since` (funding par côté, rollover, nombre
+        de balayages) : le taux instantané surestime — sur les positions réelles
+        de plusieurs jours lues le 09/11/2026, le funding accumulé ne faisait
+        que 50–90 % de « taux du jour × heures »."""
+        rows = self.fetch_all(
+            "SELECT symbol, AVG(funding_long_pct_h) AS funding_long_pct_h, AVG(funding_short_pct_h) AS funding_short_pct_h, "
+            "AVG(rollover_pct_h) AS rollover_pct_h, COUNT(*) AS samples, MIN(observed_at) AS first_observed_at "
+            "FROM perps_funding_scan WHERE observed_at >= ? GROUP BY symbol",
+            (since,),
+        )
+        return {row["symbol"]: row for row in rows}
+
     # --- trésorerie ---------------------------------------------------------------------
     def record_treasury_observation(self, row: dict[str, Any]) -> None:
         with self.connection() as conn:

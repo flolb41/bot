@@ -87,9 +87,10 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(f"  Funding net — top 8 sur {report['funding_scan_pairs']} paires balayées :")
         for entry in report["funding_leaderboard"][:8]:
             hedge = "spot Base" if entry["spot_hedgeable"] else "directionnel seul"
+            average = f"moy. {entry['avg_net_apr_pct']:+6.1f} %" if entry.get("avg_net_apr_pct") is not None else "moy.    n/a  "
             print(
-                f"    {entry['symbol']:<11} {entry['best_side']:<5} {entry['best_net_apr_pct']:+7.1f} %/an net "
-                f"(rollover {entry['rollover_apr_pct']:4.1f} %) OI {entry['oi_long_usd']:>12,.0f}/{entry['oi_short_usd']:<12,.0f} {hedge}"
+                f"    {entry['symbol']:<11} {entry['best_side']:<5} {entry['best_net_apr_pct']:+7.1f} %/an net ({average}, "
+                f"rollover {entry['rollover_apr_pct']:4.1f} %) OI {entry['oi_long_usd']:>12,.0f}/{entry['oi_short_usd']:<12,.0f} {hedge}"
             )
     treasury = report.get("treasury")
     if treasury:

@@ -437,6 +437,10 @@ perps:
   # Cash-and-carry : short perp (notionnel réel minimum Veranta : 100 USDC) +
   # long spot modélisé au prix d'index (frais DEX + glissement + gas). Revenu
   # = funding reçu par le côté short ; le funding Veranta est exprimé par heure.
+  # Vérifié le 09/11/2026 sur ~50 positions réelles d'autres traders : le
+  # funding EST crédité aux shorts ETH/BTC (taux × notionnel × heures, rollover
+  # 0), mais le taux varie — sur plusieurs jours l'accumulé ne fait que 50–90 %
+  # du taux instantané. Compter ~7–9 %/an net, pas 10,5–12,8.
   funding_carry:
     enabled: true
     markets: [ETH/USD, BTC/USD]   # spot profond sur Base (WETH, cbBTC) ET rollover nul (les alts paient 5–15 %/an)
@@ -452,8 +456,14 @@ perps:
   # Tendance basse fréquence, levier faible, stop/objectif/durée max, cooldown
   # après sortie, plafond de perte journalière (même esprit que
   # directional_live).
+  # DÉSACTIVÉE le 09/11/2026 : backtest sur bougies Veranta (1 h × 1 an, 4 h ×
+  # 2 ans, journalier × 4 ans, coûts réels) — PF 0,82–0,96 sur ETH/BTC/SOL,
+  # −35/−53/−80 $ par an pour 100 $ de notionnel, et aucune des 192–216
+  # combinaisons testées ne gagne hors échantillon (sur-apprentissage). Les
+  # frais (~0,09 $ par rotation) mangent un signal qui vaut pile ou face.
+  # Relancer `perps_main.py backtest --grid` avant de la réactiver.
   trend:
-    enabled: true
+    enabled: false
     markets: [ETH/USD, BTC/USD, SOL/USD]
     notional_usd: 100
     leverage: 2
@@ -475,6 +485,8 @@ perps:
     interval_minutes: 30
     alert_min_net_apr_pct: 15
     alert_cooldown_hours: 12
+    alert_min_oi_usd: 5000         # pas d'alerte sur un marché mort (USELESS/USD : OI 0/0 $)
+    average_window_days: 7         # le taux instantané surestime : positions réelles à 50–90 % de « taux du jour × durée »
     retention_days: 30
   # Trésorerie (papier) : taux Aave V3 USDC lu on-chain, rendements du vault LP
   # Veranta via le SDK, solde USDC oisif du wallet et manque à gagner cumulé.

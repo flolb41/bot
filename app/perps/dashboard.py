@@ -46,7 +46,10 @@ def build_report(store: PerpsStore, engine: PaperEngine, config: PerpsConfig, no
     last_tick = store.get_state("last_tick_at")
     from app.perps.funding_scan import rank_funding
 
-    funding_ranked = rank_funding(store.latest_funding_scan(), config.funding_scan)
+    funding_ranked = rank_funding(
+        store.latest_funding_scan(), config.funding_scan,
+        store.funding_scan_averages(now - config.funding_scan.average_window_days * 86400),
+    )
     treasury = store.latest_treasury_observation()
     return {
         "mode": config.mode,
@@ -60,6 +63,7 @@ def build_report(store: PerpsStore, engine: PaperEngine, config: PerpsConfig, no
         "events": store.recent_events(limit=40),
         "funding_leaderboard": funding_ranked[:15],
         "funding_scan_pairs": len(funding_ranked),
+        "funding_average_window_days": config.funding_scan.average_window_days,
         "treasury": treasury,
     }
 
@@ -116,6 +120,7 @@ def build_html(report: dict[str, Any]) -> str:
                   for e in report["events"]]
     funding_rows = [[
         escape(f["symbol"]), escape(f["best_side"]), _fmt(f["best_net_apr_pct"], 1, " %/an"),
+        _fmt(f.get("avg_net_apr_pct"), 1, " %/an") if f.get("avg_net_apr_pct") is not None else "—",
         _fmt(f["net_apr_short_pct"], 1, " %"), _fmt(f["net_apr_long_pct"], 1, " %"), _fmt(f["rollover_apr_pct"], 1, " %"),
         f"{f['oi_long_usd']:,.0f} / {f['oi_short_usd']:,.0f}", "oui" if f["spot_hedgeable"] else "non",
         "ouvert" if f.get("market_open", True) else "fermé",
@@ -143,7 +148,7 @@ th{{color:#9fb3c8}} .muted{{color:#7f8c99}} .banner{{background:#3b2f00;border:1
 <h2>Stratégies</h2>{_table(['Stratégie', 'Ouvertes', 'Clôturées', 'Taux de réussite', 'P&L net réalisé', 'Funding net encaissé', 'Frais ($)', 'Liquidations'], strategy_rows)}
 <h2>Positions ouvertes</h2>{_table(['Stratégie', 'Paire', 'Sens', 'Notionnel $', 'Levier', 'Entrée', 'Marque', 'Non réalisé net', 'Funding encaissé', 'Liquidation', 'Durée', 'Motif'], open_rows)}
 <h2>Dernières clôtures</h2>{_table(['Date', 'Stratégie', 'Paire', 'Sens', 'Entrée', 'Sortie', 'Net', 'Motif'], closed_rows)}
-<h2>Funding — toutes paires ({report.get('funding_scan_pairs', 0)} balayées, top 15 par rendement net)</h2>{_table(['Paire', 'Côté payé', 'Net', 'Net short', 'Net long', 'Rollover', 'OI long / short ($)', 'Spot Base', 'Marché'], funding_rows)}
+<h2>Funding — toutes paires ({report.get('funding_scan_pairs', 0)} balayées, top 15 par rendement net)</h2>{_table(['Paire', 'Côté payé', 'Net (instantané)', f"Net moyen {report.get('funding_average_window_days', 7):g} j", 'Net short', 'Net long', 'Rollover', 'OI long / short ($)', 'Spot Base', 'Marché'], funding_rows)}
 <h2>Trésorerie (papier) — rendement du capital oisif</h2>{_table(['Observé', 'USDC oisif', 'Aave USDC', 'Vault Veranta 7 j', '30 j', '12 m', 'Meilleur', 'Manque à gagner cumulé'], treasury_rows)}
 <h2>Événements</h2>{_table(['Date', 'Niveau', 'Stratégie', 'Message'], event_rows)}
 </body></html>"""

@@ -58,8 +58,8 @@ def test_live_gate_is_closed_by_default_and_each_lock_is_independent():
     assert not by_name["mode"].ok and not by_name["confirmation"].ok and not by_name["plafonds"].ok
     assert "VERANTA_PRIVATE_KEY absente" in by_name["cle_deleguee"].detail
 
-    live_cfg = {"perps": {"mode": "live", "live": {"max_collateral_usd": 50, "max_total_collateral_usd": 100, "max_leverage": 3},
-                          "trend": {"notional_usd": 100, "leverage": 2}}}
+    live_cfg = {"perps": {"mode": "live", "live": {"max_collateral_usd": 100, "max_total_collateral_usd": 200, "max_leverage": 3},
+                          "trend": {"notional_usd": 100, "leverage": 2}}}   # carry (défaut, 100 $ à 1x) + trend (50 $ à 2x)
     config = PerpsConfig.from_config(live_cfg)
     env = {br.LIVE_CONFIRMATION_ENV: br.LIVE_CONFIRMATION_PHRASE, "VERANTA_PRIVATE_KEY": HARDHAT_KEY,
            "VERANTA_TRADER_ADDRESS": "0x032d16Ec1F4382287cBBFbB87Dd8163934A01803"}
@@ -75,6 +75,15 @@ def test_live_gate_is_closed_by_default_and_each_lock_is_independent():
     small = PerpsConfig.from_config({"perps": {"mode": "live", "live": {"max_collateral_usd": 20, "max_total_collateral_usd": 100},
                                                "trend": {"notional_usd": 100, "leverage": 2}}})
     assert not {c.name: c for c in br.live_gate(small, env=env)}["coherence_strategies"].ok
+    # Le carry (activé par défaut) tient son short à 1x : il lui faut 100 $ de collatéral, pas 50.
+    carry_only = PerpsConfig.from_config({"perps": {"mode": "live", "live": {"max_collateral_usd": 60, "max_total_collateral_usd": 200},
+                                                    "funding_carry": {"notional_usd": 100}, "trend": {"enabled": False}}})
+    coherence = {c.name: c for c in br.live_gate(carry_only, env=env)}["coherence_strategies"]
+    assert not coherence.ok and "carry : collatéral 100.00 $ à 1x" in coherence.detail and "trend" not in coherence.detail
+    # Aucune stratégie activée : rien à autoriser.
+    none = PerpsConfig.from_config({"perps": {"mode": "live", "live": {"max_collateral_usd": 200, "max_total_collateral_usd": 200},
+                                              "funding_carry": {"enabled": False}, "trend": {"enabled": False}}})
+    assert not {c.name: c for c in br.live_gate(none, env=env)}["coherence_strategies"].ok
     # Sans adresse trader : la clé serait le wallet lui-même.
     assert "absente" in {c.name: c for c in br.live_gate(config, env={**env, "VERANTA_TRADER_ADDRESS": ""})}["cle_deleguee"].detail
 

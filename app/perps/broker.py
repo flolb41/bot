@@ -164,11 +164,19 @@ def live_gate(config: PerpsConfig, env: Mapping[str, str] | None = None) -> list
         f"max_collateral_usd={live.max_collateral_usd:g}, max_total_collateral_usd={live.max_total_collateral_usd:g}, "
         f"max_leverage={live.max_leverage:g}",
     ))
-    trend_collateral = config.trend.notional_usd / config.trend.leverage if config.trend.leverage > 0 else float("inf")
-    checks.append(GateCheck(
-        "coherence_strategies", trend_collateral <= live.max_collateral_usd and config.trend.leverage <= live.max_leverage,
-        f"trend : collatéral {trend_collateral:.2f} $ à {config.trend.leverage:g}x vs plafonds",
-    ))
+    # Collatéral et levier demandés par chaque stratégie ACTIVÉE : le carry
+    # tient son short à 1x (collatéral = notionnel), la tendance à son levier.
+    demands: list[tuple[str, float, float]] = []
+    if config.carry.enabled:
+        demands.append(("carry", config.carry.notional_usd, 1.0))
+    if config.trend.enabled:
+        trend_collateral = config.trend.notional_usd / config.trend.leverage if config.trend.leverage > 0 else float("inf")
+        demands.append(("trend", trend_collateral, config.trend.leverage))
+    coherent = all(collateral <= live.max_collateral_usd and leverage <= live.max_leverage for _, collateral, leverage in demands)
+    detail = "aucune stratégie activée" if not demands else ", ".join(
+        f"{name} : collatéral {collateral:.2f} $ à {leverage:g}x" for name, collateral, leverage in demands
+    ) + " vs plafonds"
+    checks.append(GateCheck("coherence_strategies", bool(demands) and coherent, detail))
     return checks
 
 
@@ -217,7 +225,11 @@ def _num(value: Any, default: float = 0.0) -> float:
 
 def venue_position_from_sdk(pos: Any, symbol_by_pair_index: Mapping[int, str] | None = None) -> VenuePosition:
     """Aplatissement d'une `Position` du SDK (propriétés dérivées des champs
-    `*_raw` ; repli sur les bruts / 1e6 ou 1e10 si une propriété manque)."""
+    `*_raw` ; repli sur les bruts / 1e6 ou 1e10 si une propriété manque).
+    Convention vérifiée sur des positions réelles le 09/11/2026 :
+    `unrealised_funding_fee` positif = coût pour le trader, négatif = crédit —
+    les shorts ETH/BTC affichaient bien un crédit égal à taux × notionnel ×
+    heures (même signe que `funding_usd` du moteur papier)."""
     def pick(name: str, raw_scale: float) -> float:
         value = getattr(pos, name, None)
         if value is None:
