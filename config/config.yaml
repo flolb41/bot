@@ -418,6 +418,20 @@ system_health:
   max_temperature_celsius: 80.0   # arrêt si CPU > 80°C
   max_memory_percent: 90.0        # arrêt si RAM > 90% (risque OOM sur Pi3 1Go)
 
+# Trésorerie du wallet de trading : l'USDC oisif ne doit jamais dormir. Toutes
+# les `check_interval_minutes`, le bot dépose sur Aave V3 (~4,7 %/an le
+# 09/11/2026) tout l'USDC liquide au-dessus de `keep_float_usdc`, dès que le
+# surplus atteint `min_sweep_usdc` (gas ≈ 0,003 $ par dépôt). Mêmes garde-fous
+# que les swaps (app/trading/treasury_ops.py) ; retrait manuel :
+# `main.py treasury withdraw --execute`. Remettre un flottant (ex. 5) si une
+# stratégie spot live est réactivée : sans USDC liquide, toute exécution est
+# refusée « solde insuffisant ».
+treasury:
+  auto_deposit: true
+  keep_float_usdc: 0
+  min_sweep_usdc: 5
+  check_interval_minutes: 60
+
 # Trading de perpétuels sur Base — PHASE PAPIER UNIQUEMENT (aucun ordre, aucune
 # clé). Service séparé (perps_main.py, scripts/perps-paper.service, venv
 # .venv-perps) qui lit le marché Veranta (ex-Avantis) et simule deux
@@ -438,7 +452,7 @@ perps:
     host: 0.0.0.0
     port: 8001
   venue: veranta
-  markets: [ETH/USD, BTC/USD, SOL/USD, AERO/USD]
+  markets: [ETH/USD, BTC/USD]     # observés à chaque tick ; les ~200 autres paires passent par funding_scan (30 min)
   observation_retention_days: 30
   # Cash-and-carry : short perp (notionnel réel minimum Veranta : 100 USDC) +
   # long spot modélisé au prix d'index (frais DEX + glissement + gas). Revenu
@@ -451,10 +465,19 @@ perps:
     enabled: true
     markets: [ETH/USD, BTC/USD]   # spot profond sur Base (WETH, cbBTC) ET rollover nul (les alts paient 5–15 %/an)
     notional_usd: 100
-    entry_min_apr_pct: 6          # rendement NET (funding encaissé − rollover) minimal pour entrer
+    leverage: 2                   # jambe perp à 2x : capital = 100 $ de spot + 50 $ de collatéral ; liquidation du short à +42,5 %
+    # Seuil d'entrée DYNAMIQUE : le capital immobilisé (notionnel × 1,5 à 2x)
+    # pourrait dormir sur Aave (~4,7 %/an le 09/11/2026). Le carry n'entre que
+    # si le funding net ≥ Aave × 1,5 + hurdle_margin (≈ 8 %/an), jamais sous
+    # entry_min_apr_pct. Au funding réaliste de 7–9 %, c'est volontairement
+    # marginal : le carry est un overlay pour les pics de funding, pas un
+    # placement par défaut.
+    entry_min_apr_pct: 6          # plancher absolu du seuil (rendement NET : funding encaissé − rollover)
+    hurdle_margin_apr_pct: 1      # marge au-dessus du rendement Aave équivalent
+    exit_hurdle_slack_apr_pct: 3  # sortie si le net passe sous seuil − 3 points (≈ 5 %) pendant exit_confirm_hours
     entry_persistence_hours: 6    # … tenu (médiane) sur les 6 dernières heures d'observations
     entry_min_edge_ratio: 2       # gain attendu sur max_hold_hours ≥ 2 × coût d'une rotation (~0,29 %)
-    exit_min_apr_pct: 0           # sortir si le funding net devient un coût pour le short…
+    exit_min_apr_pct: 0           # plancher du seuil de sortie
     exit_confirm_hours: 12        # … pendant 12 h d'affilée (30 min = 2 rotations inutiles le 09/11)
     max_hold_hours: 720           # 30 jours : à 10 %/an, 10 jours suffisent à amortir l'entrée
     spot_cost_pct: 0.07           # 0,05 % de frais DEX + ~0,02 % de glissement par jambe spot

@@ -1,6 +1,8 @@
 ﻿"""Tests du moteur perps papier (app.perps.engine) — aucune dépendance au SDK."""
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from app.perps.engine import (
@@ -96,7 +98,9 @@ def test_carry_opens_short_perp_plus_modelled_spot_when_funding_income_is_high(e
     assert position["open_fee_usd"] == pytest.approx(0.045)
     assert position["spot_costs_usd"] == pytest.approx(0.07 + 0.02)
     assert position["spot_qty"] == pytest.approx((100 - 0.07) / 2000)
-    assert position["collateral_usd"] == 200.0                            # capital employé : perp + spot
+    assert position["leverage"] == 2.0 and position["collateral_usd"] == 50.0   # collatéral perp ; capital = 150 $
+    assert position["liquidation_price"] == pytest.approx(liquidation_price("short", position["entry_price"], 50.0, 100.0, 0.045))
+    assert "seuil 6.0 %" in position["entry_reason"] and "Aave inconnu" in position["entry_reason"]
 
 
 def test_carry_is_not_opened_when_funding_income_is_below_threshold(engine):
@@ -346,3 +350,69 @@ def test_carry_exit_hysteresis_resets_when_funding_recovers(engine):
     assert len(engine.store.open_positions(STRATEGY_CARRY)) == 1          # 5 min < 15 min d'hystérésis
     engine.process_tick({"ETH/USD": _state(funding_short=0.001, at=T0 + 2400)}, T0 + 2400)
     assert engine.store.open_positions(STRATEGY_CARRY) == []
+
+
+# ------------------------------------------------- carry : seuil Aave, levier, liquidation
+
+def test_carry_hurdle_follows_the_treasury_reference_rate():
+    cfg = _config().carry
+    assert cfg.leverage == 2.0 and cfg.capital_usd(100.0) == 150.0
+    assert cfg.hurdle_apr_pct(None) == 6.0                                  # pas d'observation : plancher
+    assert cfg.hurdle_apr_pct(4.7) == pytest.approx(4.7 * 1.5 + 1.0)        # 8,05 % à 2x
+    assert cfg.hurdle_apr_pct(2.0) == 6.0                                   # jamais sous le plancher
+    assert cfg.exit_apr_pct(8.05) == pytest.approx(5.05) and cfg.exit_apr_pct(1.0) == 0.0
+    one_x = _config(funding_carry={"leverage": 1}).carry
+    assert one_x.hurdle_apr_pct(4.7) == pytest.approx(4.7 * 2 + 1.0)        # 10,4 % à 1x : capital doublé
+
+
+def test_carry_refuses_funding_that_does_not_beat_aave(tmp_path):
+    engine = PaperEngine(PerpsStore(tmp_path / "hurdle.db"), _config())
+    engine.store.record_treasury_observation({"observed_at": time.time(), "idle_usdc": 0.0, "aave_usdc_apr_pct": 4.7,
+                                              "missed_yield_usd": 0.0})
+    # 7,0 %/an net : au-dessus du plancher (6) mais sous le seuil Aave (8,05) -> pas d'entrée.
+    engine.process_tick({"ETH/USD": _state(funding_short=-0.0008)}, T0)
+    assert engine.store.open_positions(STRATEGY_CARRY) == []
+    assert engine.carry_hurdle_apr_pct() == pytest.approx(8.05)
+    # 10,5 %/an : entrée, motif avec le seuil et le taux Aave.
+    engine.process_tick({"ETH/USD": _state(at=T0 + 300)}, T0 + 300)
+    position = engine.store.open_positions(STRATEGY_CARRY)[0]
+    assert "seuil 8.1 %" in position["entry_reason"] and "Aave 4.70 %" in position["entry_reason"]
+    # Observation trop vieille (> 48 h) : on retombe sur le plancher.
+    stale = PaperEngine(PerpsStore(tmp_path / "stale.db"), _config())
+    stale.store.record_treasury_observation({"observed_at": time.time() - 3 * 86400, "aave_usdc_apr_pct": 4.7, "missed_yield_usd": 0.0})
+    assert stale.carry_reference_apr_pct() is None and stale.carry_hurdle_apr_pct() == 6.0
+
+
+def test_carry_exits_when_funding_falls_clearly_below_the_hurdle(tmp_path):
+    engine = PaperEngine(PerpsStore(tmp_path / "exit.db"), _config())
+    engine.store.record_treasury_observation({"observed_at": time.time(), "aave_usdc_apr_pct": 4.7, "missed_yield_usd": 0.0})
+    engine.process_tick({"ETH/USD": _state()}, T0)                          # 10,5 % ≥ 8,05
+    # 6 %/an : sous le seuil (8,05) mais au-dessus du seuil de sortie (5,05) -> on garde.
+    for i in range(1, 5):
+        engine.process_tick({"ETH/USD": _state(funding_short=-0.000685, at=T0 + i * 300)}, T0 + i * 300)
+    assert len(engine.store.open_positions(STRATEGY_CARRY)) == 1
+    # 4 %/an : sous 5,05 pendant > 15 min -> fermeture avec le seuil dans le motif.
+    for i in range(5, 10):
+        engine.process_tick({"ETH/USD": _state(funding_short=-0.000457, at=T0 + i * 300)}, T0 + i * 300)
+    closed = engine.store.closed_positions(STRATEGY_CARRY)
+    assert len(closed) == 1 and "< 5.1 %" in closed[0]["exit_reason"]
+
+
+def test_carry_short_leg_is_liquidated_on_a_violent_rally(tmp_path):
+    engine = PaperEngine(PerpsStore(tmp_path / "liq.db"), _config())
+    engine.process_tick({"ETH/USD": _state()}, T0)
+    position = engine.store.open_positions(STRATEGY_CARRY)[0]
+    liq = position["liquidation_price"]
+    assert liq == pytest.approx(position["entry_price"] * (1 + (50 * 0.85 - 0.045) / 100))   # ≈ +42,5 %
+    # +30 % : rien ; la liquidation se rapproche légèrement avec le rollover payé (ici 0 : stable).
+    engine.process_tick({"ETH/USD": _state("ETH/USD", 2600.0, at=T0 + HOUR)}, T0 + HOUR)
+    assert len(engine.store.open_positions(STRATEGY_CARRY)) == 1
+    # +50 % même marché fermé : la liquidation on-chain n'attend pas.
+    engine.process_tick({"ETH/USD": _state("ETH/USD", 3000.0, market_open=False, at=T0 + 2 * HOUR)}, T0 + 2 * HOUR)
+    closed = engine.store.closed_positions(STRATEGY_CARRY)[0]
+    assert closed["exit_reason"] == "liquidation" and closed["close_fee_usd"] == 0.0
+    assert closed["exit_price"] == pytest.approx(liq, rel=1e-4)      # 2 h de funding encaissé l'éloignent de ~0,05 $
+    # Collatéral perp perdu (50 $), spot vendu à 3000 (+ ~50 $) : net ≈ −frais − funding/rollover, pas −50.
+    spot_gain = closed["spot_qty"] * (3000.0 - closed["spot_entry_price"])
+    assert closed["gross_pnl_usd"] == pytest.approx(-50.0 + spot_gain)
+    assert -1.0 < closed["net_pnl_usd"] < 1.0

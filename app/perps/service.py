@@ -35,7 +35,13 @@ def _summarize(states: dict[str, PairState]) -> str:
 
 async def run_tick(engine: PaperEngine, provider: MarketDataProvider, config: PerpsConfig,
                    now: float | None = None) -> dict[str, Any]:
-    states = await fetch_states(provider, config.markets)
+    # Les marchés d'une position encore ouverte restent observés même s'ils ont
+    # quitté la configuration (stratégie coupée) : sinon elle ne se fermerait jamais.
+    symbols = list(config.markets)
+    for position in engine.store.open_positions():
+        if position["symbol"] not in symbols:
+            symbols.append(position["symbol"])
+    states = await fetch_states(provider, symbols)
     if not states:
         logger.warning("Aucun marché lisible : tick ignoré.")
         return {"actions": [], "markets": 0, "open_positions": None}

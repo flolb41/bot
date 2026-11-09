@@ -115,6 +115,29 @@ def test_real_sends_require_live_trading(tmp_path, monkeypatch):
     assert treasury_ops.deposit_usdc(db, {}, 5.0, dry_run=True)["error"] is None   # l'aperçu reste possible
 
 
+def test_auto_sweep_deposits_only_above_float_and_minimum(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    monkeypatch.setattr("app.trading.guardrails.is_stopped", lambda _db: False)
+    config = {"treasury": {"auto_deposit": True, "keep_float_usdc": 2.0, "min_sweep_usdc": 5.0}}
+
+    sent, _ = _wire(monkeypatch, liquid=6.0, deposited=10.0)        # 4 USDC au-dessus du flottant < 5 : rien
+    assert treasury_ops.auto_sweep(db, config) is None and sent == []
+
+    sent, _ = _wire(monkeypatch, liquid=107.0, deposited=10.0)      # 105 USDC balayés, flottant conservé
+    result = treasury_ops.auto_sweep(db, config)
+    assert result["sent"] and result["amount_usdc"] == pytest.approx(105.0)
+    assert result["after"]["liquid_usdc"] == pytest.approx(2.0) and result["after"]["deposited_usdc"] == pytest.approx(115.0)
+    notes = db.list_notifications(limit=5)
+    assert notes and "déposés automatiquement" in notes[0]["message"]
+
+    sent, _ = _wire(monkeypatch, liquid=107.0, deposited=10.0, live=False)   # trading live coupé : silence
+    assert treasury_ops.auto_sweep(db, config) is None and sent == []
+    sent, _ = _wire(monkeypatch, liquid=107.0, deposited=10.0)
+    assert treasury_ops.auto_sweep(db, {"treasury": {"auto_deposit": False}}) is None and sent == []
+    monkeypatch.setattr("app.trading.guardrails.is_stopped", lambda _db: True)   # killswitch : silence
+    assert treasury_ops.auto_sweep(db, config) is None and sent == []
+
+
 def test_treasury_snapshot_decodes_balances_and_rate(monkeypatch):
     calls = {}
 

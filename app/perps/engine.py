@@ -12,6 +12,7 @@ collatéral.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -88,10 +89,14 @@ class PaperEngine:
         notional = float(position["notional_usd"])
         funding = float(position["funding_usd"]) + notional * state.funding_pct_h(position["side"]) / 100 * hours
         rollover = float(position["rollover_usd"]) + notional * state.rollover_pct_h / 100 * hours
+        # Les deux genres ont une jambe perp dont la liquidation se rapproche à
+        # mesure que funding et rollover s'accumulent (ou s'éloigne si le funding
+        # est encaissé) ; les carrys historiques à collatéral « capital » (2 ×
+        # notionnel) gardent simplement une liquidation hors d'atteinte.
         liq = liquidation_price(
             position["side"], float(position["entry_price"]), float(position["collateral_usd"]), notional,
             fees_usd=float(position["open_fee_usd"]) + funding + rollover,
-        ) if position["kind"] == "perp" else position["liquidation_price"]
+        )
         self.store.update_position(
             int(position["id"]), funding_usd=funding, rollover_usd=rollover, last_accrual_at=now, liquidation_price=liq,
         )
@@ -146,11 +151,15 @@ class PaperEngine:
         return message
 
     def _evaluate_carry_exit(self, position: dict[str, Any], state: PairState, now: float) -> str | None:
+        liq = position.get("liquidation_price")
+        if liq is not None and float(liq) > 0 and state.price >= float(liq):
+            return self._close_carry(position, state, now, reason="liquidation", liquidated=True)
         if not state.market_open:
             return None
         key = f"carry_low_since:{position['symbol']}"
         net_apr = state.net_carry_apr_pct("short")
-        if net_apr < self.carry_cfg.exit_min_apr_pct:
+        exit_threshold = self.carry_cfg.exit_apr_pct(self.carry_hurdle_apr_pct())
+        if net_apr < exit_threshold:
             since = self.store.get_state(key)
             if not since:
                 self.store.set_state(key, str(now))
@@ -158,7 +167,8 @@ class PaperEngine:
                 self.store.set_state(key, "")
                 return self._close_carry(
                     position, state, now,
-                    reason=f"funding_faible ({net_apr:+.1f} %/an net depuis {(now - float(since)) / 3600:.0f} h)",
+                    reason=(f"funding_faible ({net_apr:+.1f} %/an net < {exit_threshold:.1f} % depuis "
+                            f"{(now - float(since)) / 3600:.0f} h)"),
                 )
         else:
             self.store.set_state(key, "")
@@ -166,11 +176,21 @@ class PaperEngine:
             return self._close_carry(position, state, now, reason="duree_max")
         return None
 
-    def _close_carry(self, position: dict[str, Any], state: PairState, now: float, *, reason: str) -> str:
+    def _close_carry(self, position: dict[str, Any], state: PairState, now: float, *, reason: str,
+                     liquidated: bool = False) -> str:
         notional = float(position["notional_usd"])
-        exit_price = state.execution_price("short", opening=False)
-        close_fee = notional * state.close_fee_pct / 100
-        perp_gross = gross_pnl_usd("short", float(position["entry_price"]), exit_price, notional)
+        collateral = float(position["collateral_usd"])
+        if liquidated:
+            # Le short est liquidé : tout le collatéral perp est perdu, aucun frais
+            # de clôture ; la jambe spot est revendue au prix courant (sa plus-value
+            # compense une partie, pas la totalité, de la perte).
+            exit_price = float(position["liquidation_price"])
+            close_fee = 0.0
+            perp_gross = -collateral
+        else:
+            exit_price = state.execution_price("short", opening=False)
+            close_fee = notional * state.close_fee_pct / 100
+            perp_gross = gross_pnl_usd("short", float(position["entry_price"]), exit_price, notional)
         spot_qty = float(position["spot_qty"] or 0)
         spot_gross = spot_qty * (state.price - float(position["spot_entry_price"] or state.price))
         spot_exit_costs = spot_qty * state.price * self.carry_cfg.spot_cost_pct / 100 + self.carry_cfg.spot_gas_usd
@@ -193,19 +213,38 @@ class PaperEngine:
         return message
 
     # --------------------------------------------------------------- entries
+    def carry_reference_apr_pct(self) -> float | None:
+        """Taux sans risque de marché du capital oisif : dernier taux Aave USDC
+        observé par la trésorerie (ignoré s'il date de plus de 48 h)."""
+        observation = self.store.latest_treasury_observation()
+        if not observation or observation.get("aave_usdc_apr_pct") is None:
+            return None
+        if time.time() - float(observation["observed_at"]) > 48 * 3600:
+            return None
+        return float(observation["aave_usdc_apr_pct"])
+
+    def carry_hurdle_apr_pct(self) -> float:
+        return self.carry_cfg.hurdle_apr_pct(self.carry_reference_apr_pct())
+
     def _carry_entries(self, states: dict[str, PairState], now: float) -> list[str]:
         actions: list[str] = []
         open_symbols = {p["symbol"] for p in self.store.open_positions(STRATEGY_CARRY)}
+        reference = self.carry_reference_apr_pct()
+        hurdle = self.carry_cfg.hurdle_apr_pct(reference)
         for symbol in self.carry_cfg.markets:
             state = states.get(symbol)
             if state is None or symbol in open_symbols or not state.market_open:
                 continue
             net_apr = state.net_carry_apr_pct("short")
-            if net_apr < self.carry_cfg.entry_min_apr_pct:
+            if net_apr < hurdle:
                 continue
-            if not self._carry_funding_persistent(symbol, now):
+            if not self._carry_funding_persistent(symbol, now, hurdle):
                 continue
             notional = max(self.carry_cfg.notional_usd, state.min_notional_usd)
+            leverage = self.carry_cfg.leverage
+            if state.max_leverage > 0:
+                leverage = min(leverage, state.max_leverage)
+            collateral = notional / leverage
             costs = self.carry_cfg.round_trip_costs_usd(notional, state.open_fee_pct, state.close_fee_pct)
             expected_income = notional * net_apr / 100 * self.carry_cfg.max_hold_hours / 8760
             if expected_income < self.carry_cfg.entry_min_edge_ratio * costs:
@@ -219,33 +258,34 @@ class PaperEngine:
             open_fee = notional * state.open_fee_pct / 100
             spot_costs = notional * self.carry_cfg.spot_cost_pct / 100 + self.carry_cfg.spot_gas_usd
             spot_qty = (notional - notional * self.carry_cfg.spot_cost_pct / 100) / state.price
+            reference_text = f"Aave {reference:.2f} %" if reference is not None else "Aave inconnu"
             position_id = self.store.insert_position({
                 "strategy": STRATEGY_CARRY, "symbol": symbol, "side": "short", "kind": "carry",
                 "opened_at": now, "entry_price": entry_price, "index_price_at_open": state.price,
-                "notional_usd": notional, "leverage": 1.0, "collateral_usd": 2 * notional,
+                "notional_usd": notional, "leverage": leverage, "collateral_usd": collateral,
                 "open_fee_usd": open_fee, "spot_qty": spot_qty, "spot_entry_price": state.price,
                 "spot_costs_usd": spot_costs, "funding_usd": 0.0, "rollover_usd": 0.0, "last_accrual_at": now,
-                "liquidation_price": liquidation_price("short", entry_price, notional, notional, open_fee),
+                "liquidation_price": liquidation_price("short", entry_price, collateral, notional, open_fee),
                 "entry_reason": (
                     f"funding net {net_apr:+.1f} %/an (brut {state.funding_income_apr_pct('short'):+.1f}, "
-                    f"rollover {state.rollover_apr_pct():.1f}) ≥ {self.carry_cfg.entry_min_apr_pct:.1f} % ; "
+                    f"rollover {state.rollover_apr_pct():.1f}) ≥ seuil {hurdle:.1f} % ({reference_text}, {leverage:g}x) ; "
                     f"amortissement {breakeven_hours / 24:.1f} j"
                 ),
             })
             if position_id is None:
                 continue
             message = (
-                f"funding_carry {symbol} ouvert : short perp {notional:.0f} $ @ {entry_price:.4f} + spot long "
-                f"{spot_qty:.6f} @ {state.price:.4f} — funding net {net_apr:+.1f} %/an, coûts de rotation "
-                f"{costs:.3f} $ amortis en {breakeven_hours / 24:.1f} j, gain attendu {expected_income:.2f} $ sur "
-                f"{self.carry_cfg.max_hold_hours / 24:.0f} j"
+                f"funding_carry {symbol} ouvert : short perp {notional:.0f} $ à {leverage:g}x @ {entry_price:.4f} + spot long "
+                f"{spot_qty:.6f} @ {state.price:.4f} (capital {self.carry_cfg.capital_usd(notional):.0f} $) — funding net "
+                f"{net_apr:+.1f} %/an ≥ seuil {hurdle:.1f} % ({reference_text}), coûts de rotation {costs:.3f} $ amortis en "
+                f"{breakeven_hours / 24:.1f} j, gain attendu {expected_income:.2f} $ sur {self.carry_cfg.max_hold_hours / 24:.0f} j"
             )
             self.store.add_event(message, strategy=STRATEGY_CARRY, symbol=symbol, created_at=now)
             logger.info(message)
             actions.append(message)
         return actions
 
-    def _carry_funding_persistent(self, symbol: str, now: float) -> bool:
+    def _carry_funding_persistent(self, symbol: str, now: float, threshold_apr_pct: float) -> bool:
         """Le rendement net doit avoir tenu sur les `entry_persistence_hours`
         dernières observations (médiane ≥ seuil, fenêtre couverte à 80 %) :
         un pic de funding d'un quart d'heure ne justifie pas 0,29 % de frais."""
@@ -259,7 +299,7 @@ class PaperEngine:
             (-row["funding_short_pct_h"] - row["rollover_pct_h"]) * 8760 for row in history
         )
         median = net_aprs[len(net_aprs) // 2]
-        return median >= self.carry_cfg.entry_min_apr_pct
+        return median >= threshold_apr_pct
 
     def _trend_entries(self, states: dict[str, PairState], now: float) -> list[str]:
         actions: list[str] = []

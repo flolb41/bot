@@ -199,3 +199,35 @@ def withdraw_usdc(db: Database, config: dict, amount_usdc: float | None = None, 
         logger.exception("Retrait Aave en échec.")
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result
+
+
+def auto_sweep(db: Database, config: dict) -> dict[str, Any] | None:
+    """Dépose automatiquement l'USDC liquide au-dessus de `treasury.keep_float_usdc`
+    dès qu'il dépasse `treasury.min_sweep_usdc` (section `treasury` de
+    config.yaml). Silencieux tant qu'il n'y a rien à faire ou que le trading
+    live n'est pas autorisé ; une notification par dépôt effectué."""
+    treasury_cfg = (config or {}).get("treasury", {}) or {}
+    if not treasury_cfg.get("auto_deposit", False) or not is_trading_live(config):
+        return None
+    from app.trading.guardrails import is_stopped
+
+    if is_stopped(db):
+        return None
+    keep_float = max(0.0, float(treasury_cfg.get("keep_float_usdc", 0.0)))
+    min_sweep = max(MIN_OPERATION_USDC, float(treasury_cfg.get("min_sweep_usdc", 5.0)))
+    preview = deposit_usdc(db, config, None, keep_float_usdc=keep_float, dry_run=True)
+    if preview["error"] or preview["amount_usdc"] < min_sweep:
+        return None
+    result = deposit_usdc(db, config, None, keep_float_usdc=keep_float, dry_run=False)
+    if result["sent"]:
+        after = result["after"] or {}
+        db.add_notification(
+            "💤→📈 USDC oisif déposé sur Aave V3",
+            f"{result['amount_usdc']:.2f} USDC déposés automatiquement (tx {result['tx_hash']}) — "
+            f"déposé total {after.get('deposited_usdc', 0):.2f} USDC"
+            + (f" à {after['apr_pct']:.2f} %/an" if after.get("apr_pct") is not None else "") + ".",
+            level="info",
+        )
+    elif result["error"]:
+        logger.warning("Balayage de trésorerie : dépôt de %.2f USDC non effectué — %s", result["amount_usdc"], result["error"])
+    return result

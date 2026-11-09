@@ -84,9 +84,17 @@ def cmd_status(args: argparse.Namespace) -> None:
             f"@ {position['entry_price']:.4f} → non réalisé {position.get('unrealized_net_usd')}"
         )
     if report["funding_leaderboard"]:
+        reference = report.get("carry_reference_apr_pct")
+        print(
+            f"  Seuil carry : {report['carry_hurdle_apr_pct']:.1f} %/an net à {report['carry_leverage']:g}x "
+            f"(capital {report['carry_capital_usd']:.0f} $ / 100 $ de notionnel, "
+            f"{'Aave ' + format(reference, '.2f') + ' %' if reference is not None else 'Aave inconnu'})"
+        )
         print(f"  Funding net — top 8 sur {report['funding_scan_pairs']} paires balayées :")
         for entry in report["funding_leaderboard"][:8]:
             hedge = "spot Base" if entry["spot_hedgeable"] else "directionnel seul"
+            if entry.get("beats_hurdle"):
+                hedge += " — CARRY > AAVE"
             average = f"moy. {entry['avg_net_apr_pct']:+6.1f} %" if entry.get("avg_net_apr_pct") is not None else "moy.    n/a  "
             print(
                 f"    {entry['symbol']:<11} {entry['best_side']:<5} {entry['best_net_apr_pct']:+7.1f} %/an net ({average}, "

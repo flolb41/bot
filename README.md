@@ -318,13 +318,19 @@ rollover, intérêt ouvert, position minimale) et comptabilise chaque position
 papier avec ces coûts réels. Synthetix V3 sur Base a été écarté le 08/11/2026
 (`maxOpenInterest = 0` sur ETH/BTC/SOL : marchés en extinction).
 
-- **`funding_carry`** : short perp + long spot modélisé (frais DEX, glissement,
-  gas) quand le rendement **net** du short (funding encaissé − rollover) tient
-  ≥ `entry_min_apr_pct` en médiane sur `entry_persistence_hours` et que le gain
-  attendu sur `max_hold_hours` couvre `entry_min_edge_ratio` fois le coût d'une
-  rotation ; sortie quand le funding net redevient un coût pendant
-  `exit_confirm_hours` d'affilée ou après `max_hold_hours`. Les alts Veranta
-  paient 5–15 %/an de rollover : seuls ETH/BTC (rollover nul) portent vraiment.
+- **`funding_carry`** : short perp (à `leverage`, 2x par défaut) + long spot
+  modélisé (frais DEX, glissement, gas) quand le rendement **net** du short
+  (funding encaissé − rollover) tient, en médiane sur
+  `entry_persistence_hours`, au-dessus d'un **seuil dynamique** : le capital
+  immobilisé (spot + collatéral = notionnel × (1 + 1/levier)) pourrait dormir
+  sur Aave, donc le carry n'entre que si funding net ≥ Aave × (1 + 1/levier)
+  + `hurdle_margin_apr_pct` (≈ 8 %/an à 2x avec Aave à 4,7 %, jamais sous
+  `entry_min_apr_pct`), et si le gain attendu sur `max_hold_hours` couvre
+  `entry_min_edge_ratio` fois le coût d'une rotation. Sortie quand le net
+  passe sous seuil − `exit_hurdle_slack_apr_pct` pendant `exit_confirm_hours`,
+  après `max_hold_hours`, ou par liquidation du short (+42,5 % à 2x : le
+  collatéral perp est perdu, la plus-value spot compense en partie). Les alts
+  Veranta paient 5–15 %/an de rollover : seuls ETH/BTC (rollover nul) portent.
   **Vérifié le 09/11/2026** sur ~50 positions réelles d'autres traders (lecture
   publique `account.positions(trader)`) : le funding est bien crédité aux
   shorts ETH/BTC (`unrealised_funding_fee` négatif = crédit, égal à
@@ -466,6 +472,14 @@ du scan. En attendant, l'USDC qui dort doit au moins toucher Aave.
 .venv/bin/python main.py treasury deposit --amount 8 --execute         # dépôt réel
 .venv/bin/python main.py treasury withdraw --execute                   # retrait total (intérêts compris)
 ```
+
+**Balayage automatique** (`treasury.auto_deposit: true` dans `config.yaml`) :
+toutes les `check_interval_minutes`, le bot dépose lui-même l'USDC liquide
+au-dessus de `keep_float_usdc` dès que le surplus atteint `min_sweep_usdc` —
+un virement vers le wallet est au travail dans l'heure, sans commande. Le
+flottant est à 0 depuis le 09/11/2026 (aucune stratégie spot live) ; en
+remettre un (ex. 5) avant de réactiver un swap live, sinon toute exécution est
+refusée « solde insuffisant ».
 
 Mêmes garde-fous que les swaps (`app/trading/treasury_ops.py`) : trading live
 requis, killswitch, whitelist fixe en code (le Pool Aave est la seule adresse

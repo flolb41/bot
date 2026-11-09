@@ -50,6 +50,12 @@ def build_report(store: PerpsStore, engine: PaperEngine, config: PerpsConfig, no
         store.latest_funding_scan(), config.funding_scan,
         store.funding_scan_averages(now - config.funding_scan.average_window_days * 86400),
     )
+    carry_reference = engine.carry_reference_apr_pct()
+    carry_hurdle = config.carry.hurdle_apr_pct(carry_reference)
+    for entry in funding_ranked:
+        # Un carry réel = short perp + spot : seule la jambe short des paires
+        # couvrables compte, et elle doit battre le capital placé sur Aave.
+        entry["beats_hurdle"] = bool(entry["spot_hedgeable"] and entry["net_apr_short_pct"] >= carry_hurdle)
     treasury = store.latest_treasury_observation()
     return {
         "mode": config.mode,
@@ -64,6 +70,10 @@ def build_report(store: PerpsStore, engine: PaperEngine, config: PerpsConfig, no
         "funding_leaderboard": funding_ranked[:15],
         "funding_scan_pairs": len(funding_ranked),
         "funding_average_window_days": config.funding_scan.average_window_days,
+        "carry_hurdle_apr_pct": carry_hurdle,
+        "carry_reference_apr_pct": carry_reference,
+        "carry_leverage": config.carry.leverage,
+        "carry_capital_usd": config.carry.capital_usd(config.carry.notional_usd),
         "treasury": treasury,
     }
 
@@ -88,6 +98,12 @@ def _ts(value: Any) -> str:
     if not value:
         return "—"
     return time.strftime("%d/%m %H:%M", time.gmtime(float(value))) + " UTC"
+
+
+def _reference_text(reference_apr_pct: Any) -> str:
+    if reference_apr_pct is None:
+        return ", taux Aave inconnu : plancher de config"
+    return f", Aave USDC {float(reference_apr_pct):.2f} %/an"
 
 
 def build_html(report: dict[str, Any]) -> str:
@@ -123,6 +139,7 @@ def build_html(report: dict[str, Any]) -> str:
         _fmt(f.get("avg_net_apr_pct"), 1, " %/an") if f.get("avg_net_apr_pct") is not None else "—",
         _fmt(f["net_apr_short_pct"], 1, " %"), _fmt(f["net_apr_long_pct"], 1, " %"), _fmt(f["rollover_apr_pct"], 1, " %"),
         f"{f['oi_long_usd']:,.0f} / {f['oi_short_usd']:,.0f}", "oui" if f["spot_hedgeable"] else "non",
+        "OUI" if f.get("beats_hurdle") else "non",
         "ouvert" if f.get("market_open", True) else "fermé",
     ] for f in report["funding_leaderboard"]]
     treasury = report.get("treasury")
@@ -149,7 +166,11 @@ th{{color:#9fb3c8}} .muted{{color:#7f8c99}} .banner{{background:#3b2f00;border:1
 <h2>Stratégies</h2>{_table(['Stratégie', 'Ouvertes', 'Clôturées', 'Taux de réussite', 'P&L net réalisé', 'Funding net encaissé', 'Frais ($)', 'Liquidations'], strategy_rows)}
 <h2>Positions ouvertes</h2>{_table(['Stratégie', 'Paire', 'Sens', 'Notionnel $', 'Levier', 'Entrée', 'Marque', 'Non réalisé net', 'Funding encaissé', 'Liquidation', 'Durée', 'Motif'], open_rows)}
 <h2>Dernières clôtures</h2>{_table(['Date', 'Stratégie', 'Paire', 'Sens', 'Entrée', 'Sortie', 'Net', 'Motif'], closed_rows)}
-<h2>Funding — toutes paires ({report.get('funding_scan_pairs', 0)} balayées, top 15 par rendement net)</h2>{_table(['Paire', 'Côté payé', 'Net (instantané)', f"Net moyen {report.get('funding_average_window_days', 7):g} j", 'Net short', 'Net long', 'Rollover', 'OI long / short ($)', 'Spot Base', 'Marché'], funding_rows)}
+<h2>Funding — toutes paires ({report.get('funding_scan_pairs', 0)} balayées, top 15 par rendement net)</h2>
+<p>Seuil carry : <b>{report.get('carry_hurdle_apr_pct', 0):.1f} %/an</b> net sur le notionnel à {report.get('carry_leverage', 1):g}x
+(capital {report.get('carry_capital_usd', 0):.0f} $ pour 100 $ de notionnel{_reference_text(report.get('carry_reference_apr_pct'))}) —
+en dessous, le même capital rapporte plus sur Aave sans risque de marché.</p>
+{_table(['Paire', 'Côté payé', 'Net (instantané)', f"Net moyen {report.get('funding_average_window_days', 7):g} j", 'Net short', 'Net long', 'Rollover', 'OI long / short ($)', 'Spot Base', 'Carry > Aave', 'Marché'], funding_rows)}
 <h2>Trésorerie — rendement du capital (Aave réel via <code>main.py treasury</code>, vault observé)</h2>{_table(['Observé', 'USDC liquide', 'Déposé Aave', 'Aave USDC', 'Vault Veranta 7 j', '30 j', '12 m', 'Meilleur', 'Manque à gagner cumulé (liquide)'], treasury_rows)}
 <h2>Événements</h2>{_table(['Date', 'Niveau', 'Stratégie', 'Message'], event_rows)}
 </body></html>"""

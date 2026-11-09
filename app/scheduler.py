@@ -626,4 +626,26 @@ def build_scheduler(
             coalesce=True,
         )
         logger.info("Rétention SQLite configurée à %d jours.", retention_days)
+
+    # --- Trésorerie : l'USDC oisif du wallet ne doit jamais dormir ; balayage
+    #     périodique vers Aave V3 au-dessus d'un flottant (voir treasury_ops) --
+    treasury_cfg = (config or {}).get("treasury", {}) or {}
+    if treasury_cfg.get("auto_deposit", False):
+        def _treasury_sweep() -> None:
+            try:
+                from app.trading.treasury_ops import auto_sweep
+
+                auto_sweep(db, config or {})
+            except Exception:
+                logger.exception("Balayage de trésorerie en échec.")
+
+        sweep_minutes = max(5.0, float(treasury_cfg.get("check_interval_minutes", 60)))
+        scheduler.add_job(
+            _treasury_sweep, IntervalTrigger(minutes=sweep_minutes),
+            id="treasury_sweep", replace_existing=True, max_instances=1, coalesce=True,
+        )
+        logger.info(
+            "Balayage de trésorerie attaché au scheduler (toutes les %d min, flottant %.2f USDC, minimum %.2f USDC).",
+            int(sweep_minutes), float(treasury_cfg.get("keep_float_usdc", 0.0)), float(treasury_cfg.get("min_sweep_usdc", 5.0)),
+        )
     return scheduler

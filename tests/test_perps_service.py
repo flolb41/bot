@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.perps.dashboard import build_report, create_perps_app
-from app.perps.engine import STRATEGY_CARRY, PaperEngine
+from app.perps.engine import STRATEGY_CARRY, STRATEGY_TREND, PaperEngine
 from app.perps.market_data import pair_state_from_sdk
 from app.perps.models import PairState, PerpsConfig
 from app.perps.service import fetch_states, run_tick
@@ -55,6 +55,8 @@ def test_perps_config_defaults_and_market_union():
     assert config.enabled is False
     assert config.mode == "paper"
     assert config.markets == ("ETH/USD", "BTC/USD", "SOL/USD")   # + marchés des stratégies (carry par défaut : ETH, BTC)
+    disabled = PerpsConfig.from_config({"perps": {"markets": ["ETH/USD"], "trend": {"enabled": False, "markets": ["SOL/USD"]}}})
+    assert "SOL/USD" not in disabled.markets                       # une stratégie coupée n'impose plus ses marchés
     assert config.trend.leverage == 3.0
     assert config.carry.exit_confirm_hours == 12.0 and config.carry.entry_persistence_hours == 6.0
     assert PerpsConfig.from_config({}).enabled is False
@@ -141,6 +143,26 @@ def test_run_tick_without_any_market_is_skipped(tmp_path):
     summary = asyncio.run(run_tick(PaperEngine(store, config), provider, config, now=T0))
     assert summary == {"actions": [], "markets": 0, "open_positions": None}
     assert store.get_state("last_tick_at") is None
+
+
+def test_run_tick_keeps_observing_markets_of_open_positions(tmp_path):
+    """Une position ouverte sur un marché retiré de la config (stratégie coupée)
+    continue d'être suivie et fermée : ici la tendance SOL en durée max."""
+    config = PerpsConfig.from_config({"perps": {
+        "markets": ["ETH/USD"], "funding_carry": {"enabled": False}, "trend": {"enabled": False, "max_hold_hours": 24},
+    }})
+    assert config.markets == ("ETH/USD",)
+    store = PerpsStore(tmp_path / "orphan.db")
+    store.insert_position({
+        "strategy": STRATEGY_TREND, "symbol": "SOL/USD", "side": "long", "kind": "perp", "opened_at": T0 - 30 * 3600,
+        "entry_price": 80.0, "index_price_at_open": 80.0, "notional_usd": 100.0, "leverage": 2.0, "collateral_usd": 50.0,
+        "open_fee_usd": 0.045, "spot_qty": None, "spot_entry_price": None, "spot_costs_usd": 0.0, "funding_usd": 0.0,
+        "rollover_usd": 0.0, "last_accrual_at": T0 - 30 * 3600, "liquidation_price": 46.0, "entry_reason": "test",
+    })
+    provider = FakeProvider({"ETH/USD": _state("ETH/USD", 2000.0), "SOL/USD": _state("SOL/USD", 81.0)})
+    summary = asyncio.run(run_tick(PaperEngine(store, config), provider, config, now=T0))
+    assert summary["markets"] == 2 and summary["open_positions"] == 0
+    assert store.closed_positions(STRATEGY_TREND)[0]["exit_reason"] == "duree_max"
 
 
 # ---------------------------------------------------------------- dashboard
