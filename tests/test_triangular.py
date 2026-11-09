@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -60,7 +60,10 @@ def test_cross_dex_scan_detects_profitable_cycle_across_different_dexes(db: Data
         patch("app.trading.triangular._collect_pairs", return_value=groups),
         patch("app.trading.triangular._quote_token_usd_price", return_value=1.0),
     ):
-        signals = run_cross_dex_triangular_scan(db, _config(cross_dex_min_spread_pct_to_log=0.1))
+        # Cycle synthétique à +20 % : plafond de plausibilité relevé pour le test.
+        signals = run_cross_dex_triangular_scan(
+            db, _config(cross_dex_min_spread_pct_to_log=0.1, cross_dex_max_plausible_spread_pct=100),
+        )
 
     assert len(signals) == 1
     signal = signals[0]
@@ -104,7 +107,9 @@ def test_cross_dex_scan_picks_best_rate_per_leg_across_dexes(db: Database):
         "AERO/USDC": [_pair("baseswap", _AERO, _USDC, 0.2)],
     }
     with patch("app.trading.triangular._collect_pairs", return_value=groups):
-        signals = run_cross_dex_triangular_scan(db, _config(cross_dex_min_spread_pct_to_log=0.1))
+        signals = run_cross_dex_triangular_scan(
+            db, _config(cross_dex_min_spread_pct_to_log=0.1, cross_dex_max_plausible_spread_pct=100),
+        )
 
     # Les 2 sens de parcours du cycle (USDC->WETH->AERO->USDC et
     # USDC->AERO->WETH->USDC) sont tous deux profitables avec ces taux : on
@@ -131,3 +136,58 @@ def test_cross_dex_scan_respects_min_spread_threshold(db: Database):
 def test_cross_dex_scan_returns_empty_without_dex_whitelist(db: Database):
     signals = run_cross_dex_triangular_scan(db, _config(dex_whitelist=[]))
     assert signals == []
+
+
+def test_cross_dex_scan_discards_implausible_spreads_as_data_errors(db: Database, caplog):
+    import logging
+
+    # AERO->USDC coté 8x trop haut par une pool fantôme : cycle « à +740 % ».
+    groups = {
+        "USDC/WETH": [_pair("uniswap", _USDC, _WETH, 2.0)],
+        "WETH/AERO": [_pair("aerodrome", _WETH, _AERO, 3.0)],
+        "AERO/USDC": [_pair("sushiswap", _AERO, _USDC, 1.4)],
+    }
+    with (
+        patch("app.trading.triangular._collect_pairs", return_value=groups),
+        patch("app.trading.triangular._quote_token_usd_price", return_value=1.0),
+        caplog.at_level(logging.INFO, logger="app.trading.triangular"),
+    ):
+        signals = run_cross_dex_triangular_scan(db, _config(cross_dex_min_spread_pct_to_log=0.1))
+
+    assert signals == []
+    assert db.list_cross_dex_triangular_signals(limit=10) == []          # rien de persisté non plus
+    assert any("implausible" in record.getMessage() for record in caplog.records)
+
+    # Plafond configurable : relevé à 1000 %, le cycle redevient visible.
+    with (
+        patch("app.trading.triangular._collect_pairs", return_value=groups),
+        patch("app.trading.triangular._quote_token_usd_price", return_value=1.0),
+    ):
+        signals = run_cross_dex_triangular_scan(
+            db, _config(cross_dex_min_spread_pct_to_log=0.1, cross_dex_max_plausible_spread_pct=1000),
+        )
+    assert len(signals) == 1 and signals[0]["spread_pct"] == pytest.approx(740.0)
+
+
+def test_cross_dex_scan_ignores_pools_recently_judged_shallow(db: Database):
+    from app.trading import pool_memory
+
+    # Deux pools AERO/USDC : sushiswap cote mieux (0.25) mais vient d'être
+    # jugée trop peu profonde on-chain -> la jambe doit retomber sur baseswap.
+    groups = {
+        "USDC/WETH": [_pair("uniswap", _USDC, _WETH, 2.0)],
+        "WETH/AERO": [_pair("aerodrome", _WETH, _AERO, 3.0)],
+        "AERO/USDC": [_pair("sushiswap", _AERO, _USDC, 0.25), _pair("baseswap", _AERO, _USDC, 0.17)],
+    }
+    pool_memory.remember_shallow_pool("sushiswap", _USDC, _AERO, 0.39)   # clé symétrique : ordre inversé volontaire
+    with (
+        patch("app.trading.triangular._collect_pairs", return_value=groups),
+        patch("app.trading.triangular._quote_token_usd_price", return_value=1.0),
+    ):
+        signals = run_cross_dex_triangular_scan(
+            db, _config(cross_dex_min_spread_pct_to_log=0.1, cross_dex_max_plausible_spread_pct=100),
+        )
+
+    assert len(signals) == 1
+    assert signals[0]["dex_ca"] == "baseswap"
+    assert signals[0]["cycle_multiplier"] == pytest.approx(2.0 * 3.0 * 0.17)

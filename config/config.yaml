@@ -329,6 +329,13 @@ trading:
   # /api/cross-dex-triangular. Seuil volontairement plus élevé que
   # min_spread_pct_to_log pour ne pas noyer la base avec du bruit non actionnable.
   cross_dex_min_spread_pct_to_log: 0.50
+  # Au-delà de cet écart, un cycle cross-DEX est une erreur de donnée (prix
+  # DexScreener d'une pool quasi vide ou figé), ni journalisé ni proposé à
+  # l'exécution : nuit du 08 au 09/11/2026, des cycles BRETT « à +740 % »
+  # bâtis sur des pools de 0,39 $ et 24,98 $ de profondeur ont été proposés
+  # puis refusés 410 fois. Un vrai écart triangulaire se compte en dixièmes
+  # de pour-cent.
+  cross_dex_max_plausible_spread_pct: 20
   # Planchers de profit renforcés à partir des résultats observés :
   # 0.01$ au minimum et 0.5% du notionnel pour les voies classiques et flashloan.
   min_net_profit_usd: 0.01

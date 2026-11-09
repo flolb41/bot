@@ -1,4 +1,4 @@
-"""Moteur de détection d'arbitrage inter-DEX (bot de trading, section "microtrades").
+﻿"""Moteur de détection d'arbitrage inter-DEX (bot de trading, section "microtrades").
 
 GARDE-FOUS DE PHASE (lire avant de modifier) :
     - Ce module ne fait QUE détecter des écarts de prix et ESTIMER un profit net
@@ -17,12 +17,11 @@ GARDE-FOUS DE PHASE (lire avant de modifier) :
 from __future__ import annotations
 
 import logging
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
 
 from app.database import Database
-from app.trading import dex_sources, fees
+from app.trading import dex_sources, fees, pool_memory
 from app.trading.flashloan import (
     _amm_price_impact_pct,
     estimate_pair_signal_flashloan_preview,
@@ -50,37 +49,16 @@ logger = logging.getLogger(__name__)
 # le réseau/RPC, pas le CPU.
 _SCAN_PARALLEL_WORKERS = 8
 
-# Pools écartées pour profondeur on-chain insuffisante : mémorisées `TTL`
-# secondes pour (1) ne pas relire leur réserve à chaque scan (appels RPC
-# inutiles, la liquidité d'une pool quasi vide ne réapparaît pas en quelques
-# minutes) et (2) n'émettre qu'UN avertissement par fenêtre au lieu d'un par
-# scan — la pool Uniswap BRETT/USDC (≈3$ de profondeur) produisait ~95
-# warnings identiques par heure le 08/11/2026.
-_SHALLOW_POOL_TTL_SECONDS = 600.0
-_shallow_pool_rejections: dict[tuple[str, str, str], tuple[float, float]] = {}
-
-
-def _shallow_pool_key(dex: str, token_address: str, quote_address: str) -> tuple[str, str, str]:
-    return (dex, token_address.lower(), quote_address.lower())
-
-
-def _recent_shallow_pool_depth(dex: str, token_address: str, quote_address: str) -> float | None:
-    """Profondeur mesurée lors d'un rejet récent de cette pool, ou None si
-    aucun rejet n'est en cours de validité."""
-    entry = _shallow_pool_rejections.get(_shallow_pool_key(dex, token_address, quote_address))
-    if entry is None:
-        return None
-    expires_at, depth_usd = entry
-    if time.monotonic() > expires_at:
-        _shallow_pool_rejections.pop(_shallow_pool_key(dex, token_address, quote_address), None)
-        return None
-    return depth_usd
-
-
-def _remember_shallow_pool(dex: str, token_address: str, quote_address: str, depth_usd: float) -> None:
-    _shallow_pool_rejections[_shallow_pool_key(dex, token_address, quote_address)] = (
-        time.monotonic() + _SHALLOW_POOL_TTL_SECONDS, depth_usd,
-    )
+# Pools écartées pour profondeur on-chain insuffisante : mémorisées (voir
+# `app.trading.pool_memory`, partagé avec le scan cross-DEX et les exécuteurs)
+# pour (1) ne pas relire leur réserve à chaque scan (appels RPC inutiles, la
+# liquidité d'une pool quasi vide ne réapparaît pas en quelques minutes) et
+# (2) n'émettre qu'UN avertissement par fenêtre au lieu d'un par scan — la
+# pool Uniswap BRETT/USDC (≈3$ de profondeur) produisait ~95 warnings
+# identiques par heure le 08/11/2026.
+_SHALLOW_POOL_TTL_SECONDS = pool_memory.SHALLOW_POOL_TTL_SECONDS
+_recent_shallow_pool_depth = pool_memory.recent_shallow_pool_depth
+_remember_shallow_pool = pool_memory.remember_shallow_pool
 
 _DEFAULT_SEED_TOKENS = [
     {"symbol": "WETH", "address": "0x4200000000000000000000000000000000000006", "coingecko_id": "ethereum"},

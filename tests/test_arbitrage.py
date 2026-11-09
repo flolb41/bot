@@ -1,9 +1,9 @@
-"""Tests du raffinement on-chain de `app.trading.arbitrage` (sans RPC réel)."""
+﻿"""Tests du raffinement on-chain de `app.trading.arbitrage` (sans RPC réel)."""
 from __future__ import annotations
 
 import logging
 
-from app.trading import arbitrage, executor
+from app.trading import arbitrage, executor, pool_memory
 
 BRETT = "0x532f27101965dd16442e59d40670faf5ebb142e4"
 USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
@@ -49,7 +49,7 @@ def test_shallow_pool_rejection_expires_after_ttl(monkeypatch):
         lambda dex, _token, _quote: depth_reads.append(dex) or 3.0,
     )
     clock = {"now": 1_000.0}
-    monkeypatch.setattr(arbitrage.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr("app.trading.pool_memory.time.monotonic", lambda: clock["now"])
 
     arbitrage._refine_spread_with_onchain_price(_spread(), BRETT, USDC, min_quote_depth_usd=25)
     clock["now"] += arbitrage._SHALLOW_POOL_TTL_SECONDS + 1
@@ -67,4 +67,4 @@ def test_deep_enough_pool_is_not_remembered_as_shallow(monkeypatch):
 
     assert refined["spread_pct"] == 5.0
     assert refined["buy_quote_depth_usd"] == 500.0
-    assert arbitrage._shallow_pool_rejections == {}
+    assert pool_memory._rejections == {}

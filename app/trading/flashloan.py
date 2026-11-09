@@ -62,6 +62,7 @@ from app.trading.fees import (
     is_net_profit_above_threshold,
 )
 from app.trading.guardrails import TradingRefused, is_trading_live, send_trading_transaction
+from app.trading import pool_memory
 from app.trading.routers import (
     EXECUTABLE_DEXES,
     FLASH_ARBITRAGE_ADDRESS,
@@ -971,6 +972,11 @@ def execute_cross_dex_triangular_signal_via_flashloan(
                 config, token_in, token_out, configured_min_liquidity / 2,
             )
             if depth_usd < minimum_depth_usd:
+                # Mémorisée pour tous les chemins (scan pair, scan cross-DEX) :
+                # une pool sous le plancher n'a aucune raison d'être relue et
+                # re-refusée au prochain scan (410 refus identiques la nuit du
+                # 08 au 09/11/2026).
+                pool_memory.remember_shallow_pool(dex, token_in, token_out, depth_usd)
                 result["error"] = (
                     f"Profondeur on-chain {depth_usd:.2f}$ sous le plancher {minimum_depth_usd:.2f}$ "
                     f"pour {token_in}/{token_out} sur {dex} — refus."

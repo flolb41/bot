@@ -413,3 +413,40 @@ def test_fallback_scan_yields_to_recent_websocket_scan(tmp_path: Path, monkeypat
     db.set_state("last_scan_started_at", "invalide")
     fallback()
     assert calls == [True, True]
+
+
+def test_structural_refusal_gets_long_cooldown_and_no_notification(tmp_path: Path, monkeypatch, caplog):
+    import app.scheduler as scheduler
+
+    db = Database(tmp_path / "structural.db")
+    signal = _pair_live_signal(db)
+    _prepare_pair_live_scan(monkeypatch, signal)
+    monkeypatch.setattr("app.trading.flashloan.pair_signal_is_flashloan_eligible", lambda _config, _signal: False)
+    monkeypatch.setattr(
+        "app.trading.executor.execute_signal",
+        lambda *_args: {"executed": False, "tx_hash_buy": None, "tx_hash_sell": None,
+                        "error": "Profondeur on-chain 0.39$ sous le plancher 25.00$ pour 0xaaa/0xbbb sur uniswap — refus."},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.scheduler"):
+        run_arbitrage_scan_job(db, config={"trading": {}})
+
+    until = float(db.get_state(scheduler._cooldown_key({**signal, "kind": "pair"})))
+    import time as _time
+    assert until - _time.time() > scheduler._STRUCTURAL_REFUSAL_COOLDOWN_SECONDS - 60
+    titles = [n["title"] for n in db.list_notifications(limit=20)]
+    assert "⚠️ Arbitrage refusé/échoué" not in titles                       # pas de spam pour un refus structurel
+    assert any("sous le plancher" in record.getMessage() for record in caplog.records)   # mais journalisé
+
+
+def test_profitable_announcement_is_deduplicated(tmp_path: Path):
+    import app.scheduler as scheduler
+
+    db = Database(tmp_path / "announce.db")
+    candidates = [{"kind": "pair", "chain": "base", "token_address": "0xaaa", "quote_address": "0xbbb"}]
+    assert scheduler._should_announce_profitable(db, candidates) is True
+    assert scheduler._should_announce_profitable(db, candidates) is False          # même ensemble, trop récent
+    other = candidates + [{"kind": "pair", "chain": "base", "token_address": "0xccc", "quote_address": "0xbbb"}]
+    assert scheduler._should_announce_profitable(db, other) is True                # ensemble différent
+    db.set_state("profitable_announce_at", str(0))
+    assert scheduler._should_announce_profitable(db, other) is True                # identique mais ancien

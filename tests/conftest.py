@@ -1,4 +1,4 @@
-"""Fixtures partagées pour la suite de tests."""
+﻿"""Fixtures partagées pour la suite de tests."""
 from __future__ import annotations
 
 import pytest
@@ -22,8 +22,9 @@ def _clear_executor_route_cache():
 @pytest.fixture(autouse=True)
 def _clear_shallow_pool_rejections():
     """Même principe pour la mémoire des pools écartées pour profondeur
-    insuffisante (`app.trading.arbitrage._shallow_pool_rejections`)."""
-    from app.trading import arbitrage
-    arbitrage._shallow_pool_rejections.clear()
+    insuffisante (`app.trading.pool_memory`, partagée par les scans et les
+    exécuteurs)."""
+    from app.trading import pool_memory
+    pool_memory.clear()
     yield
-    arbitrage._shallow_pool_rejections.clear()
+    pool_memory.clear()

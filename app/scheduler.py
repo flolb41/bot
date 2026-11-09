@@ -52,7 +52,50 @@ _MAX_ATTEMPTS_PER_CYCLE = 10
 #   de marteler un écart structurellement illusoire.
 _PAIR_COOLDOWN_SECONDS = 600
 _PAIR_COOLDOWN_SECONDS_NO_CAPITAL_RISK = 90
+# Refus structurel (aucun capital engagé, mais l'état on-chain qui le motive
+# — pool sous le plancher de profondeur, écart implausible — ne change pas à
+# l'échelle d'un scan) : cooldown long pour ne pas re-proposer le même
+# candidat à chaque scan (410 refus identiques la nuit du 08 au 09/11/2026).
+_STRUCTURAL_REFUSAL_COOLDOWN_SECONDS = 3600
+_STRUCTURAL_REFUSAL_MARKERS = (
+    "sous le plancher", "Profondeur on-chain indisponible", "Profondeur insuffisante",
+    "trop peu profonde", "implausible", "Liquidité de pool insuffisante",
+)
 _SCAN_LOCK = threading.Lock()
+
+
+def _is_structural_refusal(error: str | None) -> bool:
+    """Refus dont la cause est un état on-chain stable (profondeur de pool,
+    prix fantôme) plutôt qu'un aléa de marché (écart refermé, RPC, simulation)."""
+    return bool(error) and any(marker in error for marker in _STRUCTURAL_REFUSAL_MARKERS)
+
+
+# Même ensemble de candidats « rentables » re-détecté scan après scan (écart
+# structurel) : une seule annonce par fenêtre, pas 392 par nuit.
+_PROFITABLE_ANNOUNCE_COOLDOWN_SECONDS = 1800
+
+
+def _profitable_signature(profitable: list[dict]) -> str:
+    keys = sorted(_cooldown_key(signal) for signal in profitable)
+    return "|".join(keys)
+
+
+def _should_announce_profitable(db: Database, profitable: list[dict]) -> bool:
+    """True si l'ensemble des candidats rentables diffère du dernier annoncé,
+    ou si la dernière annonce identique date de plus de 30 min."""
+    signature = _profitable_signature(profitable)
+    now = time.time()
+    last_signature = db.get_state("profitable_announce_signature")
+    last_at = db.get_state("profitable_announce_at")
+    try:
+        recent = last_at is not None and now - float(last_at) < _PROFITABLE_ANNOUNCE_COOLDOWN_SECONDS
+    except ValueError:
+        recent = False
+    if last_signature == signature and recent:
+        return False
+    db.set_state("profitable_announce_signature", signature)
+    db.set_state("profitable_announce_at", str(now))
+    return True
 
 
 def _effective_profit_usd(signal: dict, config: dict | None = None) -> float:
@@ -325,7 +368,7 @@ def _run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = N
             reverse=True,
         )
 
-        if profitable and telegram:
+        if profitable and telegram and _should_announce_profitable(db, profitable):
             tag = "LIVE" if live else "SIMULATION"
             lines = [
                 (
@@ -443,9 +486,18 @@ def _run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = N
         # Du capital n'a réellement été engagé que si une transaction a été
         # diffusée on-chain (achat classique ou swap triangulaire) ; un refus
         # de simulation/garde-fou (avant tout envoi) ne coûte rien et mérite
-        # un cooldown bien plus court.
+        # un cooldown bien plus court — SAUF s'il est structurel (pool sous le
+        # plancher de profondeur, écart implausible) : l'état on-chain ne
+        # change pas en 90 s, le candidat reviendrait à l'identique à chaque
+        # scan (410 refus en boucle la nuit du 08 au 09/11/2026).
         capital_at_risk = bool(exec_result.get("tx_hash_buy") or exec_result.get("tx_hash"))
-        cooldown_seconds = _PAIR_COOLDOWN_SECONDS if capital_at_risk else _PAIR_COOLDOWN_SECONDS_NO_CAPITAL_RISK
+        structural_refusal = _is_structural_refusal(exec_result.get("error"))
+        if capital_at_risk:
+            cooldown_seconds = _PAIR_COOLDOWN_SECONDS
+        elif structural_refusal:
+            cooldown_seconds = _STRUCTURAL_REFUSAL_COOLDOWN_SECONDS
+        else:
+            cooldown_seconds = _PAIR_COOLDOWN_SECONDS_NO_CAPITAL_RISK
         _set_pair_cooldown(db, best_signal, cooldown_seconds)
         cooldown_label = f"{cooldown_seconds // 60} min" if cooldown_seconds >= 60 else f"{cooldown_seconds}s"
         failure_message = (
@@ -455,13 +507,16 @@ def _run_arbitrage_scan_job(db: Database, telegram=None, config: dict | None = N
         # Journalisé ET persisté en base (même sans Telegram configuré) : la
         # raison du refus n'était auparavant visible que dans la table
         # `notifications`, jamais dans app.log, rendant le diagnostic après
-        # coup laborieux.
+        # coup laborieux. Un refus structurel (aucun capital engagé, état
+        # on-chain connu) reste dans le journal mais ne crée pas de
+        # notification : il en produisait 820 par nuit.
         logger.warning("%s%s", failure_message, " Capital engagé on-chain." if capital_at_risk else "")
-        db.add_notification(
-            title="⚠️ Arbitrage refusé/échoué", message=failure_message, level="warning",
-        )
-        if telegram and exec_result["error"]:
-            telegram.send(f"⚠️ <b>{failure_message}</b>", level="warning")
+        if not structural_refusal:
+            db.add_notification(
+                title="⚠️ Arbitrage refusé/échoué", message=failure_message, level="warning",
+            )
+            if telegram and exec_result["error"]:
+                telegram.send(f"⚠️ <b>{failure_message}</b>", level="warning")
         # Abandon/échec : pas de re-scan immédiat, on laisse le prochain tick
         # normal du scheduler reprendre la main (la paire fautive est de toute
         # façon en cooldown pendant ce temps).

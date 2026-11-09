@@ -1,8 +1,10 @@
-"""Tests de la logique pure (pas de réseau/RPC) de app.trading.flashloan :
+﻿"""Tests de la logique pure (pas de réseau/RPC) de app.trading.flashloan :
 lecture de config et décisions d'éligibilité au ROUTAGE flashloan vs classique
 dans app.scheduler. L'exécution réelle (_build_leg, execute_*_via_flashloan)
 nécessite web3/RPC et n'est pas testée ici (cohérent avec l'absence de tests
 réseau pour app.trading.executor)."""
+import pytest
+
 from app.trading import flashloan
 
 USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -517,3 +519,42 @@ def test_build_leg_rejects_unsupported_dex():
 
     with pytest.raises(flashloan.TradingRefused):
         flashloan._build_leg("not-a-dex", _FakeW3(None), token_in=USDC, token_out=WETH)
+
+
+def test_cross_dex_executor_depth_refusal_remembers_the_shallow_pool(tmp_path, monkeypatch):
+    from app.database import Database
+    from app.trading import pool_memory
+
+    config = _cross_dex_config()
+    signal = _cross_dex_signal()
+    db = Database(tmp_path / "cross-dex-shallow.db")
+    signal["id"] = db.add_cross_dex_triangular_signal(signal)
+
+    class FakeEth:
+        def contract(self, **_kwargs):
+            return object()
+
+    class FakeWeb3:
+        eth = FakeEth()
+
+    monkeypatch.setattr(flashloan, "is_trading_live", lambda _config: True)
+    monkeypatch.setattr(flashloan, "make_w3", lambda **_kwargs: FakeWeb3())
+    monkeypatch.setattr(flashloan, "_is_connected_with_retry", lambda _w3: True)
+    monkeypatch.setattr(flashloan, "_get_decimals", lambda _w3, _address: 18)
+    monkeypatch.setattr(flashloan, "_quote_token_usd_price", lambda _address: 2_000.0)
+    depths = {("sushiswap", WETH.lower(), TOKEN_B): 24.98}
+    monkeypatch.setattr(
+        flashloan, "_onchain_quote_depth_usd",
+        lambda dex, token_in, token_out, *_args: depths.get((dex, token_in.lower(), token_out.lower()), 100_000.0),
+    )
+    monkeypatch.setattr(
+        flashloan, "send_trading_transaction",
+        lambda *_args, **_kwargs: pytest.fail("aucune transaction ne doit être envoyée"),
+    )
+
+    result = flashloan.execute_cross_dex_triangular_signal_via_flashloan(db, config, signal)
+
+    assert result["executed"] is False
+    assert "Profondeur on-chain 24.98$ sous le plancher" in result["error"]
+    assert pool_memory.recent_shallow_pool_depth("sushiswap", TOKEN_B, WETH) == 24.98   # clé symétrique
+    assert pool_memory.is_pool_recently_shallow("baseswap", TOKEN_B, TOKEN_C) is False

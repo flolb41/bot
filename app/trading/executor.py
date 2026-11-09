@@ -2203,13 +2203,18 @@ def sell_token_balance(db: Database, config: dict, token_address: str, quote_add
         slip = slippage_pct() / 100.0
         deadline = int(time.time()) + 180
         last_error = None
+        # Impact de prix ≈ taille / profondeur : pour rester sous la moitié de la
+        # tolérance de slippage, il faut une profondeur ≥ 200 / slippage(%) fois
+        # la taille vendue (400× à 0,5 %). Le minimum de 20× écarte en plus les
+        # pools fantômes (ex. Uniswap BRETT/USDC ≈ 3 $).
+        required_depth_usd = estimated_value_usd * max(20.0, 200.0 / max(slip * 100, 1e-9))
         for dex, price in dex_prices:
             depth_usd = _onchain_quote_depth_usd(dex, token_address, quote_address)
-            # Au moins 20x la taille vendue en profondeur côté quote : évite les
-            # pools fantômes (ex. Uniswap BRETT/USDC ≈ 3 $) et un impact de prix
-            # que la tolérance de slippage ne couvrirait pas.
-            if depth_usd is None or depth_usd < 20 * estimated_value_usd:
-                last_error = f"{dex} : profondeur on-chain insuffisante ({depth_usd if depth_usd is None else round(depth_usd, 2)}$)."
+            if depth_usd is None or depth_usd < required_depth_usd:
+                last_error = (
+                    f"{dex} : profondeur on-chain insuffisante "
+                    f"({depth_usd if depth_usd is None else round(depth_usd, 2)}$ < {required_depth_usd:.0f}$ requis)."
+                )
                 continue
             min_quote_out_units = _min_amount_out_units(
                 balance_units / (10 ** token_decimals) * price / quote_usd_price * (10 ** quote_decimals),

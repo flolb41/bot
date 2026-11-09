@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 
 from app.database import Database
-from app.trading import fees
+from app.trading import fees, pool_memory
 from app.trading.arbitrage import _DEFAULT_DEX_WHITELIST, _DEFAULT_SEED_TOKENS, _collect_pairs
 from app.trading.flashloan import estimate_triangular_signal_flashloan_preview, flashloan_min_net_profit_usd
 from app.trading.pair_health import triangular_health
@@ -53,6 +53,13 @@ def _is_classic_triangular_route_executable(signal: dict) -> bool:
 # (au lieu de 2 swaps dans 2 tx séparées), estimation volontairement prudente
 # (surestimée plutôt que sous-estimée, même principe que fees.py).
 ESTIMATED_GAS_UNITS_TRIANGULAR = 420_000
+
+# Au-delà de cet écart, un cycle n'est pas une opportunité mais une erreur de
+# donnée (prix DexScreener d'une pool quasi vide ou figé) : nuit du 08 au
+# 09/11/2026, des cycles BRETT « à +740 % » bâtis sur deux pools de 0,39 $ et
+# 24,98 $ de profondeur ont été proposés 410 fois à l'exécution. Un vrai écart
+# triangulaire sur des pools liquides se compte en dixièmes de pour-cent.
+DEFAULT_CROSS_DEX_MAX_PLAUSIBLE_SPREAD_PCT = 20.0
 
 
 def _pool_rate(pair: dict, from_token: str, to_token: str) -> float | None:
@@ -301,6 +308,9 @@ def run_cross_dex_triangular_scan(
     # classique) : ces cycles ne sont pas exécutables, un seuil bas ne ferait
     # que noyer la base de données sans valeur actionnable immédiate.
     min_spread_pct_to_log = float(trading_cfg.get("cross_dex_min_spread_pct_to_log", 0.50))
+    max_plausible_spread_pct = float(
+        trading_cfg.get("cross_dex_max_plausible_spread_pct", DEFAULT_CROSS_DEX_MAX_PLAUSIBLE_SPREAD_PCT)
+    )
 
     if not dex_whitelist:
         return []
@@ -320,9 +330,14 @@ def run_cross_dex_triangular_scan(
             ).append(pair)
 
     def _best_leg(from_addr: str, to_addr: str) -> tuple[float, dict] | None:
-        """Meilleur taux ET pool d'origine pour cette jambe, tous DEX confondus."""
+        """Meilleur taux ET pool d'origine pour cette jambe, tous DEX confondus
+        — en ignorant les pools récemment jugées trop peu profondes on-chain
+        (voir `app.trading.pool_memory`) : leur « meilleur taux » n'est qu'un
+        prix fantôme."""
         best: tuple[float, dict] | None = None
         for pair in pools_by_token_pair.get(frozenset({from_addr, to_addr})) or []:
+            if pool_memory.is_pool_recently_shallow(pair["dex_id"], from_addr, to_addr):
+                continue
             rate = _pool_rate(pair, from_addr, to_addr)
             if rate is None or rate <= 0:
                 continue
@@ -332,6 +347,7 @@ def run_cross_dex_triangular_scan(
 
     seed_entries = [(t["symbol"], t["address"].lower()) for t in seed_tokens]
     signals: list[dict] = []
+    implausible = 0
 
     for token_a_symbol, token_a_addr in seed_entries:
         for token_b_symbol, token_b_addr in seed_entries:
@@ -368,6 +384,16 @@ def run_cross_dex_triangular_scan(
                 spread_pct = (cycle_multiplier - 1) * 100
                 if spread_pct < min_spread_pct_to_log:
                     continue
+                if spread_pct > max_plausible_spread_pct:
+                    # Ni journalisé en base ni proposé : une pool de ce cycle
+                    # cote un prix fantôme. Compté pour un seul message de log.
+                    implausible += 1
+                    logger.debug(
+                        "Cycle cross-DEX %s→%s→%s (%s/%s/%s) écarté : écart %.1f %% implausible (> %.0f %%).",
+                        token_a_symbol, token_b_symbol, token_c_symbol,
+                        pair_ab["dex_id"], pair_bc["dex_id"], pair_ca["dex_id"], spread_pct, max_plausible_spread_pct,
+                    )
+                    continue
 
                 min_liquidity = min(
                     pair_ab["liquidity_usd"], pair_bc["liquidity_usd"], pair_ca["liquidity_usd"]
@@ -399,4 +425,9 @@ def run_cross_dex_triangular_scan(
 
     if signals:
         logger.info("Cross-DEX triangular scan : %d cycle(s) détecté(s).", len(signals))
+    if implausible:
+        logger.info(
+            "Cross-DEX triangular scan : %d cycle(s) écarté(s) pour écart implausible (> %.0f %%, prix de pool fantôme).",
+            implausible, max_plausible_spread_pct,
+        )
     return signals
